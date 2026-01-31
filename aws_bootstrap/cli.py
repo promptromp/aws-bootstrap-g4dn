@@ -277,7 +277,7 @@ def launch(
     click.echo()
     click.secho("  VSCode Remote SSH:", fg="cyan")
     click.secho(
-        f"    code --folder-uri vscode-remote://ssh-remote+{alias}/home/{config.ssh_user}",
+        f"    code --folder-uri vscode-remote://ssh-remote+{alias}/home/{config.ssh_user}/workspace",
         bold=True,
     )
 
@@ -410,7 +410,7 @@ def status(region, profile, gpu, instructions):
 
             click.secho("    VSCode Remote SSH:", fg="cyan")
             click.secho(
-                f"      code --folder-uri vscode-remote://ssh-remote+{alias}/home/{user}",
+                f"      code --folder-uri vscode-remote://ssh-remote+{alias}/home/{user}/workspace",
                 bold=True,
             )
 

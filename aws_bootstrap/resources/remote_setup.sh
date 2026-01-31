@@ -7,7 +7,7 @@ echo "=== aws-bootstrap-g4dn remote setup ==="
 
 # 1. Verify GPU
 echo ""
-echo "[1/5] Verifying GPU and CUDA..."
+echo "[1/6] Verifying GPU and CUDA..."
 if command -v nvidia-smi &>/dev/null; then
     nvidia-smi --query-gpu=name,driver_version,memory.total --format=csv,noheader
 else
@@ -20,15 +20,40 @@ else
     echo "WARNING: nvcc not found (CUDA toolkit may not be installed)"
 fi
 
+# Make Nsight Systems (nsys) available on PATH if installed under /opt/nvidia
+if ! command -v nsys &>/dev/null; then
+    NSIGHT_DIR="/opt/nvidia/nsight-systems"
+    if [ -d "$NSIGHT_DIR" ]; then
+        # Fix permissions — the parent dir is often root-only (drwx------)
+        sudo chmod o+rx "$NSIGHT_DIR"
+        # Find the latest version directory (lexicographic sort)
+        NSYS_VERSION=$(ls -1 "$NSIGHT_DIR" | sort -V | tail -1)
+        if [ -n "$NSYS_VERSION" ] && [ -x "$NSIGHT_DIR/$NSYS_VERSION/bin/nsys" ]; then
+            NSYS_BIN="$NSIGHT_DIR/$NSYS_VERSION/bin"
+            if ! grep -q "nsight-systems" ~/.bashrc 2>/dev/null; then
+                echo "export PATH=\"$NSYS_BIN:\$PATH\"" >> ~/.bashrc
+            fi
+            export PATH="$NSYS_BIN:$PATH"
+            echo "  Nsight Systems $NSYS_VERSION added to PATH ($NSYS_BIN)"
+        else
+            echo "  WARNING: Nsight Systems directory found but no nsys binary"
+        fi
+    else
+        echo "  Nsight Systems not found at $NSIGHT_DIR"
+    fi
+else
+    echo "  nsys already on PATH: $(command -v nsys)"
+fi
+
 # 2. Install utilities
 echo ""
-echo "[2/5] Installing utilities..."
+echo "[2/6] Installing utilities..."
 sudo apt-get update -qq
 sudo apt-get install -y -qq htop tmux tree jq
 
 # 3. Set up Python environment with uv
 echo ""
-echo "[3/5] Setting up Python environment with uv..."
+echo "[3/6] Setting up Python environment with uv..."
 if ! command -v uv &>/dev/null; then
     curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
@@ -153,7 +178,7 @@ echo "  Jupyter config written to $JUPYTER_CONFIG_DIR/jupyter_lab_config.py"
 
 # 4. Jupyter systemd service
 echo ""
-echo "[4/5] Setting up Jupyter systemd service..."
+echo "[4/6] Setting up Jupyter systemd service..."
 LOGIN_USER=$(whoami)
 
 sudo tee /etc/systemd/system/jupyter.service > /dev/null << SVCEOF
@@ -180,7 +205,7 @@ echo "  Jupyter service started (port 8888)"
 
 # 5. SSH keepalive
 echo ""
-echo "[5/5] Configuring SSH keepalive..."
+echo "[5/6] Configuring SSH keepalive..."
 if ! grep -q "ClientAliveInterval" /etc/ssh/sshd_config; then
     echo "ClientAliveInterval 60" | sudo tee -a /etc/ssh/sshd_config > /dev/null
     echo "ClientAliveCountMax 10" | sudo tee -a /etc/ssh/sshd_config > /dev/null
@@ -189,6 +214,59 @@ if ! grep -q "ClientAliveInterval" /etc/ssh/sshd_config; then
 else
     echo "  SSH keepalive already configured"
 fi
+
+# 6. VSCode workspace setup
+echo ""
+echo "[6/6] Setting up VSCode workspace..."
+mkdir -p ~/workspace/.vscode
+
+# Detect cuda-gdb path
+CUDA_GDB_PATH=""
+if command -v cuda-gdb &>/dev/null; then
+    CUDA_GDB_PATH=$(command -v cuda-gdb)
+elif [ -x /usr/local/cuda/bin/cuda-gdb ]; then
+    CUDA_GDB_PATH="/usr/local/cuda/bin/cuda-gdb"
+else
+    # Try glob for versioned CUDA installs
+    for p in /usr/local/cuda-*/bin/cuda-gdb; do
+        if [ -x "$p" ]; then
+            CUDA_GDB_PATH="$p"
+        fi
+    done
+fi
+if [ -z "$CUDA_GDB_PATH" ]; then
+    echo "  WARNING: cuda-gdb not found — using placeholder in launch.json"
+    CUDA_GDB_PATH="cuda-gdb"
+else
+    echo "  cuda-gdb: $CUDA_GDB_PATH"
+fi
+
+# Detect GPU SM architecture
+GPU_ARCH=""
+if command -v nvidia-smi &>/dev/null; then
+    COMPUTE_CAP=$(nvidia-smi --query-gpu=compute_cap --format=csv,noheader 2>/dev/null | head -1 | tr -d '[:space:]')
+    if [ -n "$COMPUTE_CAP" ]; then
+        GPU_ARCH="sm_$(echo "$COMPUTE_CAP" | tr -d '.')"
+    fi
+fi
+if [ -z "$GPU_ARCH" ]; then
+    echo "  WARNING: Could not detect GPU arch — defaulting to sm_75"
+    GPU_ARCH="sm_75"
+else
+    echo "  GPU arch: $GPU_ARCH"
+fi
+
+# Copy example CUDA source into workspace
+cp /tmp/saxpy.cu ~/workspace/saxpy.cu
+echo "  Deployed saxpy.cu"
+
+# Deploy launch.json with cuda-gdb path
+sed "s|__CUDA_GDB_PATH__|${CUDA_GDB_PATH}|g" /tmp/launch.json > ~/workspace/.vscode/launch.json
+echo "  Deployed launch.json"
+
+# Deploy tasks.json with GPU architecture
+sed "s|__GPU_ARCH__|${GPU_ARCH}|g" /tmp/tasks.json > ~/workspace/.vscode/tasks.json
+echo "  Deployed tasks.json"
 
 echo ""
 echo "=== Remote setup complete ==="

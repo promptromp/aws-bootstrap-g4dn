@@ -33,7 +33,7 @@ aws-bootstrap = "aws_bootstrap.cli:main"
 include = ["aws_bootstrap*"]
 
 [tool.setuptools.package-data]
-"aws_bootstrap.resources" = ["*.sh", "*.txt", "*.ipynb"]
+"aws_bootstrap.resources" = ["*.sh", "*.txt", "*.ipynb", "*.json", "*.cu"]
 
 [tool.setuptools_scm]
 

@@ -565,7 +565,7 @@ def test_status_instructions_shown_by_default(mock_find, mock_spot, mock_session
     assert result.exit_code == 0
     assert "ssh aws-gpu1" in result.output
     assert "ssh -NL 8888:localhost:8888 aws-gpu1" in result.output
-    assert "vscode-remote://ssh-remote+aws-gpu1/home/ubuntu" in result.output
+    assert "vscode-remote://ssh-remote+aws-gpu1/home/ubuntu/workspace" in result.output
     assert "python ~/gpu_benchmark.py" in result.output
 
 

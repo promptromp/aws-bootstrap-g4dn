@@ -176,15 +176,15 @@ Features include:
 
 **Remote EC2 instance (via VSCode Remote SSH):**
 
-1. Connect to the instance: `code --folder-uri vscode-remote://ssh-remote+aws-gpu1/home/ubuntu`
+1. Connect to the instance: `code --folder-uri vscode-remote://ssh-remote+aws-gpu1/home/ubuntu/workspace`
 2. Install the [Nsight VSCE extension](https://marketplace.visualstudio.com/items?itemName=NVIDIA.nsight-vscode-edition) on the remote (VS Code will prompt)
 3. `cuda-gdb` is included with the CUDA toolkit on Deep Learning AMIs
 
 ### Debugging Workflow
 
-1. Connect to `aws-gpu1` via VSCode Remote SSH.
-2. Open your CUDA project folder.
-3. Create a `launch.json` with a CUDA debug configuration.
+1. Connect to `aws-gpu1` via VSCode Remote SSH (opens `~/workspace`).
+2. `launch.json` and `tasks.json` are pre-configured in `~/workspace/.vscode/` with the detected `cuda-gdb` path and GPU architecture.
+3. Open or create `.cu` files in `~/workspace`.
 4. Set breakpoints in your `.cu` files.
 5. Press F5 to start debugging.
 

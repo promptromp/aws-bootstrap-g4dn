@@ -159,6 +159,42 @@ def run_remote_setup(
         click.secho(f"  SCP failed: {nb_result.stderr}", fg="red", err=True)
         return False
 
+    # SCP the CUDA example source
+    saxpy_path = script_path.parent / "saxpy.cu"
+    click.echo("  Uploading saxpy.cu...")
+    saxpy_result = subprocess.run(
+        ["scp", *ssh_opts, *scp_port_opts, str(saxpy_path), f"{user}@{host}:/tmp/saxpy.cu"],
+        capture_output=True,
+        text=True,
+    )
+    if saxpy_result.returncode != 0:
+        click.secho(f"  SCP failed: {saxpy_result.stderr}", fg="red", err=True)
+        return False
+
+    # SCP the VSCode launch.json
+    launch_json_path = script_path.parent / "launch.json"
+    click.echo("  Uploading launch.json...")
+    launch_result = subprocess.run(
+        ["scp", *ssh_opts, *scp_port_opts, str(launch_json_path), f"{user}@{host}:/tmp/launch.json"],
+        capture_output=True,
+        text=True,
+    )
+    if launch_result.returncode != 0:
+        click.secho(f"  SCP failed: {launch_result.stderr}", fg="red", err=True)
+        return False
+
+    # SCP the VSCode tasks.json
+    tasks_json_path = script_path.parent / "tasks.json"
+    click.echo("  Uploading tasks.json...")
+    tasks_result = subprocess.run(
+        ["scp", *ssh_opts, *scp_port_opts, str(tasks_json_path), f"{user}@{host}:/tmp/tasks.json"],
+        capture_output=True,
+        text=True,
+    )
+    if tasks_result.returncode != 0:
+        click.secho(f"  SCP failed: {tasks_result.stderr}", fg="red", err=True)
+        return False
+
     # SCP the script
     click.echo("  Uploading remote_setup.sh...")
     scp_result = subprocess.run(
