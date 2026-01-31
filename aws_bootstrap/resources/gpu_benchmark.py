@@ -628,7 +628,9 @@ def configure_precision(device: torch.device, requested: PrecisionMode) -> Preci
     return PrecisionMode.FP32
 
 
-def print_system_info(requested_precision: PrecisionMode) -> tuple[torch.device, PrecisionMode]:
+def print_system_info(
+    requested_precision: PrecisionMode, force_cpu: bool = False
+) -> tuple[torch.device, PrecisionMode]:
     """Print system and CUDA information, return device and actual precision mode."""
     print("\n" + "=" * 60)
     print("System Information")
@@ -636,7 +638,7 @@ def print_system_info(requested_precision: PrecisionMode) -> tuple[torch.device,
     print(f"PyTorch version: {torch.__version__}")
     print(f"Python version: {sys.version.split()[0]}")
 
-    if torch.cuda.is_available():
+    if torch.cuda.is_available() and not force_cpu:
         device = torch.device("cuda")
         print("CUDA available: Yes")
         print(f"CUDA version: {torch.version.cuda}")
@@ -666,8 +668,11 @@ def print_system_info(requested_precision: PrecisionMode) -> tuple[torch.device,
     else:
         device = torch.device("cpu")
         actual_precision = PrecisionMode.FP32
-        print("CUDA available: No (running on CPU)")
-        print("WARNING: GPU benchmark results will not be representative!")
+        if force_cpu:
+            print("CPU-only mode requested (--cpu flag)")
+        else:
+            print("CUDA available: No (running on CPU)")
+        print("Running on CPU for benchmarking")
 
     print("=" * 60)
     return device, actual_precision
@@ -724,10 +729,15 @@ def main() -> None:
         action="store_true",
         help="Run CUDA/cuBLAS diagnostic tests before benchmarking",
     )
+    parser.add_argument(
+        "--cpu",
+        action="store_true",
+        help="Force CPU-only execution (for CPU vs GPU comparison)",
+    )
     args = parser.parse_args()
 
     requested_precision = PrecisionMode(args.precision)
-    device, actual_precision = print_system_info(requested_precision)
+    device, actual_precision = print_system_info(requested_precision, force_cpu=args.cpu)
 
     # Run diagnostics if requested
     if args.diagnose:
