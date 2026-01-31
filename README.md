@@ -85,6 +85,26 @@ ssh -i ~/.ssh/id_ed25519 ubuntu@<public-ip>
 ssh -i ~/.ssh/id_ed25519 -NL 8888:localhost:8888 ubuntu@<public-ip>
 ```
 
+### Listing Resources
+
+```bash
+# List all g4dn instance types (default)
+aws-bootstrap list instance-types
+
+# List a different instance family
+aws-bootstrap list instance-types --prefix p3
+
+# List Deep Learning AMIs (default filter)
+aws-bootstrap list amis
+
+# List AMIs with a custom filter
+aws-bootstrap list amis --filter "ubuntu/images/hvm-ssd-gp3/ubuntu-noble*"
+
+# Use a specific region
+aws-bootstrap list instance-types --region us-east-1
+aws-bootstrap list amis --region us-east-1
+```
+
 ### Managing Instances
 
 ```bash

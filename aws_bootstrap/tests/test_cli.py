@@ -17,6 +17,7 @@ def test_help():
     assert "launch" in result.output
     assert "status" in result.output
     assert "terminate" in result.output
+    assert "list" in result.output
 
 
 def test_version():
@@ -177,3 +178,90 @@ def test_terminate_cancelled(mock_find, mock_session):
     result = runner.invoke(main, ["terminate"], input="n\n")
     assert result.exit_code == 0
     assert "Cancelled" in result.output
+
+
+# ---------------------------------------------------------------------------
+# list subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_list_help():
+    runner = CliRunner()
+    result = runner.invoke(main, ["list", "--help"])
+    assert result.exit_code == 0
+    assert "instance-types" in result.output
+    assert "amis" in result.output
+
+
+def test_list_instance_types_help():
+    runner = CliRunner()
+    result = runner.invoke(main, ["list", "instance-types", "--help"])
+    assert result.exit_code == 0
+    assert "--prefix" in result.output
+    assert "--region" in result.output
+
+
+def test_list_amis_help():
+    runner = CliRunner()
+    result = runner.invoke(main, ["list", "amis", "--help"])
+    assert result.exit_code == 0
+    assert "--filter" in result.output
+    assert "--region" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.list_instance_types")
+def test_list_instance_types_output(mock_list, mock_session):
+    mock_list.return_value = [
+        {
+            "InstanceType": "g4dn.xlarge",
+            "VCpuCount": 4,
+            "MemoryMiB": 16384,
+            "GpuSummary": "1x T4 (16384 MiB)",
+        },
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["list", "instance-types"])
+    assert result.exit_code == 0
+    assert "g4dn.xlarge" in result.output
+    assert "16384" in result.output
+    assert "T4" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.list_instance_types")
+def test_list_instance_types_empty(mock_list, mock_session):
+    mock_list.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["list", "instance-types", "--prefix", "zzz"])
+    assert result.exit_code == 0
+    assert "No instance types found" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.list_amis")
+def test_list_amis_output(mock_list, mock_session):
+    mock_list.return_value = [
+        {
+            "ImageId": "ami-abc123",
+            "Name": "Deep Learning AMI v42",
+            "CreationDate": "2025-06-01T00:00:00Z",
+            "Architecture": "x86_64",
+        },
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["list", "amis"])
+    assert result.exit_code == 0
+    assert "ami-abc123" in result.output
+    assert "Deep Learning AMI v42" in result.output
+    assert "2025-06-01" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.list_amis")
+def test_list_amis_empty(mock_list, mock_session):
+    mock_list.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["list", "amis", "--filter", "nonexistent*"])
+    assert result.exit_code == 0
+    assert "No AMIs found" in result.output

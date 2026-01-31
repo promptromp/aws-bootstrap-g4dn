@@ -15,6 +15,8 @@ from .ec2 import (
     get_latest_ami,
     get_spot_price,
     launch_instance,
+    list_amis,
+    list_instance_types,
     terminate_tagged_instances,
     wait_instance_ready,
 )
@@ -298,3 +300,67 @@ def terminate(region, profile, yes, instance_ids):
         )
     click.echo()
     success(f"Terminated {len(changes)} instance(s).")
+
+
+# ---------------------------------------------------------------------------
+# list command group
+# ---------------------------------------------------------------------------
+
+DEFAULT_AMI_PREFIX = "Deep Learning Base OSS Nvidia Driver GPU AMI*"
+
+
+@main.group(name="list")
+def list_cmd():
+    """List AWS resources (instance types, AMIs)."""
+
+
+@list_cmd.command(name="instance-types")
+@click.option("--prefix", default="g4dn", show_default=True, help="Instance type family prefix to filter on.")
+@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+def list_instance_types_cmd(prefix, region, profile):
+    """List EC2 instance types matching a family prefix (e.g. g4dn, p3, g5)."""
+    session = boto3.Session(profile_name=profile, region_name=region)
+    ec2 = session.client("ec2")
+
+    types = list_instance_types(ec2, prefix)
+    if not types:
+        click.secho(f"No instance types found matching '{prefix}.*'", fg="yellow")
+        return
+
+    click.secho(f"\n  {len(types)} instance type(s) matching '{prefix}.*':\n", bold=True, fg="cyan")
+
+    # Header
+    click.echo(
+        "  " + click.style(f"{'Instance Type':<24}{'vCPUs':>6}{'Memory (MiB)':>14}  GPU", fg="bright_white", bold=True)
+    )
+    click.echo("  " + "-" * 72)
+
+    for t in types:
+        gpu = t["GpuSummary"] or "-"
+        click.echo(f"  {t['InstanceType']:<24}{t['VCpuCount']:>6}{t['MemoryMiB']:>14}  {gpu}")
+
+    click.echo()
+
+
+@list_cmd.command(name="amis")
+@click.option("--filter", "ami_filter", default=DEFAULT_AMI_PREFIX, show_default=True, help="AMI name pattern.")
+@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+def list_amis_cmd(ami_filter, region, profile):
+    """List available AMIs matching a name pattern."""
+    session = boto3.Session(profile_name=profile, region_name=region)
+    ec2 = session.client("ec2")
+
+    amis = list_amis(ec2, ami_filter)
+    if not amis:
+        click.secho(f"No AMIs found matching '{ami_filter}'", fg="yellow")
+        return
+
+    click.secho(f"\n  {len(amis)} AMI(s) matching '{ami_filter}' (newest first):\n", bold=True, fg="cyan")
+
+    for ami in amis:
+        click.echo("  " + click.style(ami["ImageId"], fg="bright_white") + "  " + ami["CreationDate"][:10])
+        click.echo(f"    {ami['Name']}")
+
+    click.echo()
