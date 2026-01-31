@@ -44,14 +44,22 @@ ssh aws-gpu1                  # You're in, venv activated, PyTorch works
 
 ## Installation
 
+### From PyPI
+
 ```bash
-git clone https://github.com/your-org/aws-bootstrap-g4dn.git
+pip install aws-bootstrap-g4dn
+```
+
+### From source (development)
+
+```bash
+git clone https://github.com/promptromp/aws-bootstrap-g4dn.git
 cd aws-bootstrap-g4dn
 uv venv
 uv sync
 ```
 
-This installs the `aws-bootstrap` CLI into a virtualenv.
+Both methods install the `aws-bootstrap` CLI.
 
 ## SSH Key Setup
 
