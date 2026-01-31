@@ -9,6 +9,23 @@ from pathlib import Path
 import click
 
 
+def private_key_path(key_path: Path) -> Path:
+    """Derive the private key path from a public key path (strips .pub suffix)."""
+    return key_path.with_suffix("") if key_path.suffix == ".pub" else key_path
+
+
+def _ssh_opts(key_path: Path) -> list[str]:
+    """Build common SSH/SCP options: suppress host-key checking and specify identity."""
+    return [
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-i",
+        str(private_key_path(key_path)),
+    ]
+
+
 def import_key_pair(ec2_client, key_name: str, key_path: Path) -> str:
     """Import a local SSH public key to AWS, reusing if it already exists.
 
@@ -44,8 +61,7 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
 
     Tries a TCP connection to port 22 first, then an actual SSH command.
     """
-    # Strip .pub to get the private key path
-    private_key = key_path.with_suffix("") if key_path.suffix == ".pub" else key_path
+    base_opts = _ssh_opts(key_path)
 
     for attempt in range(1, retries + 1):
         # First check if port 22 is open
@@ -59,21 +75,7 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
 
         # Port is open, try actual SSH
         result = subprocess.run(
-            [
-                "ssh",
-                "-o",
-                "StrictHostKeyChecking=no",
-                "-o",
-                "UserKnownHostsFile=/dev/null",
-                "-o",
-                "ConnectTimeout=10",
-                "-o",
-                "BatchMode=yes",
-                "-i",
-                str(private_key),
-                f"{user}@{host}",
-                "echo ok",
-            ],
+            ["ssh", *base_opts, "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", f"{user}@{host}", "echo ok"],
             capture_output=True,
             text=True,
         )
@@ -89,15 +91,7 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
 
 def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) -> bool:
     """SCP the setup script to the instance and execute it."""
-    private_key = key_path.with_suffix("") if key_path.suffix == ".pub" else key_path
-    ssh_opts = [
-        "-o",
-        "StrictHostKeyChecking=no",
-        "-o",
-        "UserKnownHostsFile=/dev/null",
-        "-i",
-        str(private_key),
-    ]
+    ssh_opts = _ssh_opts(key_path)
 
     # SCP the script
     click.echo("  Uploading remote_setup.sh...")

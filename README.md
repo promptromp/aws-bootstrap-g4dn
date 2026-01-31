@@ -156,7 +156,7 @@ Common quota codes:
 Small increases (4-8 vCPUs) are typically auto-approved within minutes. You can also request increases via the [Service Quotas console](https://console.aws.amazon.com/servicequotas/home). While waiting, you can test the full launch/poll/SSH flow with a non-GPU instance type:
 
 ```bash
-aws-bootstrap launch --instance-type t3.medium --ami-filter "Ubuntu Server 24.04*"
+aws-bootstrap launch --instance-type t3.medium --ami-filter "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
 ```
 
 ## Additional Resources

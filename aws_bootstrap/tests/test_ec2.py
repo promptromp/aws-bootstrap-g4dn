@@ -11,13 +11,13 @@ import pytest
 from aws_bootstrap.config import LaunchConfig
 from aws_bootstrap.ec2 import (
     find_tagged_instances,
-    get_latest_dl_ami,
+    get_latest_ami,
     launch_instance,
     terminate_tagged_instances,
 )
 
 
-def test_get_latest_dl_ami_picks_newest():
+def test_get_latest_ami_picks_newest():
     ec2 = MagicMock()
     ec2.describe_images.return_value = {
         "Images": [
@@ -26,15 +26,15 @@ def test_get_latest_dl_ami_picks_newest():
             {"ImageId": "ami-mid", "Name": "DL AMI mid", "CreationDate": "2025-01-01T00:00:00Z"},
         ]
     }
-    ami = get_latest_dl_ami(ec2, "DL AMI*")
+    ami = get_latest_ami(ec2, "DL AMI*")
     assert ami["ImageId"] == "ami-new"
 
 
-def test_get_latest_dl_ami_no_results():
+def test_get_latest_ami_no_results():
     ec2 = MagicMock()
     ec2.describe_images.return_value = {"Images": []}
     with pytest.raises(click.ClickException, match="No AMI found"):
-        get_latest_dl_ami(ec2, "nonexistent*")
+        get_latest_ami(ec2, "nonexistent*")
 
 
 def _make_client_error(code: str, message: str = "test") -> botocore.exceptions.ClientError:

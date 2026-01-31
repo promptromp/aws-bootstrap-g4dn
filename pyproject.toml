@@ -47,7 +47,7 @@ max-complexity = 15
 
 [tool.ruff.lint.isort]
 combine-as-imports = true
-known-first-party = ["pdfalive"]
+known-first-party = ["aws_bootstrap"]
 lines-after-imports = 2
 no-lines-before = ["standard-library"]
 

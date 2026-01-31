@@ -8,16 +8,39 @@ import click
 from .config import LaunchConfig
 
 
-def get_latest_dl_ami(ec2_client, ami_filter: str) -> dict:
-    """Find the latest Deep Learning AMI matching the filter pattern."""
-    response = ec2_client.describe_images(
-        Owners=["amazon"],
-        Filters=[
+# Well-known AMI owners by name prefix
+_OWNER_HINTS = {
+    "Deep Learning": ["amazon"],
+    "ubuntu": ["099720109477"],  # Canonical
+    "Ubuntu": ["099720109477"],
+    "RHEL": ["309956199498"],
+    "al20": ["amazon"],  # Amazon Linux
+}
+
+
+def get_latest_ami(ec2_client, ami_filter: str) -> dict:
+    """Find the latest AMI matching the filter pattern.
+
+    Infers the owner from the filter prefix when possible,
+    otherwise searches all public AMIs.
+    """
+    owners = None
+    for prefix, owner_ids in _OWNER_HINTS.items():
+        if ami_filter.startswith(prefix):
+            owners = owner_ids
+            break
+
+    params: dict = {
+        "Filters": [
             {"Name": "name", "Values": [ami_filter]},
             {"Name": "state", "Values": ["available"]},
             {"Name": "architecture", "Values": ["x86_64"]},
         ],
-    )
+    }
+    if owners:
+        params["Owners"] = owners
+
+    response = ec2_client.describe_images(**params)
     images = response["Images"]
     if not images:
         raise click.ClickException(
@@ -25,8 +48,7 @@ def get_latest_dl_ami(ec2_client, ami_filter: str) -> dict:
         )
 
     images.sort(key=lambda x: x["CreationDate"], reverse=True)
-    ami = images[0]
-    return ami
+    return images[0]
 
 
 def ensure_security_group(ec2_client, name: str, tag_value: str) -> str:
@@ -85,14 +107,14 @@ def ensure_security_group(ec2_client, name: str, tag_value: str) -> str:
 
 def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -> dict:
     """Launch an EC2 instance (spot or on-demand)."""
-    launch_params = dict(
-        ImageId=ami_id,
-        InstanceType=config.instance_type,
-        KeyName=config.key_name,
-        SecurityGroupIds=[sg_id],
-        MinCount=1,
-        MaxCount=1,
-        BlockDeviceMappings=[
+    launch_params = {
+        "ImageId": ami_id,
+        "InstanceType": config.instance_type,
+        "KeyName": config.key_name,
+        "SecurityGroupIds": [sg_id],
+        "MinCount": 1,
+        "MaxCount": 1,
+        "BlockDeviceMappings": [
             {
                 "DeviceName": "/dev/sda1",
                 "Ebs": {
@@ -102,7 +124,7 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
                 },
             }
         ],
-        TagSpecifications=[
+        "TagSpecifications": [
             {
                 "ResourceType": "instance",
                 "Tags": [
@@ -111,7 +133,7 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
                 ],
             }
         ],
-    )
+    }
 
     if config.spot:
         launch_params["InstanceMarketOptions"] = {
@@ -144,32 +166,31 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
         else:
             raise
 
-    instance = response["Instances"][0]
-    return instance
+    return response["Instances"][0]
 
+
+_UBUNTU_AMI = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
 
 QUOTA_HINT = (
     "See the 'EC2 vCPU Quotas' section in README.md for instructions on\n"
     "  checking and requesting quota increases.\n\n"
     "  To test the flow without GPU quotas, try:\n"
-    '    aws-bootstrap launch --instance-type t3.medium --ami-filter "Ubuntu Server 24.04*"'
+    f'    aws-bootstrap launch --instance-type t3.medium --ami-filter "{_UBUNTU_AMI}"'
 )
 
 
 def _raise_quota_error(code: str, config: LaunchConfig) -> None:
-    pricing = "spot" if config.spot else "on-demand"
     if code == "MaxSpotInstanceCountExceeded":
-        msg = (
-            f"Spot instance quota exceeded for {config.instance_type} in {config.region}.\n\n"
-            f"  Your account's spot vCPU limit for this instance family is too low.\n"
-            f"  {QUOTA_HINT}"
-        )
+        pricing = "spot"
+        label = "Spot instance"
     else:
-        msg = (
-            f"On-demand vCPU quota exceeded for {config.instance_type} in {config.region}.\n\n"
-            f"  Your account's {pricing} vCPU limit for this instance family is too low.\n"
-            f"  {QUOTA_HINT}"
-        )
+        pricing = "spot" if config.spot else "on-demand"
+        label = "On-demand vCPU"
+    msg = (
+        f"{label} quota exceeded for {config.instance_type} in {config.region}.\n\n"
+        f"  Your account's {pricing} vCPU limit for this instance family is too low.\n"
+        f"  {QUOTA_HINT}"
+    )
     raise click.ClickException(msg)
 
 
@@ -184,10 +205,7 @@ def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
     instances = []
     for reservation in response["Reservations"]:
         for inst in reservation["Instances"]:
-            name = ""
-            for tag in inst.get("Tags", []):
-                if tag["Key"] == "Name":
-                    name = tag["Value"]
+            name = next((tag["Value"] for tag in inst.get("Tags", []) if tag["Key"] == "Name"), "")
             instances.append(
                 {
                     "InstanceId": inst["InstanceId"],

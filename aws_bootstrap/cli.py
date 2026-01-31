@@ -10,12 +10,12 @@ from .config import LaunchConfig
 from .ec2 import (
     ensure_security_group,
     find_tagged_instances,
-    get_latest_dl_ami,
+    get_latest_ami,
     launch_instance,
     terminate_tagged_instances,
     wait_instance_ready,
 )
-from .ssh import import_key_pair, run_remote_setup, wait_for_ssh
+from .ssh import import_key_pair, private_key_path, run_remote_setup, wait_for_ssh
 
 
 SETUP_SCRIPT = Path(__file__).parent / "remote_setup.sh"
@@ -104,8 +104,8 @@ def launch(
     ec2 = session.client("ec2")
 
     # Step 1: AMI lookup
-    step(1, 6, "Looking up Deep Learning AMI...")
-    ami = get_latest_dl_ami(ec2, config.ami_filter)
+    step(1, 6, "Looking up AMI...")
+    ami = get_latest_ami(ec2, config.ami_filter)
     info(f"Found: {ami['Name']}")
     val("AMI ID", ami["ImageId"])
 
@@ -117,12 +117,14 @@ def launch(
     step(3, 6, "Ensuring security group...")
     sg_id = ensure_security_group(ec2, config.security_group, config.tag_value)
 
+    pricing = "spot" if config.spot else "on-demand"
+
     if config.dry_run:
         click.echo()
         click.secho("--- Dry Run Summary ---", bold=True, fg="yellow")
         val("Instance type", config.instance_type)
         val("AMI", f"{ami['ImageId']} ({ami['Name']})")
-        val("Pricing", "spot" if config.spot else "on-demand")
+        val("Pricing", pricing)
         val("Key pair", config.key_name)
         val("Security group", sg_id)
         val("Volume", f"{config.volume_size} GB gp3")
@@ -133,7 +135,6 @@ def launch(
         return
 
     # Step 4: Launch instance
-    pricing = "spot" if config.spot else "on-demand"
     step(4, 6, f"Launching {config.instance_type} instance ({pricing})...")
     instance = launch_instance(ec2, config, ami["ImageId"], sg_id)
     instance_id = instance["InstanceId"]
@@ -152,20 +153,21 @@ def launch(
 
     # Step 6: SSH and remote setup
     step(6, 6, "Waiting for SSH access...")
-    private_key = config.key_path.with_suffix("") if config.key_path.suffix == ".pub" else config.key_path
+    private_key = private_key_path(config.key_path)
     if not wait_for_ssh(public_ip, config.ssh_user, config.key_path):
         warn("SSH did not become available within the timeout.")
         info(f"Instance is running — try connecting manually: ssh -i {private_key} {config.ssh_user}@{public_ip}")
         return
 
-    if config.run_setup and SETUP_SCRIPT.exists():
-        info("Running remote setup...")
-        if run_remote_setup(public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT):
-            success("Remote setup completed successfully.")
+    if config.run_setup:
+        if not SETUP_SCRIPT.exists():
+            warn(f"Setup script not found at {SETUP_SCRIPT}, skipping.")
         else:
-            warn("Remote setup failed. Instance is still running.")
-    elif config.run_setup and not SETUP_SCRIPT.exists():
-        warn(f"Setup script not found at {SETUP_SCRIPT}, skipping.")
+            info("Running remote setup...")
+            if run_remote_setup(public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT):
+                success("Remote setup completed successfully.")
+            else:
+                warn("Remote setup failed. Instance is still running.")
 
     # Print connection info
     click.echo()
