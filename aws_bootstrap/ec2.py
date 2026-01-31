@@ -1,6 +1,7 @@
 """EC2 instance provisioning: AMI lookup, security groups, and instance launch."""
 
 from __future__ import annotations
+from datetime import UTC, datetime
 
 import botocore.exceptions
 import click
@@ -214,9 +215,29 @@ def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
                     "InstanceType": inst["InstanceType"],
                     "PublicIp": inst.get("PublicIpAddress", ""),
                     "LaunchTime": inst["LaunchTime"],
+                    "Lifecycle": inst.get("InstanceLifecycle", "on-demand"),
+                    "AvailabilityZone": inst["Placement"]["AvailabilityZone"],
                 }
             )
     return instances
+
+
+def get_spot_price(ec2_client, instance_type: str, availability_zone: str) -> float | None:
+    """Get the current spot price for an instance type in a given AZ.
+
+    Returns the hourly price as a float, or None if unavailable.
+    """
+    response = ec2_client.describe_spot_price_history(
+        InstanceTypes=[instance_type],
+        ProductDescriptions=["Linux/UNIX"],
+        AvailabilityZone=availability_zone,
+        StartTime=datetime.now(UTC),
+        MaxResults=1,
+    )
+    prices = response.get("SpotPriceHistory", [])
+    if not prices:
+        return None
+    return float(prices[0]["SpotPrice"])
 
 
 def terminate_tagged_instances(ec2_client, instance_ids: list[str]) -> list[dict]:

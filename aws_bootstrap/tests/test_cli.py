@@ -70,8 +70,9 @@ def test_status_no_instances(mock_find, mock_session):
 
 
 @patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price")
 @patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_shows_instances(mock_find, mock_session):
+def test_status_shows_instances(mock_find, mock_spot_price, mock_session):
     mock_find.return_value = [
         {
             "InstanceId": "i-abc123",
@@ -80,13 +81,44 @@ def test_status_shows_instances(mock_find, mock_session):
             "InstanceType": "g4dn.xlarge",
             "PublicIp": "1.2.3.4",
             "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+            "Lifecycle": "spot",
+            "AvailabilityZone": "us-west-2a",
         }
     ]
+    mock_spot_price.return_value = 0.1578
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
     assert result.exit_code == 0
     assert "i-abc123" in result.output
     assert "1.2.3.4" in result.output
+    assert "spot ($0.1578/hr)" in result.output
+    assert "Uptime" in result.output
+    assert "Est. cost" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_on_demand_no_cost(mock_find, mock_spot_price, mock_session):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-ondemand",
+            "Name": "aws-bootstrap-g4dn.xlarge",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "5.6.7.8",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+            "Lifecycle": "on-demand",
+            "AvailabilityZone": "us-west-2a",
+        }
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "on-demand" in result.output
+    assert "Uptime" not in result.output
+    assert "Est. cost" not in result.output
+    mock_spot_price.assert_not_called()
 
 
 @patch("aws_bootstrap.cli.boto3.Session")

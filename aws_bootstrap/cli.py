@@ -1,6 +1,7 @@
 """CLI entry point for aws-bootstrap-g4dn."""
 
 from __future__ import annotations
+from datetime import UTC, datetime
 from pathlib import Path
 
 import boto3
@@ -11,6 +12,7 @@ from .ec2 import (
     ensure_security_group,
     find_tagged_instances,
     get_latest_ami,
+    get_spot_price,
     launch_instance,
     terminate_tagged_instances,
     wait_instance_ready,
@@ -221,6 +223,30 @@ def status(region, profile):
         val("    Type", inst["InstanceType"])
         if inst["PublicIp"]:
             val("    IP", inst["PublicIp"])
+
+        lifecycle = inst["Lifecycle"]
+        is_spot = lifecycle == "spot"
+
+        if is_spot:
+            spot_price = get_spot_price(ec2, inst["InstanceType"], inst["AvailabilityZone"])
+            if spot_price is not None:
+                val("    Pricing", f"spot (${spot_price:.4f}/hr)")
+            else:
+                val("    Pricing", "spot")
+        else:
+            val("    Pricing", "on-demand")
+
+        if state == "running" and is_spot:
+            uptime = datetime.now(UTC) - inst["LaunchTime"]
+            total_seconds = int(uptime.total_seconds())
+            hours, remainder = divmod(total_seconds, 3600)
+            minutes = remainder // 60
+            val("    Uptime", f"{hours}h {minutes:02d}m")
+            if spot_price is not None:
+                uptime_hours = uptime.total_seconds() / 3600
+                est_cost = uptime_hours * spot_price
+                val("    Est. cost", f"~${est_cost:.4f}")
+
         val("    Launched", str(inst["LaunchTime"]))
     click.echo()
     first_id = instances[0]["InstanceId"]

@@ -12,6 +12,7 @@ from aws_bootstrap.config import LaunchConfig
 from aws_bootstrap.ec2 import (
     find_tagged_instances,
     get_latest_ami,
+    get_spot_price,
     launch_instance,
     terminate_tagged_instances,
 )
@@ -80,6 +81,8 @@ def test_find_tagged_instances():
                         "InstanceType": "g4dn.xlarge",
                         "PublicIpAddress": "1.2.3.4",
                         "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                        "InstanceLifecycle": "spot",
+                        "Placement": {"AvailabilityZone": "us-west-2a"},
                         "Tags": [
                             {"Key": "Name", "Value": "aws-bootstrap-g4dn.xlarge"},
                             {"Key": "created-by", "Value": "aws-bootstrap-g4dn"},
@@ -95,12 +98,57 @@ def test_find_tagged_instances():
     assert instances[0]["State"] == "running"
     assert instances[0]["PublicIp"] == "1.2.3.4"
     assert instances[0]["Name"] == "aws-bootstrap-g4dn.xlarge"
+    assert instances[0]["Lifecycle"] == "spot"
+    assert instances[0]["AvailabilityZone"] == "us-west-2a"
+
+
+def test_find_tagged_instances_on_demand_lifecycle():
+    """On-demand instances have no InstanceLifecycle key; should default to 'on-demand'."""
+    ec2 = MagicMock()
+    ec2.describe_instances.return_value = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-ondemand",
+                        "State": {"Name": "running"},
+                        "InstanceType": "g4dn.xlarge",
+                        "PublicIpAddress": "5.6.7.8",
+                        "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                        "Placement": {"AvailabilityZone": "us-west-2b"},
+                        "Tags": [
+                            {"Key": "Name", "Value": "aws-bootstrap-g4dn.xlarge"},
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
+    assert len(instances) == 1
+    assert instances[0]["Lifecycle"] == "on-demand"
+    assert instances[0]["AvailabilityZone"] == "us-west-2b"
 
 
 def test_find_tagged_instances_empty():
     ec2 = MagicMock()
     ec2.describe_instances.return_value = {"Reservations": []}
     assert find_tagged_instances(ec2, "aws-bootstrap-g4dn") == []
+
+
+def test_get_spot_price_returns_price():
+    ec2 = MagicMock()
+    ec2.describe_spot_price_history.return_value = {"SpotPriceHistory": [{"SpotPrice": "0.1578"}]}
+    price = get_spot_price(ec2, "g4dn.xlarge", "us-west-2a")
+    assert price == 0.1578
+    ec2.describe_spot_price_history.assert_called_once()
+
+
+def test_get_spot_price_returns_none_when_empty():
+    ec2 = MagicMock()
+    ec2.describe_spot_price_history.return_value = {"SpotPriceHistory": []}
+    price = get_spot_price(ec2, "g4dn.xlarge", "us-west-2a")
+    assert price is None
 
 
 def test_terminate_tagged_instances():
