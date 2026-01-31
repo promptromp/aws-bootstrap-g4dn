@@ -218,6 +218,11 @@ def launch(
     info("Then open: http://localhost:8888")
 
     click.echo()
+    click.secho("  GPU Benchmark:", fg="cyan")
+    click.secho(f"    ssh {alias} 'python ~/gpu_benchmark.py'", bold=True)
+    info("Runs CNN (MNIST) and Transformer benchmarks with tqdm progress")
+
+    click.echo()
     click.secho("  Terminate:", fg="cyan")
     click.secho(f"    aws-bootstrap terminate {instance_id} --region {config.region}", bold=True)
     click.echo()
@@ -275,7 +280,13 @@ def status(region, profile, gpu):
                 )
             if gpu_info:
                 val("    GPU", f"{gpu_info.gpu_name} ({gpu_info.architecture})")
-                val("    CUDA", gpu_info.cuda_version)
+                if gpu_info.cuda_toolkit_version:
+                    cuda_str = gpu_info.cuda_toolkit_version
+                    if gpu_info.cuda_driver_version != gpu_info.cuda_toolkit_version:
+                        cuda_str += f" (driver supports up to {gpu_info.cuda_driver_version})"
+                else:
+                    cuda_str = f"{gpu_info.cuda_driver_version} (driver max, toolkit unknown)"
+                val("    CUDA", cuda_str)
                 val("    Driver", gpu_info.driver_version)
             else:
                 click.echo("    GPU: " + click.style("unavailable", dim=True))

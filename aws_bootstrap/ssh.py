@@ -121,6 +121,18 @@ def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) ->
         click.secho(f"  SCP failed: {req_result.stderr}", fg="red", err=True)
         return False
 
+    # SCP the GPU benchmark script
+    benchmark_path = script_path.parent / "gpu_benchmark.py"
+    click.echo("  Uploading gpu_benchmark.py...")
+    bench_result = subprocess.run(
+        ["scp", *ssh_opts, str(benchmark_path), f"{user}@{host}:/tmp/gpu_benchmark.py"],
+        capture_output=True,
+        text=True,
+    )
+    if bench_result.returncode != 0:
+        click.secho(f"  SCP failed: {bench_result.stderr}", fg="red", err=True)
+        return False
+
     # SCP the script
     click.echo("  Uploading remote_setup.sh...")
     scp_result = subprocess.run(
@@ -319,10 +331,11 @@ class SSHHostDetails:
 
 @dataclass
 class GpuInfo:
-    """GPU information retrieved via nvidia-smi."""
+    """GPU information retrieved via nvidia-smi and nvcc."""
 
     driver_version: str
-    cuda_version: str
+    cuda_driver_version: str  # max CUDA version supported by driver (from nvidia-smi)
+    cuda_toolkit_version: str | None  # actual CUDA toolkit installed (from nvcc), None if unavailable
     gpu_name: str
     compute_capability: str
     architecture: str
@@ -377,6 +390,7 @@ def query_gpu_info(host: str, user: str, key_path: Path, timeout: int = 10) -> G
     remote_cmd = (
         "nvidia-smi --query-gpu=driver_version,name,compute_cap --format=csv,noheader,nounits"
         " && nvidia-smi | grep -oP 'CUDA Version: \\K[\\d.]+'"
+        " && (nvcc --version 2>/dev/null | grep -oP 'release \\K[\\d.]+' || echo 'N/A')"
     )
     cmd = [
         "ssh",
@@ -406,11 +420,17 @@ def query_gpu_info(host: str, user: str, key_path: Path, timeout: int = 10) -> G
         if len(parts) != 3:
             return None
         driver_version, gpu_name, compute_cap = parts
-        cuda_version = lines[1].strip()
+        cuda_driver_version = lines[1].strip()
+        cuda_toolkit_version: str | None = None
+        if len(lines) >= 3:
+            toolkit_line = lines[2].strip()
+            if toolkit_line and toolkit_line != "N/A":
+                cuda_toolkit_version = toolkit_line
         architecture = _GPU_ARCHITECTURES.get(compute_cap, f"Unknown ({compute_cap})")
         return GpuInfo(
             driver_version=driver_version,
-            cuda_version=cuda_version,
+            cuda_driver_version=cuda_driver_version,
+            cuda_toolkit_version=cuda_toolkit_version,
             gpu_name=gpu_name,
             compute_capability=compute_cap,
             architecture=architecture,

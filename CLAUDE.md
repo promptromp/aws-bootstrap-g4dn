@@ -36,6 +36,7 @@ aws_bootstrap/
     ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
+        gpu_benchmark.py # GPU throughput benchmark (CNN + Transformer), copied to ~/gpu_benchmark.py on instance
         remote_setup.sh  # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
         requirements.txt # Python dependencies installed on the remote instance
     tests/               # Unit tests (pytest)
@@ -88,6 +89,10 @@ Use `uv add <package>` to add dependencies and `uv add --group dev <package>` fo
 The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags published by PyTorch (e.g., `118 121 124 126 128 129 130`). When PyTorch adds support for a new CUDA version, add the corresponding tag to this array. Check available tags at: https://download.pytorch.org/whl/
 
 `torch` and `torchvision` are **not** in `resources/requirements.txt` — they are installed separately by the CUDA detection logic in `remote_setup.sh`. All other Python dependencies remain in `requirements.txt`.
+
+## GPU Benchmark
+
+`resources/gpu_benchmark.py` is uploaded to `~/gpu_benchmark.py` on the remote instance during setup. It benchmarks GPU throughput with two modes: CNN on MNIST and a GPT-style Transformer on synthetic data. It reports samples/sec, batch times, and peak GPU memory. Supports `--precision` (fp32/fp16/bf16/tf32), `--diagnose` for CUDA smoke tests, and separate `--transformer-batch-size` (default 32, T4-safe). Dependencies (`torch`, `torchvision`, `tqdm`) are already installed by the setup script.
 
 ## Keeping Docs Updated
 

@@ -416,7 +416,8 @@ _RUNNING_INSTANCE = {
 
 _SAMPLE_GPU_INFO = GpuInfo(
     driver_version="560.35.03",
-    cuda_version="12.8",
+    cuda_driver_version="13.0",
+    cuda_toolkit_version="12.8",
     gpu_name="Tesla T4",
     compute_capability="7.5",
     architecture="Turing",
@@ -446,6 +447,7 @@ def test_status_gpu_shows_info(mock_find, mock_spot, mock_session, mock_ssh_host
     assert result.exit_code == 0
     assert "Tesla T4 (Turing)" in result.output
     assert "12.8" in result.output
+    assert "driver supports up to 13.0" in result.output
     assert "560.35.03" in result.output
     mock_gpu.assert_called_once()
 

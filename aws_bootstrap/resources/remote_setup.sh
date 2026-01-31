@@ -109,6 +109,30 @@ install_pytorch_cuda
 # Install remaining dependencies (torch/torchvision already installed above)
 uv pip install --python ~/venv/bin/python -r /tmp/requirements.txt
 
+# Copy GPU benchmark script
+cp /tmp/gpu_benchmark.py ~/gpu_benchmark.py
+
+# Auto-activate venv on login
+if ! grep -q 'source ~/venv/bin/activate' ~/.bashrc 2>/dev/null; then
+    echo 'source ~/venv/bin/activate' >> ~/.bashrc
+fi
+
+# Quick CUDA smoke test
+echo "  Running CUDA smoke test..."
+if ~/venv/bin/python -c "
+import torch
+assert torch.cuda.is_available(), 'CUDA not available'
+x = torch.randn(256, 256, device='cuda')
+y = torch.mm(x, x)
+torch.cuda.synchronize()
+print(f'  PyTorch {torch.__version__}, CUDA {torch.version.cuda}, GPU: {torch.cuda.get_device_name(0)}')
+print('  Quick matmul test: PASSED')
+"; then
+    echo "  CUDA smoke test passed"
+else
+    echo "  WARNING: CUDA smoke test failed — check PyTorch/CUDA installation"
+fi
+
 JUPYTER_CONFIG_DIR="$HOME/.jupyter"
 mkdir -p "$JUPYTER_CONFIG_DIR"
 cat > "$JUPYTER_CONFIG_DIR/jupyter_lab_config.py" << 'PYEOF'
