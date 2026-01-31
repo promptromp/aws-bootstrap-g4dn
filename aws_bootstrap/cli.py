@@ -9,6 +9,7 @@ import click
 
 from .config import LaunchConfig
 from .ec2 import (
+    CLIError,
     ensure_security_group,
     find_tagged_instances,
     get_latest_ami,
@@ -99,7 +100,7 @@ def launch(
 
     # Validate key path
     if not config.key_path.exists():
-        raise click.ClickException(f"SSH public key not found: {config.key_path}")
+        raise CLIError(f"SSH public key not found: {config.key_path}")
 
     # Build boto3 session
     session = boto3.Session(profile_name=config.profile, region_name=config.region)

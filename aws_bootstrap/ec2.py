@@ -9,6 +9,15 @@ import click
 from .config import LaunchConfig
 
 
+class CLIError(click.ClickException):
+    """A ClickException that displays the error message in red."""
+
+    def show(self, file=None):  # type: ignore[no-untyped-def]
+        if file is None:
+            file = click.get_text_stream("stderr")
+        click.secho(f"Error: {self.format_message()}", file=file, fg="red")
+
+
 # Well-known AMI owners by name prefix
 _OWNER_HINTS = {
     "Deep Learning": ["amazon"],
@@ -44,9 +53,7 @@ def get_latest_ami(ec2_client, ami_filter: str) -> dict:
     response = ec2_client.describe_images(**params)
     images = response["Images"]
     if not images:
-        raise click.ClickException(
-            f"No AMI found matching filter: {ami_filter}\nTry adjusting --ami-filter or check the region."
-        )
+        raise CLIError(f"No AMI found matching filter: {ami_filter}\nTry adjusting --ami-filter or check the region.")
 
     images.sort(key=lambda x: x["CreationDate"], reverse=True)
     return images[0]
@@ -57,7 +64,7 @@ def ensure_security_group(ec2_client, name: str, tag_value: str) -> str:
     # Find default VPC
     vpcs = ec2_client.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
     if not vpcs["Vpcs"]:
-        raise click.ClickException("No default VPC found. Create one or specify a VPC.")
+        raise CLIError("No default VPC found. Create one or specify a VPC.")
     vpc_id = vpcs["Vpcs"][0]["VpcId"]
 
     # Check if SG already exists
@@ -163,7 +170,7 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
                         _raise_quota_error(retry_code, config)
                     raise
             else:
-                raise click.ClickException("Launch cancelled.") from None
+                raise CLIError("Launch cancelled.") from None
         else:
             raise
 
@@ -192,7 +199,7 @@ def _raise_quota_error(code: str, config: LaunchConfig) -> None:
         f"  Your account's {pricing} vCPU limit for this instance family is too low.\n"
         f"  {QUOTA_HINT}"
     )
-    raise click.ClickException(msg)
+    raise CLIError(msg)
 
 
 def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:

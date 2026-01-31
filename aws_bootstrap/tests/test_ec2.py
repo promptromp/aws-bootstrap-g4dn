@@ -1,6 +1,7 @@
 """Tests for EC2 helper functions."""
 
 from __future__ import annotations
+import io
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -10,12 +11,27 @@ import pytest
 
 from aws_bootstrap.config import LaunchConfig
 from aws_bootstrap.ec2 import (
+    CLIError,
     find_tagged_instances,
     get_latest_ami,
     get_spot_price,
     launch_instance,
     terminate_tagged_instances,
 )
+
+
+def test_cli_error_is_click_exception():
+    err = CLIError("something went wrong")
+    assert isinstance(err, click.ClickException)
+    assert err.format_message() == "something went wrong"
+
+
+def test_cli_error_show_outputs_red():
+    err = CLIError("bad input")
+    buf = io.StringIO()
+    err.show(file=buf)
+    output = buf.getvalue()
+    assert "Error: bad input" in output
 
 
 def test_get_latest_ami_picks_newest():
