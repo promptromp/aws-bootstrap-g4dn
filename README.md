@@ -23,12 +23,11 @@ Main workflows we're optimizing for are hybrid local-remote workflows e.g.:
 ```bash
 git clone https://github.com/your-org/aws-bootstrap-g4dn.git
 cd aws-bootstrap-g4dn
-uv venv .venv
+uv venv
 uv sync
-direnv allow  # or manually: source .venv/bin/activate
 ```
 
-This installs the `aws-bootstrap` CLI into your virtualenv.
+This installs the `aws-bootstrap` CLI into a virtualenv.
 
 ## SSH Key Setup
 
