@@ -18,7 +18,7 @@ from .ec2 import (
 from .ssh import import_key_pair, private_key_path, run_remote_setup, wait_for_ssh
 
 
-SETUP_SCRIPT = Path(__file__).parent / "remote_setup.sh"
+SETUP_SCRIPT = Path(__file__).parent / "resources" / "remote_setup.sh"
 
 
 def step(number: int, total: int, msg: str) -> None:
@@ -222,6 +222,9 @@ def status(region, profile):
         if inst["PublicIp"]:
             val("    IP", inst["PublicIp"])
         val("    Launched", str(inst["LaunchTime"]))
+    click.echo()
+    first_id = instances[0]["InstanceId"]
+    click.echo("  To terminate:  " + click.style(f"aws-bootstrap terminate {first_id}", bold=True))
     click.echo()
 
 

@@ -26,12 +26,16 @@ echo "[2/5] Installing utilities..."
 sudo apt-get update -qq
 sudo apt-get install -y -qq htop tmux tree jq
 
-# 3. Configure Jupyter
+# 3. Set up Python environment with uv
 echo ""
-echo "[3/5] Configuring Jupyter Lab..."
-if ! command -v jupyter &>/dev/null; then
-    pip install --quiet jupyterlab
+echo "[3/5] Setting up Python environment with uv..."
+if ! command -v uv &>/dev/null; then
+    curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
+export PATH="$HOME/.local/bin:$PATH"
+
+uv venv ~/venv
+uv pip install --python ~/venv/bin/python -r /tmp/requirements.txt
 
 JUPYTER_CONFIG_DIR="$HOME/.jupyter"
 mkdir -p "$JUPYTER_CONFIG_DIR"
@@ -47,7 +51,6 @@ echo "  Jupyter config written to $JUPYTER_CONFIG_DIR/jupyter_lab_config.py"
 # 4. Jupyter systemd service
 echo ""
 echo "[4/5] Setting up Jupyter systemd service..."
-JUPYTER_BIN=$(command -v jupyter || echo "/usr/local/bin/jupyter")
 LOGIN_USER=$(whoami)
 
 sudo tee /etc/systemd/system/jupyter.service > /dev/null << SVCEOF
@@ -59,7 +62,7 @@ After=network.target
 Type=simple
 User=${LOGIN_USER}
 WorkingDirectory=/home/${LOGIN_USER}
-ExecStart=${JUPYTER_BIN} lab
+ExecStart=/home/${LOGIN_USER}/venv/bin/python -m jupyterlab
 Restart=on-failure
 RestartSec=10
 

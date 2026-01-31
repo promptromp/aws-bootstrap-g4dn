@@ -34,7 +34,10 @@ aws_bootstrap/
     config.py            # LaunchConfig dataclass with defaults
     ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling
     ssh.py               # SSH key pair import, SSH readiness check, remote setup
-    remote_setup.sh      # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
+    resources/           # Non-Python artifacts SCP'd to remote instances
+        __init__.py
+        remote_setup.sh  # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
+        requirements.txt # Python dependencies installed on the remote instance
     tests/               # Unit tests (pytest)
 ```
 

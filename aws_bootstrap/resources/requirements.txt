@@ -1,0 +1,10 @@
+numpy
+matplotlib
+scipy
+torch
+torchvision
+datasets
+transformers
+pandas
+tensorboard
+jupyterlab

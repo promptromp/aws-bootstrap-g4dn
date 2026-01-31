@@ -90,8 +90,20 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
 
 
 def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) -> bool:
-    """SCP the setup script to the instance and execute it."""
+    """SCP the setup script and requirements.txt to the instance and execute."""
     ssh_opts = _ssh_opts(key_path)
+    requirements_path = script_path.parent / "requirements.txt"
+
+    # SCP the requirements file
+    click.echo("  Uploading requirements.txt...")
+    req_result = subprocess.run(
+        ["scp", *ssh_opts, str(requirements_path), f"{user}@{host}:/tmp/requirements.txt"],
+        capture_output=True,
+        text=True,
+    )
+    if req_result.returncode != 0:
+        click.secho(f"  SCP failed: {req_result.stderr}", fg="red", err=True)
+        return False
 
     # SCP the script
     click.echo("  Uploading remote_setup.sh...")
