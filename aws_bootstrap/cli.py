@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import boto3
+import botocore.exceptions
 import click
 
 from .config import LaunchConfig
@@ -56,7 +57,39 @@ def warn(msg: str) -> None:
     click.secho(f"  WARNING: {msg}", fg="yellow", err=True)
 
 
-@click.group()
+class _AWSGroup(click.Group):
+    """Click group that catches common AWS credential/auth errors."""
+
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except botocore.exceptions.NoCredentialsError:
+            raise CLIError(
+                "Unable to locate AWS credentials.\n\n"
+                "  Make sure you have configured AWS credentials using one of:\n"
+                "    - Set the AWS_PROFILE environment variable:  export AWS_PROFILE=<profile-name>\n"
+                "    - Pass --profile to the command:  aws-bootstrap <command> --profile <profile-name>\n"
+                "    - Configure a default profile:  aws configure\n\n"
+                "  See: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html"
+            ) from None
+        except botocore.exceptions.ProfileNotFound as e:
+            raise CLIError(f"{e}\n\n  List available profiles with:  aws configure list-profiles") from None
+        except botocore.exceptions.PartialCredentialsError as e:
+            raise CLIError(
+                f"Incomplete AWS credentials: {e}\n\n  Check your AWS configuration with:  aws configure list"
+            ) from None
+        except botocore.exceptions.ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("AuthFailure", "UnauthorizedOperation", "ExpiredTokenException", "ExpiredToken"):
+                raise CLIError(
+                    f"AWS authorization failed: {e.response['Error']['Message']}\n\n"
+                    "  Your credentials may be expired or lack the required permissions.\n"
+                    "  Check your AWS configuration with:  aws configure list"
+                ) from None
+            raise
+
+
+@click.group(cls=_AWSGroup)
 @click.version_option(package_name="aws-bootstrap-g4dn")
 def main():
     """Bootstrap AWS EC2 GPU instances for hybrid local-remote development."""

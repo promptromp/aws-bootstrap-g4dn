@@ -50,6 +50,16 @@ ssh aws-gpu1                  # You're in, venv activated, PyTorch works
 pip install aws-bootstrap-g4dn
 ```
 
+### With uvx (no install needed)
+
+[uvx](https://docs.astral.sh/uv/guides/tools/) runs the CLI directly in a temporary environment — no global install required:
+
+```bash
+uvx --from aws-bootstrap-g4dn aws-bootstrap launch
+uvx --from aws-bootstrap-g4dn aws-bootstrap status
+uvx --from aws-bootstrap-g4dn aws-bootstrap terminate
+```
+
 ### From source (development)
 
 ```bash
@@ -59,7 +69,7 @@ uv venv
 uv sync
 ```
 
-Both methods install the `aws-bootstrap` CLI.
+All methods install the `aws-bootstrap` CLI.
 
 ## SSH Key Setup
 
