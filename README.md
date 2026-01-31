@@ -210,6 +210,9 @@ aws-bootstrap status
 # Include GPU info (CUDA toolkit + driver version, GPU name, architecture) via SSH
 aws-bootstrap status --gpu
 
+# Hide connection commands (shown by default for each running instance)
+aws-bootstrap status --no-instructions
+
 # List instances in a specific region
 aws-bootstrap status --region us-east-1
 

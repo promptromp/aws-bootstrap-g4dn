@@ -275,6 +275,13 @@ def launch(
     info("Notebook: ~/gpu_smoke_test.ipynb (GPU smoke test)")
 
     click.echo()
+    click.secho("  VSCode Remote SSH:", fg="cyan")
+    click.secho(
+        f"    code --folder-uri vscode-remote://ssh-remote+{alias}/home/{config.ssh_user}",
+        bold=True,
+    )
+
+    click.echo()
     click.secho("  GPU Benchmark:", fg="cyan")
     click.secho(f"    ssh {alias} 'python ~/gpu_benchmark.py'", bold=True)
     info("Runs CNN (MNIST) and Transformer benchmarks with tqdm progress")
@@ -289,7 +296,14 @@ def launch(
 @click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.option("--gpu", is_flag=True, default=False, help="Query GPU info (CUDA, driver) via SSH.")
-def status(region, profile, gpu):
+@click.option(
+    "--instructions/--no-instructions",
+    "-I",
+    default=True,
+    show_default=True,
+    help="Show connection commands (SSH, Jupyter, VSCode) for each running instance.",
+)
+def status(region, profile, gpu, instructions):
     """Show running instances created by aws-bootstrap."""
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
@@ -328,9 +342,13 @@ def status(region, profile, gpu):
         if inst["PublicIp"]:
             val("    IP", inst["PublicIp"])
 
+        # Look up SSH config details once (used by --gpu and --with-instructions)
+        details = None
+        if (gpu or instructions) and state == "running" and inst["PublicIp"]:
+            details = get_ssh_host_details(inst["InstanceId"])
+
         # GPU info (opt-in, only for running instances with a public IP)
         if gpu and state == "running" and inst["PublicIp"]:
-            details = get_ssh_host_details(inst["InstanceId"])
             if details:
                 gpu_info = query_gpu_info(details.hostname, details.user, details.identity_file, port=details.port)
             else:
@@ -376,6 +394,29 @@ def status(region, profile, gpu):
                 val("    Est. cost", f"~${est_cost:.4f}")
 
         val("    Launched", str(inst["LaunchTime"]))
+
+        # Connection instructions (opt-in, only for running instances with a public IP and alias)
+        if instructions and state == "running" and inst["PublicIp"] and alias:
+            user = details.user if details else "ubuntu"
+            port = details.port if details else 22
+            port_flag = f" -p {port}" if port != 22 else ""
+
+            click.echo()
+            click.secho("    SSH:", fg="cyan")
+            click.secho(f"      ssh{port_flag} {alias}", bold=True)
+
+            click.secho("    Jupyter (via SSH tunnel):", fg="cyan")
+            click.secho(f"      ssh -NL 8888:localhost:8888{port_flag} {alias}", bold=True)
+
+            click.secho("    VSCode Remote SSH:", fg="cyan")
+            click.secho(
+                f"      code --folder-uri vscode-remote://ssh-remote+{alias}/home/{user}",
+                bold=True,
+            )
+
+            click.secho("    GPU Benchmark:", fg="cyan")
+            click.secho(f"      ssh {alias} 'python ~/gpu_benchmark.py'", bold=True)
+
     click.echo()
     first_id = instances[0]["InstanceId"]
     click.echo("  To terminate:  " + click.style(f"aws-bootstrap terminate {first_id}", bold=True))
