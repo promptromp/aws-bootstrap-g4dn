@@ -160,12 +160,14 @@ aws-bootstrap launch --instance-type t3.medium --ami-filter "ubuntu/images/hvm-s
 
 ## Additional Resources
 
-For pricing information on GPU instances see [here](https://instances.vantage.sh/aws/ec2/g4dn.xlarge).
-Spot Instances Quotas see [here](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-limits.html)
-Deep Learning AMIs - see [here](https://docs.aws.amazon.com/dlami/latest/devguide/what-is-dlami.html)
-Nvidia Nsight - Setup Remote Debugging - see [here](https://docs.nvidia.com/nsight-visual-studio-edition/3.2/Content/Setup_Remote_Debugging.htm)
+| Topic | Link |
+|-------|------|
+| GPU instance pricing | [instances.vantage.sh](https://instances.vantage.sh/aws/ec2/g4dn.xlarge) |
+| Spot instance quotas | [AWS docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-limits.html) |
+| Deep Learning AMIs | [AWS docs](https://docs.aws.amazon.com/dlami/latest/devguide/what-is-dlami.html) |
+| Nvidia Nsight remote debugging | [Nvidia docs](https://docs.nvidia.com/nsight-visual-studio-edition/3.2/Content/Setup_Remote_Debugging.htm) |
 
-A couple of additional relevant recent tutorials (2025) for setting up CUDA environment on EC2 GPU instances are:
+Tutorials on setting up a CUDA environment on EC2 GPU instances:
 
-https://www.dolthub.com/blog/2025-03-12-provision-an-ec2-gpu-host-on-aws/
-https://techfortalk.co.uk/2025/10/11/aws-ec2-setup-for-gpu-cuda-programming/
+- [Provision an EC2 GPU Host on AWS](https://www.dolthub.com/blog/2025-03-12-provision-an-ec2-gpu-host-on-aws/) (DoltHub, 2025)
+- [AWS EC2 Setup for GPU/CUDA Programming](https://techfortalk.co.uk/2025/10/11/aws-ec2-setup-for-gpu-cuda-programming/) (TechForTalk, 2025)
