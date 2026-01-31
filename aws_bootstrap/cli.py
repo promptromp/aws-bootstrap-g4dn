@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 
 import boto3
+import botocore.exceptions
 import click
 
 from .config import LaunchConfig
@@ -56,7 +57,39 @@ def warn(msg: str) -> None:
     click.secho(f"  WARNING: {msg}", fg="yellow", err=True)
 
 
-@click.group()
+class _AWSGroup(click.Group):
+    """Click group that catches common AWS credential/auth errors."""
+
+    def invoke(self, ctx):
+        try:
+            return super().invoke(ctx)
+        except botocore.exceptions.NoCredentialsError:
+            raise CLIError(
+                "Unable to locate AWS credentials.\n\n"
+                "  Make sure you have configured AWS credentials using one of:\n"
+                "    - Set the AWS_PROFILE environment variable:  export AWS_PROFILE=<profile-name>\n"
+                "    - Pass --profile to the command:  aws-bootstrap <command> --profile <profile-name>\n"
+                "    - Configure a default profile:  aws configure\n\n"
+                "  See: https://docs.aws.amazon.com/cli/latest/userguide/cli-configure-files.html"
+            ) from None
+        except botocore.exceptions.ProfileNotFound as e:
+            raise CLIError(f"{e}\n\n  List available profiles with:  aws configure list-profiles") from None
+        except botocore.exceptions.PartialCredentialsError as e:
+            raise CLIError(
+                f"Incomplete AWS credentials: {e}\n\n  Check your AWS configuration with:  aws configure list"
+            ) from None
+        except botocore.exceptions.ClientError as e:
+            code = e.response["Error"]["Code"]
+            if code in ("AuthFailure", "UnauthorizedOperation", "ExpiredTokenException", "ExpiredToken"):
+                raise CLIError(
+                    f"AWS authorization failed: {e.response['Error']['Message']}\n\n"
+                    "  Your credentials may be expired or lack the required permissions.\n"
+                    "  Check your AWS configuration with:  aws configure list"
+                ) from None
+            raise
+
+
+@click.group(cls=_AWSGroup)
 @click.version_option(package_name="aws-bootstrap-g4dn")
 def main():
     """Bootstrap AWS EC2 GPU instances for hybrid local-remote development."""
@@ -80,6 +113,12 @@ def main():
 @click.option("--no-setup", is_flag=True, default=False, help="Skip running the remote setup script.")
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would be done without executing.")
 @click.option("--profile", default=None, help="AWS profile override (defaults to AWS_PROFILE env var).")
+@click.option(
+    "--python-version",
+    default=None,
+    help="Python version for the remote venv (e.g. 3.13, 3.14.2). Passed to uv during setup.",
+)
+@click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port on the remote instance.")
 def launch(
     instance_type,
     ami_filter,
@@ -92,6 +131,8 @@ def launch(
     no_setup,
     dry_run,
     profile,
+    python_version,
+    ssh_port,
 ):
     """Launch a GPU-accelerated EC2 instance."""
     config = LaunchConfig(
@@ -104,6 +145,8 @@ def launch(
         volume_size=volume_size,
         run_setup=not no_setup,
         dry_run=dry_run,
+        ssh_port=ssh_port,
+        python_version=python_version,
     )
     if ami_filter:
         config.ami_filter = ami_filter
@@ -130,7 +173,7 @@ def launch(
 
     # Step 3: Security group
     step(3, 6, "Ensuring security group...")
-    sg_id = ensure_security_group(ec2, config.security_group, config.tag_value)
+    sg_id = ensure_security_group(ec2, config.security_group, config.tag_value, ssh_port=config.ssh_port)
 
     pricing = "spot" if config.spot else "on-demand"
 
@@ -145,6 +188,10 @@ def launch(
         val("Volume", f"{config.volume_size} GB gp3")
         val("Region", config.region)
         val("Remote setup", "yes" if config.run_setup else "no")
+        if config.ssh_port != 22:
+            val("SSH port", str(config.ssh_port))
+        if config.python_version:
+            val("Python version", config.python_version)
         click.echo()
         click.secho("No resources launched (dry-run mode).", fg="yellow")
         return
@@ -169,9 +216,13 @@ def launch(
     # Step 6: SSH and remote setup
     step(6, 6, "Waiting for SSH access...")
     private_key = private_key_path(config.key_path)
-    if not wait_for_ssh(public_ip, config.ssh_user, config.key_path):
+    if not wait_for_ssh(public_ip, config.ssh_user, config.key_path, port=config.ssh_port):
         warn("SSH did not become available within the timeout.")
-        info(f"Instance is running — try connecting manually: ssh -i {private_key} {config.ssh_user}@{public_ip}")
+        port_flag = f" -p {config.ssh_port}" if config.ssh_port != 22 else ""
+        info(
+            f"Instance is running — try connecting manually:"
+            f" ssh -i {private_key}{port_flag} {config.ssh_user}@{public_ip}"
+        )
         return
 
     if config.run_setup:
@@ -179,7 +230,9 @@ def launch(
             warn(f"Setup script not found at {SETUP_SCRIPT}, skipping.")
         else:
             info("Running remote setup...")
-            if run_remote_setup(public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT):
+            if run_remote_setup(
+                public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT, config.python_version, port=config.ssh_port
+            ):
                 success("Remote setup completed successfully.")
             else:
                 warn("Remote setup failed. Instance is still running.")
@@ -191,6 +244,7 @@ def launch(
         user=config.ssh_user,
         key_path=config.key_path,
         alias_prefix=config.alias_prefix,
+        port=config.ssh_port,
     )
     success(f"Added SSH config alias: {alias}")
 
@@ -206,17 +260,26 @@ def launch(
     val("Pricing", pricing)
     val("SSH alias", alias)
 
+    port_flag = f" -p {config.ssh_port}" if config.ssh_port != 22 else ""
+
     click.echo()
     click.secho("  SSH:", fg="cyan")
-    click.secho(f"    ssh {alias}", bold=True)
-    info(f"or: ssh -i {private_key} {config.ssh_user}@{public_ip}")
+    click.secho(f"    ssh{port_flag} {alias}", bold=True)
+    info(f"or: ssh -i {private_key}{port_flag} {config.ssh_user}@{public_ip}")
 
     click.echo()
     click.secho("  Jupyter (via SSH tunnel):", fg="cyan")
-    click.secho(f"    ssh -NL 8888:localhost:8888 {alias}", bold=True)
-    info(f"or: ssh -i {private_key} -NL 8888:localhost:8888 {config.ssh_user}@{public_ip}")
+    click.secho(f"    ssh -NL 8888:localhost:8888{port_flag} {alias}", bold=True)
+    info(f"or: ssh -i {private_key} -NL 8888:localhost:8888{port_flag} {config.ssh_user}@{public_ip}")
     info("Then open: http://localhost:8888")
     info("Notebook: ~/gpu_smoke_test.ipynb (GPU smoke test)")
+
+    click.echo()
+    click.secho("  VSCode Remote SSH:", fg="cyan")
+    click.secho(
+        f"    code --folder-uri vscode-remote://ssh-remote+{alias}/home/{config.ssh_user}",
+        bold=True,
+    )
 
     click.echo()
     click.secho("  GPU Benchmark:", fg="cyan")
@@ -233,7 +296,14 @@ def launch(
 @click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.option("--gpu", is_flag=True, default=False, help="Query GPU info (CUDA, driver) via SSH.")
-def status(region, profile, gpu):
+@click.option(
+    "--instructions/--no-instructions",
+    "-I",
+    default=True,
+    show_default=True,
+    help="Show connection commands (SSH, Jupyter, VSCode) for each running instance.",
+)
+def status(region, profile, gpu, instructions):
     """Show running instances created by aws-bootstrap."""
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
@@ -272,11 +342,15 @@ def status(region, profile, gpu):
         if inst["PublicIp"]:
             val("    IP", inst["PublicIp"])
 
+        # Look up SSH config details once (used by --gpu and --with-instructions)
+        details = None
+        if (gpu or instructions) and state == "running" and inst["PublicIp"]:
+            details = get_ssh_host_details(inst["InstanceId"])
+
         # GPU info (opt-in, only for running instances with a public IP)
         if gpu and state == "running" and inst["PublicIp"]:
-            details = get_ssh_host_details(inst["InstanceId"])
             if details:
-                gpu_info = query_gpu_info(details.hostname, details.user, details.identity_file)
+                gpu_info = query_gpu_info(details.hostname, details.user, details.identity_file, port=details.port)
             else:
                 gpu_info = query_gpu_info(
                     inst["PublicIp"],
@@ -320,6 +394,29 @@ def status(region, profile, gpu):
                 val("    Est. cost", f"~${est_cost:.4f}")
 
         val("    Launched", str(inst["LaunchTime"]))
+
+        # Connection instructions (opt-in, only for running instances with a public IP and alias)
+        if instructions and state == "running" and inst["PublicIp"] and alias:
+            user = details.user if details else "ubuntu"
+            port = details.port if details else 22
+            port_flag = f" -p {port}" if port != 22 else ""
+
+            click.echo()
+            click.secho("    SSH:", fg="cyan")
+            click.secho(f"      ssh{port_flag} {alias}", bold=True)
+
+            click.secho("    Jupyter (via SSH tunnel):", fg="cyan")
+            click.secho(f"      ssh -NL 8888:localhost:8888{port_flag} {alias}", bold=True)
+
+            click.secho("    VSCode Remote SSH:", fg="cyan")
+            click.secho(
+                f"      code --folder-uri vscode-remote://ssh-remote+{alias}/home/{user}",
+                bold=True,
+            )
+
+            click.secho("    GPU Benchmark:", fg="cyan")
+            click.secho(f"      ssh {alias} 'python ~/gpu_benchmark.py'", bold=True)
+
     click.echo()
     first_id = instances[0]["InstanceId"]
     click.echo("  To terminate:  " + click.style(f"aws-bootstrap terminate {first_id}", bold=True))

@@ -5,10 +5,12 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import botocore.exceptions
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import main
-from aws_bootstrap.ssh import GpuInfo, SSHHostDetails
+from aws_bootstrap.gpu import GpuInfo
+from aws_bootstrap.ssh import SSHHostDetails
 
 
 def test_help():
@@ -72,11 +74,12 @@ def test_status_no_instances(mock_find, mock_session):
     assert "No active" in result.output
 
 
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
 @patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_shows_instances(mock_find, mock_spot_price, mock_session, mock_ssh_hosts):
+def test_status_shows_instances(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details):
     mock_find.return_value = [
         {
             "InstanceId": "i-abc123",
@@ -100,11 +103,12 @@ def test_status_shows_instances(mock_find, mock_spot_price, mock_session, mock_s
     assert "Est. cost" in result.output
 
 
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
 @patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_on_demand_no_cost(mock_find, mock_spot_price, mock_session, mock_ssh_hosts):
+def test_status_on_demand_no_cost(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details):
     mock_find.return_value = [
         {
             "InstanceId": "i-ondemand",
@@ -350,11 +354,12 @@ def test_terminate_removes_ssh_config(mock_terminate, mock_find, mock_session, m
     mock_remove_ssh.assert_called_once_with("i-abc123")
 
 
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts")
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
 @patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_shows_alias(mock_find, mock_spot_price, mock_session, mock_ssh_hosts):
+def test_status_shows_alias(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details):
     mock_find.return_value = [
         {
             "InstanceId": "i-abc123",
@@ -375,11 +380,12 @@ def test_status_shows_alias(mock_find, mock_spot_price, mock_session, mock_ssh_h
     assert "aws-gpu1" in result.output
 
 
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
 @patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_no_alias_graceful(mock_find, mock_spot_price, mock_session, mock_ssh_hosts):
+def test_status_no_alias_graceful(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details):
     mock_find.return_value = [
         {
             "InstanceId": "i-old999",
@@ -519,10 +525,312 @@ def test_status_gpu_skips_non_running(mock_find, mock_session, mock_ssh_hosts, m
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
 @patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_without_gpu_flag_no_ssh(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu):
+def test_status_without_gpu_flag_no_gpu_query(
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu
+):
     mock_find.return_value = [_RUNNING_INSTANCE]
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
     assert result.exit_code == 0
     mock_gpu.assert_not_called()
-    mock_details.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# --instructions / --no-instructions / -I flag tests
+# ---------------------------------------------------------------------------
+
+
+def test_status_help_shows_instructions_flag():
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--help"])
+    assert result.exit_code == 0
+    assert "--instructions" in result.output
+    assert "--no-instructions" in result.output
+    assert "-I" in result.output
+
+
+@patch("aws_bootstrap.cli.get_ssh_host_details")
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={"i-abc123": "aws-gpu1"})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_instructions_shown_by_default(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details):
+    """Instructions are shown by default (no flag needed)."""
+    mock_find.return_value = [_RUNNING_INSTANCE]
+    mock_details.return_value = SSHHostDetails(
+        hostname="1.2.3.4", user="ubuntu", identity_file=Path("/home/user/.ssh/id_ed25519")
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "ssh aws-gpu1" in result.output
+    assert "ssh -NL 8888:localhost:8888 aws-gpu1" in result.output
+    assert "vscode-remote://ssh-remote+aws-gpu1/home/ubuntu" in result.output
+    assert "python ~/gpu_benchmark.py" in result.output
+
+
+@patch("aws_bootstrap.cli.get_ssh_host_details")
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={"i-abc123": "aws-gpu1"})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_no_instructions_suppresses_commands(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details):
+    """--no-instructions suppresses connection commands."""
+    mock_find.return_value = [_RUNNING_INSTANCE]
+    mock_details.return_value = SSHHostDetails(
+        hostname="1.2.3.4", user="ubuntu", identity_file=Path("/home/user/.ssh/id_ed25519")
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--no-instructions"])
+    assert result.exit_code == 0
+    assert "vscode-remote" not in result.output
+    assert "Jupyter" not in result.output
+
+
+@patch("aws_bootstrap.cli.get_ssh_host_details")
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_instructions_no_alias_skips(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details):
+    """Instances without an SSH alias don't get connection instructions."""
+    mock_find.return_value = [_RUNNING_INSTANCE]
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "ssh aws-gpu" not in result.output
+    assert "vscode-remote" not in result.output
+
+
+@patch("aws_bootstrap.cli.get_ssh_host_details")
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={"i-abc123": "aws-gpu1"})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_instructions_non_default_port(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details):
+    mock_find.return_value = [_RUNNING_INSTANCE]
+    mock_details.return_value = SSHHostDetails(
+        hostname="1.2.3.4", user="ubuntu", identity_file=Path("/home/user/.ssh/id_ed25519"), port=2222
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "ssh -p 2222 aws-gpu1" in result.output
+    assert "ssh -NL 8888:localhost:8888 -p 2222 aws-gpu1" in result.output
+
+
+# ---------------------------------------------------------------------------
+# AWS credential / auth error handling tests
+# ---------------------------------------------------------------------------
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_no_credentials_shows_friendly_error(mock_session, mock_find):
+    """NoCredentialsError should show a helpful message, not a raw traceback."""
+    mock_find.side_effect = botocore.exceptions.NoCredentialsError()
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code != 0
+    assert "Unable to locate AWS credentials" in result.output
+    assert "AWS_PROFILE" in result.output
+    assert "--profile" in result.output
+    assert "aws configure" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_profile_not_found_shows_friendly_error(mock_session):
+    """ProfileNotFound should show the missing profile name and list command."""
+    mock_session.side_effect = botocore.exceptions.ProfileNotFound(profile="nonexistent")
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--profile", "nonexistent"])
+    assert result.exit_code != 0
+    assert "nonexistent" in result.output
+    assert "aws configure list-profiles" in result.output
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_partial_credentials_shows_friendly_error(mock_session, mock_find):
+    """PartialCredentialsError should mention incomplete credentials."""
+    mock_find.side_effect = botocore.exceptions.PartialCredentialsError(
+        provider="env", cred_var="AWS_SECRET_ACCESS_KEY"
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code != 0
+    assert "Incomplete AWS credentials" in result.output
+    assert "aws configure list" in result.output
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_expired_token_shows_friendly_error(mock_session, mock_find):
+    """ExpiredTokenException should show authorization failure with context."""
+    mock_find.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ExpiredTokenException", "Message": "The security token is expired"}},
+        "DescribeInstances",
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code != 0
+    assert "AWS authorization failed" in result.output
+    assert "expired" in result.output.lower()
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_auth_failure_shows_friendly_error(mock_session, mock_find):
+    """AuthFailure ClientError should show authorization failure message."""
+    mock_find.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "AuthFailure", "Message": "credentials are invalid"}},
+        "DescribeInstances",
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code != 0
+    assert "AWS authorization failed" in result.output
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_unhandled_client_error_propagates(mock_session, mock_find):
+    """Non-auth ClientErrors should propagate without being caught."""
+    mock_find.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "UnknownError", "Message": "something else"}},
+        "DescribeInstances",
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code != 0
+    assert isinstance(result.exception, botocore.exceptions.ClientError)
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_no_credentials_caught_on_terminate(mock_session, mock_find):
+    """Credential errors are caught for all subcommands, not just status."""
+    mock_find.side_effect = botocore.exceptions.NoCredentialsError()
+    runner = CliRunner()
+    result = runner.invoke(main, ["terminate"])
+    assert result.exit_code != 0
+    assert "Unable to locate AWS credentials" in result.output
+
+
+@patch("aws_bootstrap.cli.list_instance_types")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_no_credentials_caught_on_list(mock_session, mock_list):
+    """Credential errors are caught for nested subcommands (list instance-types)."""
+    mock_list.side_effect = botocore.exceptions.NoCredentialsError()
+    runner = CliRunner()
+    result = runner.invoke(main, ["list", "instance-types"])
+    assert result.exit_code != 0
+    assert "Unable to locate AWS credentials" in result.output
+
+
+# ---------------------------------------------------------------------------
+# --python-version tests
+# ---------------------------------------------------------------------------
+
+
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_launch_python_version_passed_to_setup(
+    mock_session, mock_ami, mock_import, mock_sg, mock_launch, mock_wait, mock_ssh, mock_setup, mock_add_ssh, tmp_path
+):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_wait.return_value = {"PublicIpAddress": "1.2.3.4"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--python-version", "3.13"])
+    assert result.exit_code == 0
+    mock_setup.assert_called_once()
+    assert mock_setup.call_args[0][4] == "3.13"
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_shows_python_version(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run", "--python-version", "3.14.2"])
+    assert result.exit_code == 0
+    assert "3.14.2" in result.output
+    assert "Python version" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_omits_python_version_when_unset(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run"])
+    assert result.exit_code == 0
+    assert "Python version" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# --ssh-port tests
+# ---------------------------------------------------------------------------
+
+
+def test_launch_help_shows_ssh_port():
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--help"])
+    assert result.exit_code == 0
+    assert "--ssh-port" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_shows_ssh_port_when_non_default(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run", "--ssh-port", "2222"])
+    assert result.exit_code == 0
+    assert "2222" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_omits_ssh_port_when_default(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run"])
+    assert result.exit_code == 0
+    assert "SSH port" not in result.output

@@ -39,7 +39,7 @@ ssh aws-gpu1                  # You're in, venv activated, PyTorch works
 
 1. AWS profile configured with relevant permissions (profile name can be passed via `--profile` or read from `AWS_PROFILE` env var)
 2. AWS CLI v2 — see [here](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
-3. Python 3.14+ and [uv](https://github.com/astral-sh/uv)
+3. Python 3.12+ and [uv](https://github.com/astral-sh/uv)
 4. An SSH key pair (see below)
 
 ## Installation
@@ -48,6 +48,16 @@ ssh aws-gpu1                  # You're in, venv activated, PyTorch works
 
 ```bash
 pip install aws-bootstrap-g4dn
+```
+
+### With uvx (no install needed)
+
+[uvx](https://docs.astral.sh/uv/guides/tools/) runs the CLI directly in a temporary environment — no global install required:
+
+```bash
+uvx --from aws-bootstrap-g4dn aws-bootstrap launch
+uvx --from aws-bootstrap-g4dn aws-bootstrap status
+uvx --from aws-bootstrap-g4dn aws-bootstrap terminate
 ```
 
 ### From source (development)
@@ -59,7 +69,7 @@ uv venv
 uv sync
 ```
 
-Both methods install the `aws-bootstrap` CLI.
+All methods install the `aws-bootstrap` CLI.
 
 ## SSH Key Setup
 
@@ -97,6 +107,12 @@ aws-bootstrap launch --on-demand --instance-type g5.xlarge --region us-east-1
 # Launch without running the remote setup script
 aws-bootstrap launch --no-setup
 
+# Use a specific Python version in the remote venv
+aws-bootstrap launch --python-version 3.13
+
+# Use a non-default SSH port
+aws-bootstrap launch --ssh-port 2222
+
 # Use a specific AWS profile
 aws-bootstrap launch --profile my-aws-profile
 ```
@@ -120,7 +136,7 @@ The setup script runs automatically on the instance after SSH becomes available:
 |------|------|
 | **GPU verify** | Confirms `nvidia-smi` and `nvcc` are working |
 | **Utilities** | Installs `htop`, `tmux`, `tree`, `jq` |
-| **Python venv** | Creates `~/venv` with `uv`, auto-activates in `~/.bashrc` |
+| **Python venv** | Creates `~/venv` with `uv`, auto-activates in `~/.bashrc`. Use `--python-version` to pin a specific Python (e.g. `3.13`) |
 | **CUDA-aware PyTorch** | Detects CUDA toolkit version → installs PyTorch from the matching `cu{TAG}` wheel index |
 | **CUDA smoke test** | Runs `torch.cuda.is_available()` + GPU matmul to verify the stack |
 | **GPU benchmark** | Copies `gpu_benchmark.py` to `~/gpu_benchmark.py` |
@@ -193,6 +209,9 @@ aws-bootstrap status
 
 # Include GPU info (CUDA toolkit + driver version, GPU name, architecture) via SSH
 aws-bootstrap status --gpu
+
+# Hide connection commands (shown by default for each running instance)
+aws-bootstrap status --no-instructions
 
 # List instances in a specific region
 aws-bootstrap status --region us-east-1

@@ -59,7 +59,7 @@ def get_latest_ami(ec2_client, ami_filter: str) -> dict:
     return images[0]
 
 
-def ensure_security_group(ec2_client, name: str, tag_value: str) -> str:
+def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int = 22) -> str:
     """Find or create a security group with SSH ingress in the default VPC."""
     # Find default VPC
     vpcs = ec2_client.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
@@ -103,8 +103,8 @@ def ensure_security_group(ec2_client, name: str, tag_value: str) -> str:
         IpPermissions=[
             {
                 "IpProtocol": "tcp",
-                "FromPort": 22,
-                "ToPort": 22,
+                "FromPort": ssh_port,
+                "ToPort": ssh_port,
                 "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "SSH access"}],
             }
         ],

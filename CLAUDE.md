@@ -10,7 +10,7 @@ Target workflows: Jupyter server-client, VSCode Remote SSH, and NVIDIA Nsight re
 
 ## Tech Stack & Requirements
 
-- **Python 3.14+** with **uv** package manager (astral-sh/uv) — used for venv creation, dependency management, and running the project
+- **Python 3.12+** with **uv** package manager (astral-sh/uv) — used for venv creation, dependency management, and running the project
 - **boto3** — AWS SDK for EC2 provisioning (AMI lookup, security groups, instance launch, waiters)
 - **click** — CLI framework with built-in color support (`click.secho`, `click.style`)
 - **setuptools + setuptools-scm** — build backend with git-tag-based versioning (configured in pyproject.toml)
@@ -33,7 +33,8 @@ aws_bootstrap/
     cli.py               # Click CLI entry point (launch, status, terminate commands)
     config.py            # LaunchConfig dataclass with defaults
     ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing
-    ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management
+    gpu.py               # GPU architecture mapping and GpuInfo dataclass
+    ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management, GPU queries
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
         gpu_benchmark.py       # GPU throughput benchmark (CNN + Transformer), copied to ~/gpu_benchmark.py on instance
@@ -44,6 +45,7 @@ aws_bootstrap/
         test_config.py
         test_cli.py
         test_ec2.py
+        test_gpu.py
         test_ssh_config.py
         test_ssh_gpu.py
 docs/
@@ -54,8 +56,8 @@ Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`
 
 ## CLI Commands
 
-- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`
-- **`status`** — lists all non-terminated instances (including `shutting-down`) with type, IP, SSH alias, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`)
+- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`; `--python-version` controls which Python `uv` installs in the remote venv; `--ssh-port` overrides the default SSH port (22) for security group ingress, connection checks, and SSH config
+- **`status`** — lists all non-terminated instances (including `shutting-down`) with type, IP, SSH alias, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`); `--instructions` (default: on) prints connection commands (SSH, Jupyter tunnel, VSCode Remote SSH, GPU benchmark) for each running instance; suppress with `--no-instructions`
 - **`terminate`** — terminates instances by ID or all aws-bootstrap instances in the region; removes SSH config aliases
 - **`list instance-types`** — lists EC2 instance types matching a family prefix (default: `g4dn`), showing vCPUs, memory, and GPU info
 - **`list amis`** — lists available AMIs matching a name pattern (default: Deep Learning Base OSS Nvidia Driver GPU AMIs), sorted newest-first
@@ -96,7 +98,7 @@ The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags publi
 ## Remote Setup Details
 
 `remote_setup.sh` also:
-- Creates `~/venv` and appends `source ~/venv/bin/activate` to `~/.bashrc` so the venv is auto-activated on SSH login
+- Creates `~/venv` and appends `source ~/venv/bin/activate` to `~/.bashrc` so the venv is auto-activated on SSH login. When `--python-version` is passed to `launch`, the CLI sets `PYTHON_VERSION` as an inline env var on the SSH command; `remote_setup.sh` reads it to run `uv python install` and `uv venv --python` with the requested version
 - Runs a quick CUDA smoke test (`torch.cuda.is_available()` + GPU matmul) after PyTorch installation to verify the GPU stack; prints a WARNING on failure but does not abort
 - Copies `gpu_benchmark.py` to `~/gpu_benchmark.py` and `gpu_smoke_test.ipynb` to `~/gpu_smoke_test.ipynb`
 

@@ -12,6 +12,8 @@ from pathlib import Path
 
 import click
 
+from .gpu import _GPU_ARCHITECTURES, GpuInfo
+
 
 # ---------------------------------------------------------------------------
 # SSH config markers
@@ -72,17 +74,18 @@ def import_key_pair(ec2_client, key_name: str, key_path: Path) -> str:
     return key_name
 
 
-def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay: int = 10) -> bool:
+def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay: int = 10, port: int = 22) -> bool:
     """Wait for SSH to become available on the instance.
 
-    Tries a TCP connection to port 22 first, then an actual SSH command.
+    Tries a TCP connection to the SSH port first, then an actual SSH command.
     """
     base_opts = _ssh_opts(key_path)
+    port_opts = ["-p", str(port)] if port != 22 else []
 
     for attempt in range(1, retries + 1):
-        # First check if port 22 is open
+        # First check if the SSH port is open
         try:
-            sock = socket.create_connection((host, 22), timeout=5)
+            sock = socket.create_connection((host, port), timeout=5)
             sock.close()
         except (TimeoutError, ConnectionRefusedError, OSError):
             click.echo("  SSH not ready " + click.style(f"(attempt {attempt}/{retries})", dim=True) + ", waiting...")
@@ -90,11 +93,18 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
             continue
 
         # Port is open, try actual SSH
-        result = subprocess.run(
-            ["ssh", *base_opts, "-o", "ConnectTimeout=10", "-o", "BatchMode=yes", f"{user}@{host}", "echo ok"],
-            capture_output=True,
-            text=True,
-        )
+        cmd = [
+            "ssh",
+            *base_opts,
+            *port_opts,
+            "-o",
+            "ConnectTimeout=10",
+            "-o",
+            "BatchMode=yes",
+            f"{user}@{host}",
+            "echo ok",
+        ]
+        result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
             click.secho("  SSH connection established.", fg="green")
             return True
@@ -105,15 +115,19 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
     return False
 
 
-def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) -> bool:
+def run_remote_setup(
+    host: str, user: str, key_path: Path, script_path: Path, python_version: str | None = None, port: int = 22
+) -> bool:
     """SCP the setup script and requirements.txt to the instance and execute."""
     ssh_opts = _ssh_opts(key_path)
+    scp_port_opts = ["-P", str(port)] if port != 22 else []
+    ssh_port_opts = ["-p", str(port)] if port != 22 else []
     requirements_path = script_path.parent / "requirements.txt"
 
     # SCP the requirements file
     click.echo("  Uploading requirements.txt...")
     req_result = subprocess.run(
-        ["scp", *ssh_opts, str(requirements_path), f"{user}@{host}:/tmp/requirements.txt"],
+        ["scp", *ssh_opts, *scp_port_opts, str(requirements_path), f"{user}@{host}:/tmp/requirements.txt"],
         capture_output=True,
         text=True,
     )
@@ -125,7 +139,7 @@ def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) ->
     benchmark_path = script_path.parent / "gpu_benchmark.py"
     click.echo("  Uploading gpu_benchmark.py...")
     bench_result = subprocess.run(
-        ["scp", *ssh_opts, str(benchmark_path), f"{user}@{host}:/tmp/gpu_benchmark.py"],
+        ["scp", *ssh_opts, *scp_port_opts, str(benchmark_path), f"{user}@{host}:/tmp/gpu_benchmark.py"],
         capture_output=True,
         text=True,
     )
@@ -137,7 +151,7 @@ def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) ->
     notebook_path = script_path.parent / "gpu_smoke_test.ipynb"
     click.echo("  Uploading gpu_smoke_test.ipynb...")
     nb_result = subprocess.run(
-        ["scp", *ssh_opts, str(notebook_path), f"{user}@{host}:/tmp/gpu_smoke_test.ipynb"],
+        ["scp", *ssh_opts, *scp_port_opts, str(notebook_path), f"{user}@{host}:/tmp/gpu_smoke_test.ipynb"],
         capture_output=True,
         text=True,
     )
@@ -148,7 +162,7 @@ def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) ->
     # SCP the script
     click.echo("  Uploading remote_setup.sh...")
     scp_result = subprocess.run(
-        ["scp", *ssh_opts, str(script_path), f"{user}@{host}:/tmp/remote_setup.sh"],
+        ["scp", *ssh_opts, *scp_port_opts, str(script_path), f"{user}@{host}:/tmp/remote_setup.sh"],
         capture_output=True,
         text=True,
     )
@@ -156,10 +170,14 @@ def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) ->
         click.secho(f"  SCP failed: {scp_result.stderr}", fg="red", err=True)
         return False
 
-    # Execute the script
+    # Execute the script, passing PYTHON_VERSION as an inline env var if specified
     click.echo("  Running remote_setup.sh on instance...")
+    remote_cmd = "chmod +x /tmp/remote_setup.sh && "
+    if python_version:
+        remote_cmd += f"PYTHON_VERSION={python_version} "
+    remote_cmd += "/tmp/remote_setup.sh"
     ssh_result = subprocess.run(
-        ["ssh", *ssh_opts, f"{user}@{host}", "chmod +x /tmp/remote_setup.sh && /tmp/remote_setup.sh"],
+        ["ssh", *ssh_opts, *ssh_port_opts, f"{user}@{host}", remote_cmd],
         capture_output=False,
     )
     return ssh_result.returncode == 0
@@ -222,15 +240,17 @@ def _next_alias(content: str, prefix: str = "aws-gpu") -> str:
     return f"{prefix}{max_n + 1}"
 
 
-def _build_stanza(instance_id: str, alias: str, hostname: str, user: str, key_path: Path) -> str:
+def _build_stanza(instance_id: str, alias: str, hostname: str, user: str, key_path: Path, port: int = 22) -> str:
     """Build a complete SSH config stanza with markers."""
     priv_key = private_key_path(key_path)
+    port_line = f"    Port {port}\n" if port != 22 else ""
     return (
         f"{_BEGIN_MARKER.format(instance_id=instance_id)}\n"
         f"Host {alias}\n"
         f"    HostName {hostname}\n"
         f"    User {user}\n"
         f"    IdentityFile {priv_key}\n"
+        f"{port_line}"
         f"    StrictHostKeyChecking no\n"
         f"    UserKnownHostsFile /dev/null\n"
         f"{_END_MARKER.format(instance_id=instance_id)}\n"
@@ -244,6 +264,7 @@ def add_ssh_host(
     key_path: Path,
     config_path: Path | None = None,
     alias_prefix: str = "aws-gpu",
+    port: int = 22,
 ) -> str:
     """Add (or update) an SSH host stanza for *instance_id*.
 
@@ -257,7 +278,7 @@ def add_ssh_host(
     content = _remove_block(content, instance_id)
 
     alias = existing_alias or _next_alias(content, alias_prefix)
-    stanza = _build_stanza(instance_id, alias, hostname, user, key_path)
+    stanza = _build_stanza(instance_id, alias, hostname, user, key_path, port=port)
 
     # Ensure a blank line before our block if file has content
     if content and not content.endswith("\n\n") and not content.endswith("\n"):
@@ -317,21 +338,6 @@ def list_ssh_hosts(config_path: Path | None = None) -> dict[str, str]:
     return result
 
 
-# ---------------------------------------------------------------------------
-# GPU info via SSH
-# ---------------------------------------------------------------------------
-
-_GPU_ARCHITECTURES: dict[str, str] = {
-    "7.0": "Volta",
-    "7.5": "Turing",
-    "8.0": "Ampere",
-    "8.6": "Ampere",
-    "8.7": "Ampere",
-    "8.9": "Ada Lovelace",
-    "9.0": "Hopper",
-}
-
-
 @dataclass
 class SSHHostDetails:
     """Connection details parsed from an SSH config stanza."""
@@ -339,18 +345,7 @@ class SSHHostDetails:
     hostname: str
     user: str
     identity_file: Path
-
-
-@dataclass
-class GpuInfo:
-    """GPU information retrieved via nvidia-smi and nvcc."""
-
-    driver_version: str
-    cuda_driver_version: str  # max CUDA version supported by driver (from nvidia-smi)
-    cuda_toolkit_version: str | None  # actual CUDA toolkit installed (from nvcc), None if unavailable
-    gpu_name: str
-    compute_capability: str
-    architecture: str
+    port: int = 22
 
 
 def get_ssh_host_details(instance_id: str, config_path: Path | None = None) -> SSHHostDetails | None:
@@ -371,6 +366,7 @@ def get_ssh_host_details(instance_id: str, config_path: Path | None = None) -> S
     hostname: str | None = None
     user: str | None = None
     identity_file: str | None = None
+    port: int = 22
 
     for line in content.splitlines():
         if line == begin_marker:
@@ -378,7 +374,7 @@ def get_ssh_host_details(instance_id: str, config_path: Path | None = None) -> S
             continue
         if line == end_marker and in_block:
             if hostname and user and identity_file:
-                return SSHHostDetails(hostname=hostname, user=user, identity_file=Path(identity_file))
+                return SSHHostDetails(hostname=hostname, user=user, identity_file=Path(identity_file), port=port)
             return None
         if in_block:
             stripped = line.strip()
@@ -388,17 +384,20 @@ def get_ssh_host_details(instance_id: str, config_path: Path | None = None) -> S
                 user = stripped.removeprefix("User ").strip()
             elif stripped.startswith("IdentityFile "):
                 identity_file = stripped.removeprefix("IdentityFile ").strip()
+            elif stripped.startswith("Port "):
+                port = int(stripped.removeprefix("Port ").strip())
 
     return None
 
 
-def query_gpu_info(host: str, user: str, key_path: Path, timeout: int = 10) -> GpuInfo | None:
+def query_gpu_info(host: str, user: str, key_path: Path, timeout: int = 10, port: int = 22) -> GpuInfo | None:
     """SSH into a host and query GPU info via ``nvidia-smi``.
 
     Returns ``GpuInfo`` on success, or ``None`` if the SSH connection fails,
     ``nvidia-smi`` is unavailable, or the output is malformed.
     """
     ssh_opts = _ssh_opts(key_path)
+    port_opts = ["-p", str(port)] if port != 22 else []
     remote_cmd = (
         "nvidia-smi --query-gpu=driver_version,name,compute_cap --format=csv,noheader,nounits"
         " && nvidia-smi | grep -oP 'CUDA Version: \\K[\\d.]+'"
@@ -407,6 +406,7 @@ def query_gpu_info(host: str, user: str, key_path: Path, timeout: int = 10) -> G
     cmd = [
         "ssh",
         *ssh_opts,
+        *port_opts,
         "-o",
         f"ConnectTimeout={timeout}",
         "-o",
