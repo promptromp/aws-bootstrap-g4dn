@@ -118,6 +118,7 @@ def main():
     default=None,
     help="Python version for the remote venv (e.g. 3.13, 3.14.2). Passed to uv during setup.",
 )
+@click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port on the remote instance.")
 def launch(
     instance_type,
     ami_filter,
@@ -131,6 +132,7 @@ def launch(
     dry_run,
     profile,
     python_version,
+    ssh_port,
 ):
     """Launch a GPU-accelerated EC2 instance."""
     config = LaunchConfig(
@@ -143,6 +145,7 @@ def launch(
         volume_size=volume_size,
         run_setup=not no_setup,
         dry_run=dry_run,
+        ssh_port=ssh_port,
         python_version=python_version,
     )
     if ami_filter:
@@ -170,7 +173,7 @@ def launch(
 
     # Step 3: Security group
     step(3, 6, "Ensuring security group...")
-    sg_id = ensure_security_group(ec2, config.security_group, config.tag_value)
+    sg_id = ensure_security_group(ec2, config.security_group, config.tag_value, ssh_port=config.ssh_port)
 
     pricing = "spot" if config.spot else "on-demand"
 
@@ -185,6 +188,8 @@ def launch(
         val("Volume", f"{config.volume_size} GB gp3")
         val("Region", config.region)
         val("Remote setup", "yes" if config.run_setup else "no")
+        if config.ssh_port != 22:
+            val("SSH port", str(config.ssh_port))
         if config.python_version:
             val("Python version", config.python_version)
         click.echo()
@@ -211,9 +216,13 @@ def launch(
     # Step 6: SSH and remote setup
     step(6, 6, "Waiting for SSH access...")
     private_key = private_key_path(config.key_path)
-    if not wait_for_ssh(public_ip, config.ssh_user, config.key_path):
+    if not wait_for_ssh(public_ip, config.ssh_user, config.key_path, port=config.ssh_port):
         warn("SSH did not become available within the timeout.")
-        info(f"Instance is running — try connecting manually: ssh -i {private_key} {config.ssh_user}@{public_ip}")
+        port_flag = f" -p {config.ssh_port}" if config.ssh_port != 22 else ""
+        info(
+            f"Instance is running — try connecting manually:"
+            f" ssh -i {private_key}{port_flag} {config.ssh_user}@{public_ip}"
+        )
         return
 
     if config.run_setup:
@@ -221,7 +230,9 @@ def launch(
             warn(f"Setup script not found at {SETUP_SCRIPT}, skipping.")
         else:
             info("Running remote setup...")
-            if run_remote_setup(public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT, config.python_version):
+            if run_remote_setup(
+                public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT, config.python_version, port=config.ssh_port
+            ):
                 success("Remote setup completed successfully.")
             else:
                 warn("Remote setup failed. Instance is still running.")
@@ -233,6 +244,7 @@ def launch(
         user=config.ssh_user,
         key_path=config.key_path,
         alias_prefix=config.alias_prefix,
+        port=config.ssh_port,
     )
     success(f"Added SSH config alias: {alias}")
 
@@ -248,15 +260,17 @@ def launch(
     val("Pricing", pricing)
     val("SSH alias", alias)
 
+    port_flag = f" -p {config.ssh_port}" if config.ssh_port != 22 else ""
+
     click.echo()
     click.secho("  SSH:", fg="cyan")
-    click.secho(f"    ssh {alias}", bold=True)
-    info(f"or: ssh -i {private_key} {config.ssh_user}@{public_ip}")
+    click.secho(f"    ssh{port_flag} {alias}", bold=True)
+    info(f"or: ssh -i {private_key}{port_flag} {config.ssh_user}@{public_ip}")
 
     click.echo()
     click.secho("  Jupyter (via SSH tunnel):", fg="cyan")
-    click.secho(f"    ssh -NL 8888:localhost:8888 {alias}", bold=True)
-    info(f"or: ssh -i {private_key} -NL 8888:localhost:8888 {config.ssh_user}@{public_ip}")
+    click.secho(f"    ssh -NL 8888:localhost:8888{port_flag} {alias}", bold=True)
+    info(f"or: ssh -i {private_key} -NL 8888:localhost:8888{port_flag} {config.ssh_user}@{public_ip}")
     info("Then open: http://localhost:8888")
     info("Notebook: ~/gpu_smoke_test.ipynb (GPU smoke test)")
 
@@ -318,7 +332,7 @@ def status(region, profile, gpu):
         if gpu and state == "running" and inst["PublicIp"]:
             details = get_ssh_host_details(inst["InstanceId"])
             if details:
-                gpu_info = query_gpu_info(details.hostname, details.user, details.identity_file)
+                gpu_info = query_gpu_info(details.hostname, details.user, details.identity_file, port=details.port)
             else:
                 gpu_info = query_gpu_info(
                     inst["PublicIp"],

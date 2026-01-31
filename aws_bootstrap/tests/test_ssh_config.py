@@ -10,6 +10,7 @@ from aws_bootstrap.ssh import (
     _read_ssh_config,
     add_ssh_host,
     find_ssh_alias,
+    get_ssh_host_details,
     list_ssh_hosts,
     remove_ssh_host,
 )
@@ -295,3 +296,38 @@ def test_list_hosts_nonexistent_file(tmp_path):
 def test_remove_nonexistent_file(tmp_path):
     cfg = tmp_path / "no_such_file"
     assert remove_ssh_host("i-abc123", config_path=cfg) is None
+
+
+# ---------------------------------------------------------------------------
+# Port in stanza / details
+# ---------------------------------------------------------------------------
+
+
+def test_stanza_includes_port_when_non_default(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-abc123", "1.2.3.4", "ubuntu", KEY_PATH, config_path=cfg, port=2222)
+    content = cfg.read_text()
+    assert "Port 2222" in content
+
+
+def test_stanza_omits_port_when_default(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-abc123", "1.2.3.4", "ubuntu", KEY_PATH, config_path=cfg)
+    content = cfg.read_text()
+    assert "Port" not in content
+
+
+def test_get_ssh_host_details_parses_port(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-abc123", "1.2.3.4", "ubuntu", KEY_PATH, config_path=cfg, port=2222)
+    details = get_ssh_host_details("i-abc123", config_path=cfg)
+    assert details is not None
+    assert details.port == 2222
+
+
+def test_get_ssh_host_details_default_port(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-abc123", "1.2.3.4", "ubuntu", KEY_PATH, config_path=cfg)
+    details = get_ssh_host_details("i-abc123", config_path=cfg)
+    assert details is not None
+    assert details.port == 22

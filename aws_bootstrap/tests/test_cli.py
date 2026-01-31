@@ -9,7 +9,8 @@ import botocore.exceptions
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import main
-from aws_bootstrap.ssh import GpuInfo, SSHHostDetails
+from aws_bootstrap.gpu import GpuInfo
+from aws_bootstrap.ssh import SSHHostDetails
 
 
 def test_help():
@@ -700,3 +701,47 @@ def test_launch_dry_run_omits_python_version_when_unset(mock_sg, mock_import, mo
     result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run"])
     assert result.exit_code == 0
     assert "Python version" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# --ssh-port tests
+# ---------------------------------------------------------------------------
+
+
+def test_launch_help_shows_ssh_port():
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--help"])
+    assert result.exit_code == 0
+    assert "--ssh-port" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_shows_ssh_port_when_non_default(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run", "--ssh-port", "2222"])
+    assert result.exit_code == 0
+    assert "2222" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_omits_ssh_port_when_default(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run"])
+    assert result.exit_code == 0
+    assert "SSH port" not in result.output
