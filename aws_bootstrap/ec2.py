@@ -2,8 +2,8 @@
 
 from __future__ import annotations
 
-import click
 import botocore.exceptions
+import click
 
 from .config import LaunchConfig
 
@@ -21,8 +21,7 @@ def get_latest_dl_ami(ec2_client, ami_filter: str) -> dict:
     images = response["Images"]
     if not images:
         raise click.ClickException(
-            f"No AMI found matching filter: {ami_filter}\n"
-            "Try adjusting --ami-filter or check the region."
+            f"No AMI found matching filter: {ami_filter}\nTry adjusting --ami-filter or check the region."
         )
 
     images.sort(key=lambda x: x["CreationDate"], reverse=True)
@@ -47,7 +46,8 @@ def ensure_security_group(ec2_client, name: str, tag_value: str) -> str:
     )
     if existing["SecurityGroups"]:
         sg_id = existing["SecurityGroups"][0]["GroupId"]
-        click.echo("  Security group " + click.style(f"'{name}'", fg="bright_white") + f" already exists ({sg_id}), reusing.")
+        msg = "  Security group " + click.style(f"'{name}'", fg="bright_white")
+        click.echo(msg + f" already exists ({sg_id}), reusing.")
         return sg_id
 
     # Create new SG
@@ -132,7 +132,7 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
                 launch_params.pop("InstanceMarketOptions", None)
                 response = ec2_client.run_instances(**launch_params)
             else:
-                raise click.ClickException("Launch cancelled.")
+                raise click.ClickException("Launch cancelled.") from None
         else:
             raise
 

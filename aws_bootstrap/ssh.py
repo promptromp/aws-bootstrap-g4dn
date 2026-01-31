@@ -1,9 +1,8 @@
 """SSH key pair management for EC2 instances."""
 
 from __future__ import annotations
-
-import subprocess
 import socket
+import subprocess
 import time
 from pathlib import Path
 
@@ -53,7 +52,7 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
         try:
             sock = socket.create_connection((host, 22), timeout=5)
             sock.close()
-        except (socket.timeout, ConnectionRefusedError, OSError):
+        except (TimeoutError, ConnectionRefusedError, OSError):
             click.echo("  SSH not ready " + click.style(f"(attempt {attempt}/{retries})", dim=True) + ", waiting...")
             time.sleep(delay)
             continue
@@ -62,11 +61,16 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
         result = subprocess.run(
             [
                 "ssh",
-                "-o", "StrictHostKeyChecking=no",
-                "-o", "UserKnownHostsFile=/dev/null",
-                "-o", "ConnectTimeout=10",
-                "-o", "BatchMode=yes",
-                "-i", str(private_key),
+                "-o",
+                "StrictHostKeyChecking=no",
+                "-o",
+                "UserKnownHostsFile=/dev/null",
+                "-o",
+                "ConnectTimeout=10",
+                "-o",
+                "BatchMode=yes",
+                "-i",
+                str(private_key),
                 f"{user}@{host}",
                 "echo ok",
             ],
@@ -87,9 +91,12 @@ def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) ->
     """SCP the setup script to the instance and execute it."""
     private_key = key_path.with_suffix("") if key_path.suffix == ".pub" else key_path
     ssh_opts = [
-        "-o", "StrictHostKeyChecking=no",
-        "-o", "UserKnownHostsFile=/dev/null",
-        "-i", str(private_key),
+        "-o",
+        "StrictHostKeyChecking=no",
+        "-o",
+        "UserKnownHostsFile=/dev/null",
+        "-i",
+        str(private_key),
     ]
 
     # SCP the script

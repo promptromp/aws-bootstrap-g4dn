@@ -1,15 +1,15 @@
 """CLI entry point for aws-bootstrap-g4dn."""
 
 from __future__ import annotations
-
 from pathlib import Path
 
 import boto3
 import click
 
 from .config import LaunchConfig
-from .ec2 import get_latest_dl_ami, ensure_security_group, launch_instance, wait_instance_ready
-from .ssh import import_key_pair, wait_for_ssh, run_remote_setup
+from .ec2 import ensure_security_group, get_latest_dl_ami, launch_instance, wait_instance_ready
+from .ssh import import_key_pair, run_remote_setup, wait_for_ssh
+
 
 SETUP_SCRIPT = Path(__file__).parent / "remote_setup.sh"
 
@@ -58,7 +58,19 @@ def main():
 @click.option("--no-setup", is_flag=True, default=False, help="Skip running the remote setup script.")
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would be done without executing.")
 @click.option("--profile", default=None, help="AWS profile override (defaults to AWS_PROFILE env var).")
-def launch(instance_type, ami_filter, spot, key_path, key_name, region, security_group, volume_size, no_setup, dry_run, profile):
+def launch(
+    instance_type,
+    ami_filter,
+    spot,
+    key_path,
+    key_name,
+    region,
+    security_group,
+    volume_size,
+    no_setup,
+    dry_run,
+    profile,
+):
     """Launch a GPU-accelerated EC2 instance."""
     config = LaunchConfig(
         instance_type=instance_type,
