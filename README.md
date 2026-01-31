@@ -1,5 +1,13 @@
 # aws-bootstrap-g4dn
 
+--------------------------------------------------------------------------------
+
+[![CI](https://github.com/promptromp/aws-bootstrap-g4dn/actions/workflows/ci.yml/badge.svg)](https://github.com/promptromp/aws-bootstrap-g4dn/actions/workflows/ci.yml)
+[![GitHub License](https://img.shields.io/github/license/promptromp/aws-bootstrap-g4dn)](https://github.com/promptromp/aws-bootstrap-g4dn/blob/main/LICENSE)
+[![PyPI - Version](https://img.shields.io/pypi/v/aws-bootstrap-g4dn)](https://pypi.org/project/aws-bootstrap-g4dn/)
+[![PyPI - Python Version](https://img.shields.io/pypi/pyversions/aws-bootstrap-g4dn)](https://pypi.org/project/aws-bootstrap-g4dn/)
+
+
 This repository contains code and documentation to make it fast and easy to bootstrap an AWS EC2 instance running a Deep Learning AMI (e.g. Ubuntu or Amazon Linux) with a CUDA-compliant Nvidia GPU (e.g. g4dn.xlarge by default).
 
 The idea is to make it easy in particular to quickly spawn cost-effective Spot Instances via AWS CLI , bootstrapping the instance with an SSH key, and ramping up to be able to develop using CUDA.
