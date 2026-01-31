@@ -20,6 +20,31 @@ else
     echo "WARNING: nvcc not found (CUDA toolkit may not be installed)"
 fi
 
+# Make Nsight Systems (nsys) available on PATH if installed under /opt/nvidia
+if ! command -v nsys &>/dev/null; then
+    NSIGHT_DIR="/opt/nvidia/nsight-systems"
+    if [ -d "$NSIGHT_DIR" ]; then
+        # Fix permissions — the parent dir is often root-only (drwx------)
+        sudo chmod o+rx "$NSIGHT_DIR"
+        # Find the latest version directory (lexicographic sort)
+        NSYS_VERSION=$(ls -1 "$NSIGHT_DIR" | sort -V | tail -1)
+        if [ -n "$NSYS_VERSION" ] && [ -x "$NSIGHT_DIR/$NSYS_VERSION/bin/nsys" ]; then
+            NSYS_BIN="$NSIGHT_DIR/$NSYS_VERSION/bin"
+            if ! grep -q "nsight-systems" ~/.bashrc 2>/dev/null; then
+                echo "export PATH=\"$NSYS_BIN:\$PATH\"" >> ~/.bashrc
+            fi
+            export PATH="$NSYS_BIN:$PATH"
+            echo "  Nsight Systems $NSYS_VERSION added to PATH ($NSYS_BIN)"
+        else
+            echo "  WARNING: Nsight Systems directory found but no nsys binary"
+        fi
+    else
+        echo "  Nsight Systems not found at $NSIGHT_DIR"
+    fi
+else
+    echo "  nsys already on PATH: $(command -v nsys)"
+fi
+
 # 2. Install utilities
 echo ""
 echo "[2/6] Installing utilities..."
