@@ -116,6 +116,7 @@ The setup script runs automatically on the instance after SSH becomes available:
 | **CUDA-aware PyTorch** | Detects CUDA toolkit version → installs PyTorch from the matching `cu{TAG}` wheel index |
 | **CUDA smoke test** | Runs `torch.cuda.is_available()` + GPU matmul to verify the stack |
 | **GPU benchmark** | Copies `gpu_benchmark.py` to `~/gpu_benchmark.py` |
+| **GPU smoke test notebook** | Copies `gpu_smoke_test.ipynb` to `~/gpu_smoke_test.ipynb` (open in JupyterLab) |
 | **Jupyter** | Configures and starts JupyterLab as a systemd service on port 8888 |
 | **SSH keepalive** | Configures server-side keepalive to prevent idle disconnects |
 
@@ -153,6 +154,8 @@ Or with explicit key/IP:
 ```bash
 ssh -i ~/.ssh/id_ed25519 -NL 8888:localhost:8888 ubuntu@<public-ip>
 ```
+
+A **GPU smoke test notebook** (`~/gpu_smoke_test.ipynb`) is pre-installed on every instance. Open it in JupyterLab to interactively verify the CUDA stack, run FP32/FP16 matmuls, train a small CNN on MNIST, and visualise training loss and GPU memory usage.
 
 ### 📋 Listing Resources
 

@@ -133,6 +133,18 @@ def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) ->
         click.secho(f"  SCP failed: {bench_result.stderr}", fg="red", err=True)
         return False
 
+    # SCP the GPU smoke test notebook
+    notebook_path = script_path.parent / "gpu_smoke_test.ipynb"
+    click.echo("  Uploading gpu_smoke_test.ipynb...")
+    nb_result = subprocess.run(
+        ["scp", *ssh_opts, str(notebook_path), f"{user}@{host}:/tmp/gpu_smoke_test.ipynb"],
+        capture_output=True,
+        text=True,
+    )
+    if nb_result.returncode != 0:
+        click.secho(f"  SCP failed: {nb_result.stderr}", fg="red", err=True)
+        return False
+
     # SCP the script
     click.echo("  Uploading remote_setup.sh...")
     scp_result = subprocess.run(

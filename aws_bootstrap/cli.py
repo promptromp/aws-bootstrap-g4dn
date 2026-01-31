@@ -216,6 +216,7 @@ def launch(
     click.secho(f"    ssh -NL 8888:localhost:8888 {alias}", bold=True)
     info(f"or: ssh -i {private_key} -NL 8888:localhost:8888 {config.ssh_user}@{public_ip}")
     info("Then open: http://localhost:8888")
+    info("Notebook: ~/gpu_smoke_test.ipynb (GPU smoke test)")
 
     click.echo()
     click.secho("  GPU Benchmark:", fg="cyan")

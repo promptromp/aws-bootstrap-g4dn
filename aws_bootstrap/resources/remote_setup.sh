@@ -109,8 +109,9 @@ install_pytorch_cuda
 # Install remaining dependencies (torch/torchvision already installed above)
 uv pip install --python ~/venv/bin/python -r /tmp/requirements.txt
 
-# Copy GPU benchmark script
+# Copy GPU benchmark script and smoke test notebook
 cp /tmp/gpu_benchmark.py ~/gpu_benchmark.py
+cp /tmp/gpu_smoke_test.ipynb ~/gpu_smoke_test.ipynb
 
 # Auto-activate venv on login
 if ! grep -q 'source ~/venv/bin/activate' ~/.bashrc 2>/dev/null; then

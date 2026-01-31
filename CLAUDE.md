@@ -36,9 +36,10 @@ aws_bootstrap/
     ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
-        gpu_benchmark.py # GPU throughput benchmark (CNN + Transformer), copied to ~/gpu_benchmark.py on instance
-        remote_setup.sh  # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
-        requirements.txt # Python dependencies installed on the remote instance
+        gpu_benchmark.py       # GPU throughput benchmark (CNN + Transformer), copied to ~/gpu_benchmark.py on instance
+        gpu_smoke_test.ipynb   # Interactive Jupyter notebook for GPU verification, copied to ~/gpu_smoke_test.ipynb
+        remote_setup.sh        # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
+        requirements.txt       # Python dependencies installed on the remote instance
     tests/               # Unit tests (pytest)
         test_config.py
         test_cli.py
@@ -97,7 +98,7 @@ The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags publi
 `remote_setup.sh` also:
 - Creates `~/venv` and appends `source ~/venv/bin/activate` to `~/.bashrc` so the venv is auto-activated on SSH login
 - Runs a quick CUDA smoke test (`torch.cuda.is_available()` + GPU matmul) after PyTorch installation to verify the GPU stack; prints a WARNING on failure but does not abort
-- Copies `gpu_benchmark.py` to `~/gpu_benchmark.py`
+- Copies `gpu_benchmark.py` to `~/gpu_benchmark.py` and `gpu_smoke_test.ipynb` to `~/gpu_smoke_test.ipynb`
 
 ## GPU Benchmark
 
