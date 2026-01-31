@@ -105,7 +105,9 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
     return False
 
 
-def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) -> bool:
+def run_remote_setup(
+    host: str, user: str, key_path: Path, script_path: Path, python_version: str | None = None
+) -> bool:
     """SCP the setup script and requirements.txt to the instance and execute."""
     ssh_opts = _ssh_opts(key_path)
     requirements_path = script_path.parent / "requirements.txt"
@@ -156,10 +158,14 @@ def run_remote_setup(host: str, user: str, key_path: Path, script_path: Path) ->
         click.secho(f"  SCP failed: {scp_result.stderr}", fg="red", err=True)
         return False
 
-    # Execute the script
+    # Execute the script, passing PYTHON_VERSION as an inline env var if specified
     click.echo("  Running remote_setup.sh on instance...")
+    remote_cmd = "chmod +x /tmp/remote_setup.sh && "
+    if python_version:
+        remote_cmd += f"PYTHON_VERSION={python_version} "
+    remote_cmd += "/tmp/remote_setup.sh"
     ssh_result = subprocess.run(
-        ["ssh", *ssh_opts, f"{user}@{host}", "chmod +x /tmp/remote_setup.sh && /tmp/remote_setup.sh"],
+        ["ssh", *ssh_opts, f"{user}@{host}", remote_cmd],
         capture_output=False,
     )
     return ssh_result.returncode == 0

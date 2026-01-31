@@ -34,7 +34,13 @@ if ! command -v uv &>/dev/null; then
 fi
 export PATH="$HOME/.local/bin:$PATH"
 
-uv venv ~/venv
+if [ -n "${PYTHON_VERSION:-}" ]; then
+    echo "  Installing Python ${PYTHON_VERSION}..."
+    uv python install "$PYTHON_VERSION"
+    uv venv --python "$PYTHON_VERSION" ~/venv
+else
+    uv venv ~/venv
+fi
 
 # --- CUDA-aware PyTorch installation ---
 # Known PyTorch CUDA wheel tags (ascending order).

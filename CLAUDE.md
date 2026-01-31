@@ -54,7 +54,7 @@ Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`
 
 ## CLI Commands
 
-- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`
+- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`; `--python-version` controls which Python `uv` installs in the remote venv
 - **`status`** — lists all non-terminated instances (including `shutting-down`) with type, IP, SSH alias, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`)
 - **`terminate`** — terminates instances by ID or all aws-bootstrap instances in the region; removes SSH config aliases
 - **`list instance-types`** — lists EC2 instance types matching a family prefix (default: `g4dn`), showing vCPUs, memory, and GPU info

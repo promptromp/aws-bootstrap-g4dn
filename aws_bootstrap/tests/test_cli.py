@@ -636,3 +636,67 @@ def test_no_credentials_caught_on_list(mock_session, mock_list):
     result = runner.invoke(main, ["list", "instance-types"])
     assert result.exit_code != 0
     assert "Unable to locate AWS credentials" in result.output
+
+
+# ---------------------------------------------------------------------------
+# --python-version tests
+# ---------------------------------------------------------------------------
+
+
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_launch_python_version_passed_to_setup(
+    mock_session, mock_ami, mock_import, mock_sg, mock_launch, mock_wait, mock_ssh, mock_setup, mock_add_ssh, tmp_path
+):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_wait.return_value = {"PublicIpAddress": "1.2.3.4"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--python-version", "3.13"])
+    assert result.exit_code == 0
+    mock_setup.assert_called_once()
+    assert mock_setup.call_args[0][4] == "3.13"
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_shows_python_version(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run", "--python-version", "3.14.2"])
+    assert result.exit_code == 0
+    assert "3.14.2" in result.output
+    assert "Python version" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_omits_python_version_when_unset(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run"])
+    assert result.exit_code == 0
+    assert "Python version" not in result.output

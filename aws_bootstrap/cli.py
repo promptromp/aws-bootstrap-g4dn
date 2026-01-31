@@ -113,6 +113,11 @@ def main():
 @click.option("--no-setup", is_flag=True, default=False, help="Skip running the remote setup script.")
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would be done without executing.")
 @click.option("--profile", default=None, help="AWS profile override (defaults to AWS_PROFILE env var).")
+@click.option(
+    "--python-version",
+    default=None,
+    help="Python version for the remote venv (e.g. 3.13, 3.14.2). Passed to uv during setup.",
+)
 def launch(
     instance_type,
     ami_filter,
@@ -125,6 +130,7 @@ def launch(
     no_setup,
     dry_run,
     profile,
+    python_version,
 ):
     """Launch a GPU-accelerated EC2 instance."""
     config = LaunchConfig(
@@ -137,6 +143,7 @@ def launch(
         volume_size=volume_size,
         run_setup=not no_setup,
         dry_run=dry_run,
+        python_version=python_version,
     )
     if ami_filter:
         config.ami_filter = ami_filter
@@ -178,6 +185,8 @@ def launch(
         val("Volume", f"{config.volume_size} GB gp3")
         val("Region", config.region)
         val("Remote setup", "yes" if config.run_setup else "no")
+        if config.python_version:
+            val("Python version", config.python_version)
         click.echo()
         click.secho("No resources launched (dry-run mode).", fg="yellow")
         return
@@ -212,7 +221,7 @@ def launch(
             warn(f"Setup script not found at {SETUP_SCRIPT}, skipping.")
         else:
             info("Running remote setup...")
-            if run_remote_setup(public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT):
+            if run_remote_setup(public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT, config.python_version):
                 success("Remote setup completed successfully.")
             else:
                 warn("Remote setup failed. Instance is still running.")

@@ -107,6 +107,9 @@ aws-bootstrap launch --on-demand --instance-type g5.xlarge --region us-east-1
 # Launch without running the remote setup script
 aws-bootstrap launch --no-setup
 
+# Use a specific Python version in the remote venv
+aws-bootstrap launch --python-version 3.13
+
 # Use a specific AWS profile
 aws-bootstrap launch --profile my-aws-profile
 ```

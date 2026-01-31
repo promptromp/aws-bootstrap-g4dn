@@ -22,3 +22,4 @@ class LaunchConfig:
     ssh_user: str = "ubuntu"
     tag_value: str = "aws-bootstrap-g4dn"
     alias_prefix: str = "aws-gpu"
+    python_version: str | None = None
