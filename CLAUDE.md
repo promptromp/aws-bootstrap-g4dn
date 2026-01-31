@@ -13,7 +13,7 @@ Target workflows: Jupyter server-client, VSCode Remote SSH, and NVIDIA Nsight re
 - **Python 3.14+** with **uv** package manager (astral-sh/uv) — used for venv creation, dependency management, and running the project
 - **boto3** — AWS SDK for EC2 provisioning (AMI lookup, security groups, instance launch, waiters)
 - **click** — CLI framework with built-in color support (`click.secho`, `click.style`)
-- **hatchling** — build backend (configured in pyproject.toml)
+- **setuptools + setuptools-scm** — build backend with git-tag-based versioning (configured in pyproject.toml)
 - **AWS CLI v2** with a configured AWS profile (`AWS_PROFILE` env var or `--profile` flag)
 - **direnv** for automatic venv activation (`.envrc` sources `.venv/bin/activate`)
 
@@ -103,6 +103,28 @@ The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags publi
 ## GPU Benchmark
 
 `resources/gpu_benchmark.py` is uploaded to `~/gpu_benchmark.py` on the remote instance during setup. It benchmarks GPU throughput with two modes: CNN on MNIST and a GPT-style Transformer on synthetic data. It reports samples/sec, batch times, and peak GPU memory. Supports `--precision` (fp32/fp16/bf16/tf32), `--diagnose` for CUDA smoke tests, and separate `--transformer-batch-size` (default 32, T4-safe). Dependencies (`torch`, `torchvision`, `tqdm`) are already installed by the setup script.
+
+## Versioning & Publishing
+
+Version is derived automatically from git tags via **setuptools-scm** — no hardcoded version string in the codebase.
+
+- **Tagged commits** (e.g. `0.1.0`) produce exact versions
+- **Between tags**, setuptools-scm generates dev versions like `0.1.1.dev5+gabcdef` (valid PEP 440)
+- `click.version_option(package_name="aws-bootstrap-g4dn")` in `cli.py` reads from package metadata — works automatically
+
+### Release process
+
+1. Create and push a git tag: `git tag X.Y.Z && git push origin X.Y.Z`
+2. The `publish-to-pypi.yml` workflow triggers on tag push and:
+   - Builds wheel + sdist
+   - Publishes to PyPI and TestPyPI via OIDC trusted publishing
+   - Creates a GitHub Release with Sigstore-signed artifacts
+
+### Required one-time setup (repo owner)
+
+- **PyPI trusted publisher**: https://pypi.org/manage/account/publishing/ — add publisher for `aws-bootstrap-g4dn`, workflow `publish-to-pypi.yml`, environment `pypi`
+- **TestPyPI trusted publisher**: same at https://test.pypi.org/manage/account/publishing/, environment `testpypi`
+- **GitHub environments**: create `pypi` and `testpypi` environments at repo Settings > Environments
 
 ## Keeping Docs Updated
 
