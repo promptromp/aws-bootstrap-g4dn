@@ -13,11 +13,70 @@ Main workflows we're optimizing for are hybrid local-remote workflows e.g.:
 
 ## Requirements
 
-Main requirements for running this are:
+1. AWS profile configured with relevant permissions (profile name can be passed via `--profile` or read from `AWS_PROFILE` env var)
+2. AWS CLI v2 — see [here](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+3. Python 3.14+ and [uv](https://github.com/astral-sh/uv)
+4. An SSH key pair (see below)
 
-1. AWS profile configured with relevant permissions to make AWS code (profile name can be passed to most CLIs or read directly via `AWS_PROFILE` env var)
-2. AWS CLI v2 - see [here](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
-3. Python 3.13 and up, and [uv](https://github.com/astral-sh/uv)
+## Installation
+
+```bash
+git clone https://github.com/your-org/aws-bootstrap-g4dn.git
+cd aws-bootstrap-g4dn
+uv venv .venv
+uv sync
+direnv allow  # or manually: source .venv/bin/activate
+```
+
+This installs the `aws-bootstrap` CLI into your virtualenv.
+
+## SSH Key Setup
+
+The CLI expects an Ed25519 SSH public key at `~/.ssh/id_ed25519.pub` by default. If you don't have one, generate it:
+
+```bash
+ssh-keygen -t ed25519
+```
+
+Accept the default path (`~/.ssh/id_ed25519`) and optionally set a passphrase. The key pair will be imported into AWS automatically on first launch.
+
+To use a different key, pass `--key-path`:
+
+```bash
+aws-bootstrap launch --key-path ~/.ssh/my_other_key.pub
+```
+
+## Usage
+
+```bash
+# Show available commands
+aws-bootstrap --help
+
+# Show launch options
+aws-bootstrap launch --help
+
+# Dry run — validates AMI lookup, key import, and security group without launching
+aws-bootstrap launch --dry-run
+
+# Launch a spot g4dn.xlarge (default)
+aws-bootstrap launch
+
+# Launch on-demand in a specific region with a custom instance type
+aws-bootstrap launch --on-demand --instance-type g5.xlarge --region us-east-1
+
+# Launch without running the remote setup script
+aws-bootstrap launch --no-setup
+
+# Use a specific AWS profile
+aws-bootstrap launch --profile my-aws-profile
+```
+
+After launch, the CLI prints SSH and Jupyter tunnel commands:
+
+```
+ssh -i ~/.ssh/id_ed25519 ubuntu@<public-ip>
+ssh -i ~/.ssh/id_ed25519 -NL 8888:localhost:8888 ubuntu@<public-ip>
+```
 
 ## Additional Resources
 
