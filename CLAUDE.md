@@ -51,6 +51,8 @@ Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`
 - **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors)
 - **`status`** — lists active instances with type, IP, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances
 - **`terminate`** — terminates instances by ID or all aws-bootstrap instances in the region
+- **`list instance-types`** — lists EC2 instance types matching a family prefix (default: `g4dn`), showing vCPUs, memory, and GPU info
+- **`list amis`** — lists available AMIs matching a name pattern (default: Deep Learning Base OSS Nvidia Driver GPU AMIs), sorted newest-first
 
 ## Coding Conventions
 

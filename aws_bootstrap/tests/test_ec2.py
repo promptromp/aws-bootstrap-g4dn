@@ -16,6 +16,8 @@ from aws_bootstrap.ec2 import (
     get_latest_ami,
     get_spot_price,
     launch_instance,
+    list_amis,
+    list_instance_types,
     terminate_tagged_instances,
 )
 
@@ -182,3 +184,130 @@ def test_terminate_tagged_instances():
     assert len(changes) == 1
     assert changes[0]["InstanceId"] == "i-abc123"
     ec2.terminate_instances.assert_called_once_with(InstanceIds=["i-abc123"])
+
+
+# ---------------------------------------------------------------------------
+# list_instance_types
+# ---------------------------------------------------------------------------
+
+
+def test_list_instance_types_returns_sorted():
+    ec2 = MagicMock()
+    paginator = MagicMock()
+    ec2.get_paginator.return_value = paginator
+    paginator.paginate.return_value = [
+        {
+            "InstanceTypes": [
+                {
+                    "InstanceType": "g4dn.xlarge",
+                    "VCpuInfo": {"DefaultVCpus": 4},
+                    "MemoryInfo": {"SizeInMiB": 16384},
+                    "GpuInfo": {"Gpus": [{"Count": 1, "Name": "T4", "MemoryInfo": {"SizeInMiB": 16384}}]},
+                },
+                {
+                    "InstanceType": "g4dn.2xlarge",
+                    "VCpuInfo": {"DefaultVCpus": 8},
+                    "MemoryInfo": {"SizeInMiB": 32768},
+                    "GpuInfo": {"Gpus": [{"Count": 1, "Name": "T4", "MemoryInfo": {"SizeInMiB": 16384}}]},
+                },
+            ]
+        }
+    ]
+    results = list_instance_types(ec2, "g4dn")
+    assert len(results) == 2
+    # sorted by name — 2xlarge < xlarge lexicographically
+    assert results[0]["InstanceType"] == "g4dn.2xlarge"
+    assert results[1]["InstanceType"] == "g4dn.xlarge"
+    assert results[1]["VCpuCount"] == 4
+    assert results[1]["MemoryMiB"] == 16384
+    assert "T4" in results[1]["GpuSummary"]
+
+
+def test_list_instance_types_no_gpu():
+    ec2 = MagicMock()
+    paginator = MagicMock()
+    ec2.get_paginator.return_value = paginator
+    paginator.paginate.return_value = [
+        {
+            "InstanceTypes": [
+                {
+                    "InstanceType": "t3.medium",
+                    "VCpuInfo": {"DefaultVCpus": 2},
+                    "MemoryInfo": {"SizeInMiB": 4096},
+                },
+            ]
+        }
+    ]
+    results = list_instance_types(ec2, "t3")
+    assert len(results) == 1
+    assert results[0]["GpuSummary"] == ""
+
+
+def test_list_instance_types_empty():
+    ec2 = MagicMock()
+    paginator = MagicMock()
+    ec2.get_paginator.return_value = paginator
+    paginator.paginate.return_value = [{"InstanceTypes": []}]
+    results = list_instance_types(ec2, "nonexistent")
+    assert results == []
+
+
+# ---------------------------------------------------------------------------
+# list_amis
+# ---------------------------------------------------------------------------
+
+
+def test_list_amis_sorted_newest_first():
+    ec2 = MagicMock()
+    ec2.describe_images.return_value = {
+        "Images": [
+            {
+                "ImageId": "ami-old",
+                "Name": "DL AMI old",
+                "CreationDate": "2024-01-01T00:00:00Z",
+                "Architecture": "x86_64",
+            },
+            {
+                "ImageId": "ami-new",
+                "Name": "DL AMI new",
+                "CreationDate": "2025-06-01T00:00:00Z",
+                "Architecture": "x86_64",
+            },
+        ]
+    }
+    results = list_amis(ec2, "DL AMI*")
+    assert len(results) == 2
+    assert results[0]["ImageId"] == "ami-new"
+    assert results[1]["ImageId"] == "ami-old"
+
+
+def test_list_amis_empty():
+    ec2 = MagicMock()
+    ec2.describe_images.return_value = {"Images": []}
+    results = list_amis(ec2, "nonexistent*")
+    assert results == []
+
+
+def test_list_amis_limited_to_20():
+    ec2 = MagicMock()
+    ec2.describe_images.return_value = {
+        "Images": [
+            {
+                "ImageId": f"ami-{i:03d}",
+                "Name": f"AMI {i}",
+                "CreationDate": f"2025-01-{i + 1:02d}T00:00:00Z",
+                "Architecture": "x86_64",
+            }
+            for i in range(25)
+        ]
+    }
+    results = list_amis(ec2, "AMI*")
+    assert len(results) == 20
+
+
+def test_list_amis_uses_owner_hint_for_deep_learning():
+    ec2 = MagicMock()
+    ec2.describe_images.return_value = {"Images": []}
+    list_amis(ec2, "Deep Learning Base*")
+    call_kwargs = ec2.describe_images.call_args[1]
+    assert call_kwargs["Owners"] == ["amazon"]

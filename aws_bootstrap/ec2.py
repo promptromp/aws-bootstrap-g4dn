@@ -247,6 +247,73 @@ def get_spot_price(ec2_client, instance_type: str, availability_zone: str) -> fl
     return float(prices[0]["SpotPrice"])
 
 
+def list_instance_types(ec2_client, name_prefix: str = "g4dn") -> list[dict]:
+    """List EC2 instance types matching a name prefix (e.g. 'g4dn', 'p3').
+
+    Returns a list of dicts with InstanceType, vCPUs, MemoryMiB, and GPUs info,
+    sorted by instance type name.
+    """
+    paginator = ec2_client.get_paginator("describe_instance_types")
+    pages = paginator.paginate(
+        Filters=[{"Name": "instance-type", "Values": [f"{name_prefix}.*"]}],
+    )
+    results = []
+    for page in pages:
+        for it in page["InstanceTypes"]:
+            gpus = it.get("GpuInfo", {}).get("Gpus", [])
+            gpu_summary = ""
+            if gpus:
+                g = gpus[0]
+                mem = g.get("MemoryInfo", {}).get("SizeInMiB", 0)
+                gpu_summary = f"{g.get('Count', '?')}x {g.get('Name', 'GPU')} ({mem} MiB)"
+            results.append(
+                {
+                    "InstanceType": it["InstanceType"],
+                    "VCpuCount": it["VCpuInfo"]["DefaultVCpus"],
+                    "MemoryMiB": it["MemoryInfo"]["SizeInMiB"],
+                    "GpuSummary": gpu_summary,
+                }
+            )
+    results.sort(key=lambda x: x["InstanceType"])
+    return results
+
+
+def list_amis(ec2_client, ami_filter: str) -> list[dict]:
+    """List available AMIs matching a name filter pattern.
+
+    Returns a list of dicts with ImageId, Name, CreationDate, and Architecture,
+    sorted by creation date (newest first). Limited to the 20 most recent.
+    """
+    owners = None
+    for prefix, owner_ids in _OWNER_HINTS.items():
+        if ami_filter.startswith(prefix):
+            owners = owner_ids
+            break
+
+    params: dict = {
+        "Filters": [
+            {"Name": "name", "Values": [ami_filter]},
+            {"Name": "state", "Values": ["available"]},
+            {"Name": "architecture", "Values": ["x86_64"]},
+        ],
+    }
+    if owners:
+        params["Owners"] = owners
+
+    response = ec2_client.describe_images(**params)
+    images = response["Images"]
+    images.sort(key=lambda x: x["CreationDate"], reverse=True)
+    return [
+        {
+            "ImageId": img["ImageId"],
+            "Name": img["Name"],
+            "CreationDate": img["CreationDate"],
+            "Architecture": img.get("Architecture", ""),
+        }
+        for img in images[:20]
+    ]
+
+
 def terminate_tagged_instances(ec2_client, instance_ids: list[str]) -> list[dict]:
     """Terminate instances by ID. Returns the state changes."""
     response = ec2_client.terminate_instances(InstanceIds=instance_ids)
