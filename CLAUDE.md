@@ -49,6 +49,7 @@ aws_bootstrap/
         test_ssh_config.py
         test_ssh_gpu.py
 docs/
+    nsight-remote-profiling.md # Nsight Compute, Nsight Systems, and Nsight VSCE remote profiling guide
     spot-request-lifecycle.md  # Research notes on spot request cleanup
 ```
 

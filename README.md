@@ -303,7 +303,7 @@ aws-bootstrap launch --instance-type t3.medium --ami-filter "ubuntu/images/hvm-s
 | GPU instance pricing | [instances.vantage.sh](https://instances.vantage.sh/aws/ec2/g4dn.xlarge) |
 | Spot instance quotas | [AWS docs](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-limits.html) |
 | Deep Learning AMIs | [AWS docs](https://docs.aws.amazon.com/dlami/latest/devguide/what-is-dlami.html) |
-| Nvidia Nsight remote debugging | [Nvidia docs](https://docs.nvidia.com/nsight-visual-studio-edition/3.2/Content/Setup_Remote_Debugging.htm) |
+| Nsight remote GPU profiling | [Guide](docs/nsight-remote-profiling.md) — Nsight Compute, Nsight Systems, and Nsight VSCE on EC2 |
 
 Tutorials on setting up a CUDA environment on EC2 GPU instances:
 
