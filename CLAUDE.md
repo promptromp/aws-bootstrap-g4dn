@@ -30,11 +30,12 @@ direnv allow  # or manually: source .venv/bin/activate
 ```
 aws_bootstrap/
     __init__.py          # Package init
-    cli.py               # Click CLI entry point (launch command, output helpers)
+    cli.py               # Click CLI entry point (launch, status, terminate commands)
     config.py            # LaunchConfig dataclass with defaults
-    ec2.py               # AMI lookup, security group, instance launch, polling
+    ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling
     ssh.py               # SSH key pair import, SSH readiness check, remote setup
     remote_setup.sh      # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
+    tests/               # Unit tests (pytest)
 ```
 
 Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`)
@@ -63,3 +64,10 @@ uv run pytest
 ```
 
 Use `uv add <package>` to add dependencies and `uv add --group dev <package>` for dev dependencies.
+
+## Keeping Docs Updated
+
+When making changes that affect project setup, CLI interface, dependencies, project structure, or development workflows, update **README.md** and **CLAUDE.md** accordingly:
+
+- **README.md** — user-facing: installation, usage examples, CLI options, AWS setup/quota instructions
+- **CLAUDE.md** — agent-facing: project overview, tech stack, project structure, coding conventions

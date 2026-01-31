@@ -7,7 +7,14 @@ import boto3
 import click
 
 from .config import LaunchConfig
-from .ec2 import ensure_security_group, get_latest_dl_ami, launch_instance, wait_instance_ready
+from .ec2 import (
+    ensure_security_group,
+    find_tagged_instances,
+    get_latest_dl_ami,
+    launch_instance,
+    terminate_tagged_instances,
+    wait_instance_ready,
+)
 from .ssh import import_key_pair, run_remote_setup, wait_for_ssh
 
 
@@ -183,4 +190,79 @@ def launch(
     click.echo()
     click.secho("  Terminate:", fg="cyan")
     click.secho(f"    aws ec2 terminate-instances --instance-ids {instance_id} --region {config.region}", bold=True)
+    click.secho(f"    aws-bootstrap terminate --region {config.region}", bold=True)
     click.echo()
+
+
+@main.command()
+@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+def status(region, profile):
+    """Show running instances created by aws-bootstrap."""
+    session = boto3.Session(profile_name=profile, region_name=region)
+    ec2 = session.client("ec2")
+
+    instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
+    if not instances:
+        click.secho("No active aws-bootstrap instances found.", fg="yellow")
+        return
+
+    click.secho(f"\n  Found {len(instances)} instance(s):\n", bold=True, fg="cyan")
+    for inst in instances:
+        state = inst["State"]
+        state_color = {"running": "green", "pending": "yellow", "stopping": "yellow", "stopped": "red"}.get(
+            state, "white"
+        )
+        click.echo(
+            "  " + click.style(inst["InstanceId"], fg="bright_white") + "  " + click.style(state, fg=state_color)
+        )
+        val("    Type", inst["InstanceType"])
+        if inst["PublicIp"]:
+            val("    IP", inst["PublicIp"])
+        val("    Launched", str(inst["LaunchTime"]))
+    click.echo()
+
+
+@main.command()
+@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
+@click.argument("instance_ids", nargs=-1)
+def terminate(region, profile, yes, instance_ids):
+    """Terminate instances created by aws-bootstrap.
+
+    Pass specific instance IDs to terminate, or omit to terminate all
+    aws-bootstrap instances in the region.
+    """
+    session = boto3.Session(profile_name=profile, region_name=region)
+    ec2 = session.client("ec2")
+
+    if instance_ids:
+        targets = list(instance_ids)
+    else:
+        instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
+        if not instances:
+            click.secho("No active aws-bootstrap instances found.", fg="yellow")
+            return
+        targets = [inst["InstanceId"] for inst in instances]
+        click.secho(f"\n  Found {len(targets)} instance(s) to terminate:\n", bold=True, fg="cyan")
+        for inst in instances:
+            iid = click.style(inst["InstanceId"], fg="bright_white")
+            click.echo(f"  {iid}  {inst['State']}  {inst['InstanceType']}")
+
+    if not yes:
+        click.echo()
+        if not click.confirm(f"  Terminate {len(targets)} instance(s)?"):
+            click.secho("  Cancelled.", fg="yellow")
+            return
+
+    changes = terminate_tagged_instances(ec2, targets)
+    click.echo()
+    for change in changes:
+        prev = change["PreviousState"]["Name"]
+        curr = change["CurrentState"]["Name"]
+        click.echo(
+            "  " + click.style(change["InstanceId"], fg="bright_white") + f"  {prev} -> " + click.style(curr, fg="red")
+        )
+    click.echo()
+    success(f"Terminated {len(changes)} instance(s).")

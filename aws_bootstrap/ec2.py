@@ -126,11 +126,19 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
         response = ec2_client.run_instances(**launch_params)
     except botocore.exceptions.ClientError as e:
         code = e.response["Error"]["Code"]
-        if code in ("InsufficientInstanceCapacity", "SpotMaxPriceTooLow") and config.spot:
+        if code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
+            _raise_quota_error(code, config)
+        elif code in ("InsufficientInstanceCapacity", "SpotMaxPriceTooLow") and config.spot:
             click.secho(f"\n  Spot request failed: {e.response['Error']['Message']}", fg="yellow")
             if click.confirm("  Retry as on-demand instance?"):
                 launch_params.pop("InstanceMarketOptions", None)
-                response = ec2_client.run_instances(**launch_params)
+                try:
+                    response = ec2_client.run_instances(**launch_params)
+                except botocore.exceptions.ClientError as retry_e:
+                    retry_code = retry_e.response["Error"]["Code"]
+                    if retry_code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
+                        _raise_quota_error(retry_code, config)
+                    raise
             else:
                 raise click.ClickException("Launch cancelled.") from None
         else:
@@ -138,6 +146,65 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
 
     instance = response["Instances"][0]
     return instance
+
+
+QUOTA_HINT = (
+    "See the 'EC2 vCPU Quotas' section in README.md for instructions on\n"
+    "  checking and requesting quota increases.\n\n"
+    "  To test the flow without GPU quotas, try:\n"
+    '    aws-bootstrap launch --instance-type t3.medium --ami-filter "Ubuntu Server 24.04*"'
+)
+
+
+def _raise_quota_error(code: str, config: LaunchConfig) -> None:
+    pricing = "spot" if config.spot else "on-demand"
+    if code == "MaxSpotInstanceCountExceeded":
+        msg = (
+            f"Spot instance quota exceeded for {config.instance_type} in {config.region}.\n\n"
+            f"  Your account's spot vCPU limit for this instance family is too low.\n"
+            f"  {QUOTA_HINT}"
+        )
+    else:
+        msg = (
+            f"On-demand vCPU quota exceeded for {config.instance_type} in {config.region}.\n\n"
+            f"  Your account's {pricing} vCPU limit for this instance family is too low.\n"
+            f"  {QUOTA_HINT}"
+        )
+    raise click.ClickException(msg)
+
+
+def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
+    """Find all running/pending instances with the created-by tag."""
+    response = ec2_client.describe_instances(
+        Filters=[
+            {"Name": "tag:created-by", "Values": [tag_value]},
+            {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
+        ]
+    )
+    instances = []
+    for reservation in response["Reservations"]:
+        for inst in reservation["Instances"]:
+            name = ""
+            for tag in inst.get("Tags", []):
+                if tag["Key"] == "Name":
+                    name = tag["Value"]
+            instances.append(
+                {
+                    "InstanceId": inst["InstanceId"],
+                    "Name": name,
+                    "State": inst["State"]["Name"],
+                    "InstanceType": inst["InstanceType"],
+                    "PublicIp": inst.get("PublicIpAddress", ""),
+                    "LaunchTime": inst["LaunchTime"],
+                }
+            )
+    return instances
+
+
+def terminate_tagged_instances(ec2_client, instance_ids: list[str]) -> list[dict]:
+    """Terminate instances by ID. Returns the state changes."""
+    response = ec2_client.terminate_instances(InstanceIds=instance_ids)
+    return response["TerminatingInstances"]
 
 
 def wait_instance_ready(ec2_client, instance_id: str) -> dict:

@@ -78,34 +78,86 @@ ssh -i ~/.ssh/id_ed25519 ubuntu@<public-ip>
 ssh -i ~/.ssh/id_ed25519 -NL 8888:localhost:8888 ubuntu@<public-ip>
 ```
 
-## Spot Instance Quotas
-
-AWS accounts have [service quotas](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-limits.html) that limit how many vCPUs you can run per instance family. New or lightly-used accounts often have a **default spot quota of 0 vCPUs** for GPU instance families (G and VT), which will cause a `MaxSpotInstanceCountExceeded` error on launch.
-
-To check your current G/VT spot quota:
+### Managing Instances
 
 ```bash
+# List all running aws-bootstrap instances
+aws-bootstrap status
+
+# List instances in a specific region
+aws-bootstrap status --region us-east-1
+
+# Terminate all aws-bootstrap instances (with confirmation prompt)
+aws-bootstrap terminate
+
+# Terminate specific instances
+aws-bootstrap terminate i-abc123 i-def456
+
+# Skip confirmation prompt
+aws-bootstrap terminate --yes
+```
+
+## EC2 vCPU Quotas
+
+AWS accounts have [service quotas](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-resource-limits.html) that limit how many vCPUs you can run per instance family. New or lightly-used accounts often have a **default quota of 0 vCPUs** for GPU instance families (G and VT), which will cause errors on launch:
+
+- **Spot**: `MaxSpotInstanceCountExceeded`
+- **On-Demand**: `VcpuLimitExceeded`
+
+Check your current quotas (g4dn.xlarge requires at least 4 vCPUs):
+
+```bash
+# Spot G/VT quota
 aws service-quotas get-service-quota \
   --service-code ec2 \
   --quota-code L-3819A6DF \
   --region us-west-2
+
+# On-Demand G/VT quota
+aws service-quotas get-service-quota \
+  --service-code ec2 \
+  --quota-code L-DB2BBE81 \
+  --region us-west-2
 ```
 
-To request an increase (g4dn.xlarge requires at least 4 vCPUs):
+Request increases:
 
 ```bash
+# Spot — increase to 4 vCPUs
 aws service-quotas request-service-quota-increase \
   --service-code ec2 \
   --quota-code L-3819A6DF \
   --desired-value 4 \
   --region us-west-2
+
+# On-Demand — increase to 4 vCPUs
+aws service-quotas request-service-quota-increase \
+  --service-code ec2 \
+  --quota-code L-DB2BBE81 \
+  --desired-value 4 \
+  --region us-west-2
 ```
 
-Relevant quota codes:
+Quota codes may vary by region or account type. To list the actual codes in your region:
+
+```bash
+# List all G/VT-related quotas
+aws service-quotas list-service-quotas \
+  --service-code ec2 \
+  --region us-west-2 \
+  --query "Quotas[?contains(QuotaName, 'G and VT')].[QuotaCode,QuotaName,Value]" \
+  --output table
+```
+
+Common quota codes:
 - `L-3819A6DF` — All G and VT **Spot** Instance Requests
 - `L-DB2BBE81` — Running **On-Demand** G and VT instances
 
-Small increases (4-8 vCPUs) are typically auto-approved within minutes. In the meantime, you can use `--on-demand` if your on-demand quota is non-zero, or test the flow with a non-GPU instance type like `--instance-type t3.medium`.
+Small increases (4-8 vCPUs) are typically auto-approved within minutes. You can also request increases via the [Service Quotas console](https://console.aws.amazon.com/servicequotas/home). While waiting, you can test the full launch/poll/SSH flow with a non-GPU instance type:
+
+```bash
+aws-bootstrap launch --instance-type t3.medium --ami-filter "Ubuntu Server 24.04*"
+```
 
 ## Additional Resources
 
