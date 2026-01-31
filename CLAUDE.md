@@ -45,6 +45,8 @@ aws_bootstrap/
         test_ec2.py
         test_ssh_config.py
         test_ssh_gpu.py
+docs/
+    spot-request-lifecycle.md  # Research notes on spot request cleanup
 ```
 
 Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`)
@@ -52,7 +54,7 @@ Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`
 ## CLI Commands
 
 - **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`
-- **`status`** — lists active instances with type, IP, SSH alias, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info (CUDA version, driver, GPU name/architecture) via SSH
+- **`status`** — lists all non-terminated instances (including `shutting-down`) with type, IP, SSH alias, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`)
 - **`terminate`** — terminates instances by ID or all aws-bootstrap instances in the region; removes SSH config aliases
 - **`list instance-types`** — lists EC2 instance types matching a family prefix (default: `g4dn`), showing vCPUs, memory, and GPU info
 - **`list amis`** — lists available AMIs matching a name pattern (default: Deep Learning Base OSS Nvidia Driver GPU AMIs), sorted newest-first
@@ -89,6 +91,13 @@ Use `uv add <package>` to add dependencies and `uv add --group dev <package>` fo
 The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags published by PyTorch (e.g., `118 121 124 126 128 129 130`). When PyTorch adds support for a new CUDA version, add the corresponding tag to this array. Check available tags at: https://download.pytorch.org/whl/
 
 `torch` and `torchvision` are **not** in `resources/requirements.txt` — they are installed separately by the CUDA detection logic in `remote_setup.sh`. All other Python dependencies remain in `requirements.txt`.
+
+## Remote Setup Details
+
+`remote_setup.sh` also:
+- Creates `~/venv` and appends `source ~/venv/bin/activate` to `~/.bashrc` so the venv is auto-activated on SSH login
+- Runs a quick CUDA smoke test (`torch.cuda.is_available()` + GPU matmul) after PyTorch installation to verify the GPU stack; prints a WARNING on failure but does not abort
+- Copies `gpu_benchmark.py` to `~/gpu_benchmark.py`
 
 ## GPU Benchmark
 

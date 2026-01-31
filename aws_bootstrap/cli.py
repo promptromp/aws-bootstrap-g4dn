@@ -251,9 +251,13 @@ def status(region, profile, gpu):
 
     for inst in instances:
         state = inst["State"]
-        state_color = {"running": "green", "pending": "yellow", "stopping": "yellow", "stopped": "red"}.get(
-            state, "white"
-        )
+        state_color = {
+            "running": "green",
+            "pending": "yellow",
+            "stopping": "yellow",
+            "stopped": "red",
+            "shutting-down": "red",
+        }.get(state, "white")
         alias = ssh_hosts.get(inst["InstanceId"])
         alias_str = f" ({alias})" if alias else ""
         click.echo(
