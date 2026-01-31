@@ -11,6 +11,14 @@ Main workflows we're optimizing for are hybrid local-remote workflows e.g.:
 3. Using Nvidia Nsight for remote debugging
 
 
+## Requirements
+
+Main requirements for running this are:
+
+1. AWS profile configured with relevant permissions to make AWS code (profile name can be passed to most CLIs or read directly via `AWS_PROFILE` env var)
+2. AWS CLI v2 - see [here](https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html)
+3. Python 3.13 and up, and [uv](https://github.com/astral-sh/uv)
+
 ## Additional Resources
 
 For pricing information on GPU instances see [here](https://instances.vantage.sh/aws/ec2/g4dn.xlarge).
