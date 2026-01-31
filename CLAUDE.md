@@ -33,24 +33,30 @@ aws_bootstrap/
     cli.py               # Click CLI entry point (launch, status, terminate commands)
     config.py            # LaunchConfig dataclass with defaults
     ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing
-    ssh.py               # SSH key pair import, SSH readiness check, remote setup
+    ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
-        remote_setup.sh  # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
-        requirements.txt # Python dependencies installed on the remote instance
+        gpu_benchmark.py       # GPU throughput benchmark (CNN + Transformer), copied to ~/gpu_benchmark.py on instance
+        gpu_smoke_test.ipynb   # Interactive Jupyter notebook for GPU verification, copied to ~/gpu_smoke_test.ipynb
+        remote_setup.sh        # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
+        requirements.txt       # Python dependencies installed on the remote instance
     tests/               # Unit tests (pytest)
         test_config.py
         test_cli.py
         test_ec2.py
+        test_ssh_config.py
+        test_ssh_gpu.py
+docs/
+    spot-request-lifecycle.md  # Research notes on spot request cleanup
 ```
 
 Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`)
 
 ## CLI Commands
 
-- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors)
-- **`status`** — lists active instances with type, IP, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances
-- **`terminate`** — terminates instances by ID or all aws-bootstrap instances in the region
+- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`
+- **`status`** — lists all non-terminated instances (including `shutting-down`) with type, IP, SSH alias, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`)
+- **`terminate`** — terminates instances by ID or all aws-bootstrap instances in the region; removes SSH config aliases
 - **`list instance-types`** — lists EC2 instance types matching a family prefix (default: `g4dn`), showing vCPUs, memory, and GPU info
 - **`list amis`** — lists available AMIs matching a name pattern (default: Deep Learning Base OSS Nvidia Driver GPU AMIs), sorted newest-first
 
@@ -78,6 +84,25 @@ uv run pytest
 ```
 
 Use `uv add <package>` to add dependencies and `uv add --group dev <package>` for dev dependencies.
+
+## CUDA-Aware PyTorch Installation
+
+`remote_setup.sh` detects the CUDA toolkit version on the instance (via `nvcc`, falling back to `nvidia-smi`) and installs PyTorch from the matching CUDA wheel index (`https://download.pytorch.org/whl/cu{TAG}`). This ensures `torch.version.cuda` matches the system's CUDA toolkit, which is required for compiling custom CUDA extensions with `nvcc`.
+
+The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags published by PyTorch (e.g., `118 121 124 126 128 129 130`). When PyTorch adds support for a new CUDA version, add the corresponding tag to this array. Check available tags at: https://download.pytorch.org/whl/
+
+`torch` and `torchvision` are **not** in `resources/requirements.txt` — they are installed separately by the CUDA detection logic in `remote_setup.sh`. All other Python dependencies remain in `requirements.txt`.
+
+## Remote Setup Details
+
+`remote_setup.sh` also:
+- Creates `~/venv` and appends `source ~/venv/bin/activate` to `~/.bashrc` so the venv is auto-activated on SSH login
+- Runs a quick CUDA smoke test (`torch.cuda.is_available()` + GPU matmul) after PyTorch installation to verify the GPU stack; prints a WARNING on failure but does not abort
+- Copies `gpu_benchmark.py` to `~/gpu_benchmark.py` and `gpu_smoke_test.ipynb` to `~/gpu_smoke_test.ipynb`
+
+## GPU Benchmark
+
+`resources/gpu_benchmark.py` is uploaded to `~/gpu_benchmark.py` on the remote instance during setup. It benchmarks GPU throughput with two modes: CNN on MNIST and a GPT-style Transformer on synthetic data. It reports samples/sec, batch times, and peak GPU memory. Supports `--precision` (fp32/fp16/bf16/tf32), `--diagnose` for CUDA smoke tests, and separate `--transformer-batch-size` (default 32, T4-safe). Dependencies (`torch`, `torchvision`, `tqdm`) are already installed by the setup script.
 
 ## Keeping Docs Updated
 

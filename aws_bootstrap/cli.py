@@ -20,7 +20,17 @@ from .ec2 import (
     terminate_tagged_instances,
     wait_instance_ready,
 )
-from .ssh import import_key_pair, private_key_path, run_remote_setup, wait_for_ssh
+from .ssh import (
+    add_ssh_host,
+    get_ssh_host_details,
+    import_key_pair,
+    list_ssh_hosts,
+    private_key_path,
+    query_gpu_info,
+    remove_ssh_host,
+    run_remote_setup,
+    wait_for_ssh,
+)
 
 
 SETUP_SCRIPT = Path(__file__).parent / "resources" / "remote_setup.sh"
@@ -174,6 +184,16 @@ def launch(
             else:
                 warn("Remote setup failed. Instance is still running.")
 
+    # Add SSH config alias
+    alias = add_ssh_host(
+        instance_id=instance_id,
+        hostname=public_ip,
+        user=config.ssh_user,
+        key_path=config.key_path,
+        alias_prefix=config.alias_prefix,
+    )
+    success(f"Added SSH config alias: {alias}")
+
     # Print connection info
     click.echo()
     click.secho("=" * 60, fg="green")
@@ -184,27 +204,36 @@ def launch(
     val("Public IP", public_ip)
     val("Instance", config.instance_type)
     val("Pricing", pricing)
+    val("SSH alias", alias)
 
     click.echo()
     click.secho("  SSH:", fg="cyan")
-    click.secho(f"    ssh -i {private_key} {config.ssh_user}@{public_ip}", bold=True)
+    click.secho(f"    ssh {alias}", bold=True)
+    info(f"or: ssh -i {private_key} {config.ssh_user}@{public_ip}")
 
     click.echo()
     click.secho("  Jupyter (via SSH tunnel):", fg="cyan")
-    click.secho(f"    ssh -i {private_key} -NL 8888:localhost:8888 {config.ssh_user}@{public_ip}", bold=True)
+    click.secho(f"    ssh -NL 8888:localhost:8888 {alias}", bold=True)
+    info(f"or: ssh -i {private_key} -NL 8888:localhost:8888 {config.ssh_user}@{public_ip}")
     info("Then open: http://localhost:8888")
+    info("Notebook: ~/gpu_smoke_test.ipynb (GPU smoke test)")
+
+    click.echo()
+    click.secho("  GPU Benchmark:", fg="cyan")
+    click.secho(f"    ssh {alias} 'python ~/gpu_benchmark.py'", bold=True)
+    info("Runs CNN (MNIST) and Transformer benchmarks with tqdm progress")
 
     click.echo()
     click.secho("  Terminate:", fg="cyan")
-    click.secho(f"    aws ec2 terminate-instances --instance-ids {instance_id} --region {config.region}", bold=True)
-    click.secho(f"    aws-bootstrap terminate --region {config.region}", bold=True)
+    click.secho(f"    aws-bootstrap terminate {instance_id} --region {config.region}", bold=True)
     click.echo()
 
 
 @main.command()
 @click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
 @click.option("--profile", default=None, help="AWS profile override.")
-def status(region, profile):
+@click.option("--gpu", is_flag=True, default=False, help="Query GPU info (CUDA, driver) via SSH.")
+def status(region, profile, gpu):
     """Show running instances created by aws-bootstrap."""
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
@@ -214,18 +243,58 @@ def status(region, profile):
         click.secho("No active aws-bootstrap instances found.", fg="yellow")
         return
 
+    ssh_hosts = list_ssh_hosts()
+
     click.secho(f"\n  Found {len(instances)} instance(s):\n", bold=True, fg="cyan")
+    if gpu:
+        click.echo("  " + click.style("Querying GPU info via SSH...", dim=True))
+        click.echo()
+
     for inst in instances:
         state = inst["State"]
-        state_color = {"running": "green", "pending": "yellow", "stopping": "yellow", "stopped": "red"}.get(
-            state, "white"
-        )
+        state_color = {
+            "running": "green",
+            "pending": "yellow",
+            "stopping": "yellow",
+            "stopped": "red",
+            "shutting-down": "red",
+        }.get(state, "white")
+        alias = ssh_hosts.get(inst["InstanceId"])
+        alias_str = f" ({alias})" if alias else ""
         click.echo(
-            "  " + click.style(inst["InstanceId"], fg="bright_white") + "  " + click.style(state, fg=state_color)
+            "  "
+            + click.style(inst["InstanceId"], fg="bright_white")
+            + click.style(alias_str, fg="cyan")
+            + "  "
+            + click.style(state, fg=state_color)
         )
         val("    Type", inst["InstanceType"])
         if inst["PublicIp"]:
             val("    IP", inst["PublicIp"])
+
+        # GPU info (opt-in, only for running instances with a public IP)
+        if gpu and state == "running" and inst["PublicIp"]:
+            details = get_ssh_host_details(inst["InstanceId"])
+            if details:
+                gpu_info = query_gpu_info(details.hostname, details.user, details.identity_file)
+            else:
+                gpu_info = query_gpu_info(
+                    inst["PublicIp"],
+                    "ubuntu",
+                    Path("~/.ssh/id_ed25519").expanduser(),
+                )
+            if gpu_info:
+                val("    GPU", f"{gpu_info.gpu_name} ({gpu_info.architecture})")
+                if gpu_info.cuda_toolkit_version:
+                    cuda_str = gpu_info.cuda_toolkit_version
+                    if gpu_info.cuda_driver_version != gpu_info.cuda_toolkit_version:
+                        cuda_str += f" (driver supports up to {gpu_info.cuda_driver_version})"
+                else:
+                    cuda_str = f"{gpu_info.cuda_driver_version} (driver max, toolkit unknown)"
+                val("    CUDA", cuda_str)
+                val("    Driver", gpu_info.driver_version)
+            else:
+                click.echo("    GPU: " + click.style("unavailable", dim=True))
 
         lifecycle = inst["Lifecycle"]
         is_spot = lifecycle == "spot"
@@ -298,6 +367,9 @@ def terminate(region, profile, yes, instance_ids):
         click.echo(
             "  " + click.style(change["InstanceId"], fg="bright_white") + f"  {prev} -> " + click.style(curr, fg="red")
         )
+        removed_alias = remove_ssh_host(change["InstanceId"])
+        if removed_alias:
+            info(f"Removed SSH config alias: {removed_alias}")
     click.echo()
     success(f"Terminated {len(changes)} instance(s).")
 

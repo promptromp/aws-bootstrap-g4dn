@@ -7,17 +7,33 @@
 [![PyPI - Version](https://img.shields.io/pypi/v/aws-bootstrap-g4dn)](https://pypi.org/project/aws-bootstrap-g4dn/)
 [![PyPI - Python Version](https://img.shields.io/pypi/pyversions/aws-bootstrap-g4dn)](https://pypi.org/project/aws-bootstrap-g4dn/)
 
+One command to go from zero to a **fully configured GPU dev box** on AWS — with CUDA-matched PyTorch, Jupyter, SSH aliases, and a GPU benchmark ready to run.
 
-This repository contains code and documentation to make it fast and easy to bootstrap an AWS EC2 instance running a Deep Learning AMI (e.g. Ubuntu or Amazon Linux) with a CUDA-compliant Nvidia GPU (e.g. g4dn.xlarge by default).
+```bash
+aws-bootstrap launch          # Spot g4dn.xlarge in ~3 minutes
+ssh aws-gpu1                  # You're in, venv activated, PyTorch works
+```
 
-The idea is to make it easy in particular to quickly spawn cost-effective Spot Instances via AWS CLI , bootstrapping the instance with an SSH key, and ramping up to be able to develop using CUDA.
+### ✨ Key Features
 
-Main workflows we're optimizing for are hybrid local-remote workflows e.g.:
+| | Feature | Details |
+|---|---|---|
+| 🚀 | **One-command launch** | Spot (default) or on-demand, with automatic fallback on capacity errors |
+| 🔑 | **Auto SSH config** | Adds `aws-gpu1` alias to `~/.ssh/config` — no IP juggling. Cleaned up on terminate |
+| 🐍 | **CUDA-aware PyTorch** | Detects the installed CUDA toolkit (`nvcc`) and installs PyTorch from the matching wheel index — no more `torch.version.cuda` mismatches |
+| ✅ | **PyTorch smoke test** | Runs a quick `torch.cuda` matmul after setup to verify the GPU stack works end-to-end |
+| 📊 | **GPU benchmark included** | CNN (MNIST) + Transformer benchmarks with FP16/FP32/BF16 precision and tqdm progress |
+| 📓 | **Jupyter ready** | Lab server auto-starts as a systemd service on port 8888 — just SSH tunnel and open |
+| 🖥️ | **`status --gpu`** | Shows CUDA toolkit version, driver max, GPU architecture, spot pricing, uptime, and estimated cost |
+| 🗑️ | **Clean terminate** | Stops instances, removes SSH aliases, shows shutting-down state until fully gone |
 
-1. Using Jupyter server-client (with Jupyter server running on the instance and local jupyter client)
-2. Using VSCode Remote SSH extension
-3. Using Nvidia Nsight for remote debugging
+### 🎯 Target Workflows
 
+1. **Jupyter server-client** — Jupyter runs on the instance, connect from your local browser
+2. **VSCode Remote SSH** — `ssh aws-gpu1` just works with the Remote SSH extension
+3. **NVIDIA Nsight remote debugging** — GPU debugging over SSH
+
+---
 
 ## Requirements
 
@@ -55,12 +71,11 @@ aws-bootstrap launch --key-path ~/.ssh/my_other_key.pub
 
 ## Usage
 
+### 🚀 Launching an Instance
+
 ```bash
 # Show available commands
 aws-bootstrap --help
-
-# Show launch options
-aws-bootstrap launch --help
 
 # Dry run — validates AMI lookup, key import, and security group without launching
 aws-bootstrap launch --dry-run
@@ -78,14 +93,71 @@ aws-bootstrap launch --no-setup
 aws-bootstrap launch --profile my-aws-profile
 ```
 
-After launch, the CLI prints SSH and Jupyter tunnel commands:
+After launch, the CLI:
 
+1. **Adds an SSH alias** (e.g. `aws-gpu1`) to `~/.ssh/config`
+2. **Runs remote setup** — installs utilities, creates a Python venv, installs CUDA-matched PyTorch, sets up Jupyter
+3. **Runs a CUDA smoke test** — verifies `torch.cuda.is_available()` and runs a quick GPU matmul
+4. **Prints connection commands** — SSH, Jupyter tunnel, GPU benchmark, and terminate
+
+```bash
+ssh aws-gpu1                  # venv auto-activates on login
 ```
-ssh -i ~/.ssh/id_ed25519 ubuntu@<public-ip>
+
+### 🔧 What Remote Setup Does
+
+The setup script runs automatically on the instance after SSH becomes available:
+
+| Step | What |
+|------|------|
+| **GPU verify** | Confirms `nvidia-smi` and `nvcc` are working |
+| **Utilities** | Installs `htop`, `tmux`, `tree`, `jq` |
+| **Python venv** | Creates `~/venv` with `uv`, auto-activates in `~/.bashrc` |
+| **CUDA-aware PyTorch** | Detects CUDA toolkit version → installs PyTorch from the matching `cu{TAG}` wheel index |
+| **CUDA smoke test** | Runs `torch.cuda.is_available()` + GPU matmul to verify the stack |
+| **GPU benchmark** | Copies `gpu_benchmark.py` to `~/gpu_benchmark.py` |
+| **GPU smoke test notebook** | Copies `gpu_smoke_test.ipynb` to `~/gpu_smoke_test.ipynb` (open in JupyterLab) |
+| **Jupyter** | Configures and starts JupyterLab as a systemd service on port 8888 |
+| **SSH keepalive** | Configures server-side keepalive to prevent idle disconnects |
+
+### 📊 GPU Benchmark
+
+A GPU throughput benchmark is pre-installed at `~/gpu_benchmark.py` on every instance:
+
+```bash
+# Run both CNN and Transformer benchmarks (default)
+ssh aws-gpu1 'python ~/gpu_benchmark.py'
+
+# CNN only, quick run
+ssh aws-gpu1 'python ~/gpu_benchmark.py --mode cnn --benchmark-batches 20'
+
+# Transformer only with custom batch size
+ssh aws-gpu1 'python ~/gpu_benchmark.py --mode transformer --transformer-batch-size 16'
+
+# Run CUDA diagnostics first (tests FP16/FP32 matmul, autocast, etc.)
+ssh aws-gpu1 'python ~/gpu_benchmark.py --diagnose'
+
+# Force FP32 precision (if FP16 has issues on your GPU)
+ssh aws-gpu1 'python ~/gpu_benchmark.py --precision fp32'
+```
+
+Reports: iterations/sec, samples/sec, peak GPU memory, and avg batch time for each model.
+
+### 📓 Jupyter (via SSH Tunnel)
+
+```bash
+ssh -NL 8888:localhost:8888 aws-gpu1
+# Then open: http://localhost:8888
+```
+
+Or with explicit key/IP:
+```bash
 ssh -i ~/.ssh/id_ed25519 -NL 8888:localhost:8888 ubuntu@<public-ip>
 ```
 
-### Listing Resources
+A **GPU smoke test notebook** (`~/gpu_smoke_test.ipynb`) is pre-installed on every instance. Open it in JupyterLab to interactively verify the CUDA stack, run FP32/FP16 matmuls, train a small CNN on MNIST, and visualise training loss and GPU memory usage.
+
+### 📋 Listing Resources
 
 ```bash
 # List all g4dn instance types (default)
@@ -105,11 +177,14 @@ aws-bootstrap list instance-types --region us-east-1
 aws-bootstrap list amis --region us-east-1
 ```
 
-### Managing Instances
+### 🖥️ Managing Instances
 
 ```bash
-# List all running aws-bootstrap instances
+# Show all aws-bootstrap instances (including shutting-down)
 aws-bootstrap status
+
+# Include GPU info (CUDA toolkit + driver version, GPU name, architecture) via SSH
+aws-bootstrap status --gpu
 
 # List instances in a specific region
 aws-bootstrap status --region us-east-1
@@ -123,6 +198,14 @@ aws-bootstrap terminate i-abc123 i-def456
 # Skip confirmation prompt
 aws-bootstrap terminate --yes
 ```
+
+`status --gpu` reports both the **installed CUDA toolkit** version (from `nvcc`) and the **maximum CUDA version supported by the driver** (from `nvidia-smi`), so you can see at a glance whether they match:
+
+```
+CUDA: 12.8 (driver supports up to 13.0)
+```
+
+SSH aliases are managed automatically — they're created on `launch`, shown in `status`, and cleaned up on `terminate`. Aliases use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and never reuse numbers from previous instances.
 
 ## EC2 vCPU Quotas
 

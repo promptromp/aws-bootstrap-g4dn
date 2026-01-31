@@ -35,7 +35,104 @@ fi
 export PATH="$HOME/.local/bin:$PATH"
 
 uv venv ~/venv
+
+# --- CUDA-aware PyTorch installation ---
+# Known PyTorch CUDA wheel tags (ascending order).
+# Update this list when PyTorch publishes new CUDA builds.
+# See: https://download.pytorch.org/whl/
+KNOWN_CUDA_TAGS=(118 121 124 126 128 129 130)
+
+detect_cuda_version() {
+    # Primary: nvcc (actual toolkit installed on the system)
+    if command -v nvcc &>/dev/null; then
+        nvcc --version | grep -oP 'release \K[\d.]+'
+        return
+    fi
+    # Fallback: nvidia-smi (max CUDA the driver supports)
+    if command -v nvidia-smi &>/dev/null; then
+        nvidia-smi | grep -oP 'CUDA Version: \K[\d.]+'
+        return
+    fi
+    echo ""
+}
+
+cuda_version_to_tag() {
+    # "12.9" → "129", "13.0" → "130"
+    echo "$1" | tr -d '.'
+}
+
+find_best_cuda_tag() {
+    local detected_tag="$1"
+    local best=""
+    for tag in "${KNOWN_CUDA_TAGS[@]}"; do
+        if [ "$tag" -le "$detected_tag" ]; then
+            best="$tag"
+        fi
+    done
+    echo "$best"
+}
+
+install_pytorch_cuda() {
+    local cuda_ver
+    cuda_ver=$(detect_cuda_version)
+
+    if [ -z "$cuda_ver" ]; then
+        echo "  WARNING: No CUDA detected — installing PyTorch from PyPI (CPU or default CUDA)"
+        uv pip install --python ~/venv/bin/python torch torchvision
+        return
+    fi
+    echo "  Detected CUDA version: $cuda_ver"
+
+    local detected_tag
+    detected_tag=$(cuda_version_to_tag "$cuda_ver")
+
+    local best_tag
+    best_tag=$(find_best_cuda_tag "$detected_tag")
+
+    if [ -z "$best_tag" ]; then
+        echo "  WARNING: No matching PyTorch CUDA tag for cu${detected_tag} — installing from PyPI"
+        uv pip install --python ~/venv/bin/python torch torchvision
+        return
+    fi
+
+    echo "  Using PyTorch CUDA index: cu${best_tag}"
+    if ! uv pip install --python ~/venv/bin/python \
+            --default-index "https://download.pytorch.org/whl/cu${best_tag}" \
+            torch torchvision; then
+        echo "  WARNING: CUDA index install failed — falling back to PyPI"
+        uv pip install --python ~/venv/bin/python torch torchvision
+    fi
+}
+
+install_pytorch_cuda
+
+# Install remaining dependencies (torch/torchvision already installed above)
 uv pip install --python ~/venv/bin/python -r /tmp/requirements.txt
+
+# Copy GPU benchmark script and smoke test notebook
+cp /tmp/gpu_benchmark.py ~/gpu_benchmark.py
+cp /tmp/gpu_smoke_test.ipynb ~/gpu_smoke_test.ipynb
+
+# Auto-activate venv on login
+if ! grep -q 'source ~/venv/bin/activate' ~/.bashrc 2>/dev/null; then
+    echo 'source ~/venv/bin/activate' >> ~/.bashrc
+fi
+
+# Quick CUDA smoke test
+echo "  Running CUDA smoke test..."
+if ~/venv/bin/python -c "
+import torch
+assert torch.cuda.is_available(), 'CUDA not available'
+x = torch.randn(256, 256, device='cuda')
+y = torch.mm(x, x)
+torch.cuda.synchronize()
+print(f'  PyTorch {torch.__version__}, CUDA {torch.version.cuda}, GPU: {torch.cuda.get_device_name(0)}')
+print('  Quick matmul test: PASSED')
+"; then
+    echo "  CUDA smoke test passed"
+else
+    echo "  WARNING: CUDA smoke test failed — check PyTorch/CUDA installation"
+fi
 
 JUPYTER_CONFIG_DIR="$HOME/.jupyter"
 mkdir -p "$JUPYTER_CONFIG_DIR"

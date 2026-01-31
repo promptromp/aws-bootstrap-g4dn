@@ -21,3 +21,4 @@ class LaunchConfig:
     profile: str | None = field(default_factory=lambda: os.environ.get("AWS_PROFILE"))
     ssh_user: str = "ubuntu"
     tag_value: str = "aws-bootstrap-g4dn"
+    alias_prefix: str = "aws-gpu"

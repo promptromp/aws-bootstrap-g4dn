@@ -203,11 +203,14 @@ def _raise_quota_error(code: str, config: LaunchConfig) -> None:
 
 
 def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
-    """Find all running/pending instances with the created-by tag."""
+    """Find all non-terminated instances with the created-by tag."""
     response = ec2_client.describe_instances(
         Filters=[
             {"Name": "tag:created-by", "Values": [tag_value]},
-            {"Name": "instance-state-name", "Values": ["pending", "running", "stopping", "stopped"]},
+            {
+                "Name": "instance-state-name",
+                "Values": ["pending", "running", "stopping", "stopped", "shutting-down"],
+            },
         ]
     )
     instances = []
