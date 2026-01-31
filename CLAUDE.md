@@ -32,16 +32,25 @@ aws_bootstrap/
     __init__.py          # Package init
     cli.py               # Click CLI entry point (launch, status, terminate commands)
     config.py            # LaunchConfig dataclass with defaults
-    ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling
+    ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing
     ssh.py               # SSH key pair import, SSH readiness check, remote setup
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
         remote_setup.sh  # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
         requirements.txt # Python dependencies installed on the remote instance
     tests/               # Unit tests (pytest)
+        test_config.py
+        test_cli.py
+        test_ec2.py
 ```
 
 Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`)
+
+## CLI Commands
+
+- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors)
+- **`status`** — lists active instances with type, IP, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances
+- **`terminate`** — terminates instances by ID or all aws-bootstrap instances in the region
 
 ## Coding Conventions
 
