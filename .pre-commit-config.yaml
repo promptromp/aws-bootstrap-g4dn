@@ -8,6 +8,7 @@ repos:
     - id: fix-byte-order-marker
     - id: check-case-conflict
     - id: check-json
+      exclude: ^aws_bootstrap/resources/(launch|tasks)\.json$
     - id: check-yaml
       args: [ --unsafe ]
     - id: detect-aws-credentials

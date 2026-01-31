@@ -30,7 +30,7 @@ ssh aws-gpu1                  # You're in, venv activated, PyTorch works
 ### 🎯 Target Workflows
 
 1. **Jupyter server-client** — Jupyter runs on the instance, connect from your local browser
-2. **VSCode Remote SSH** — `ssh aws-gpu1` just works with the Remote SSH extension
+2. **VSCode Remote SSH** — opens `~/workspace` with pre-configured CUDA debug/build tasks and an example `.cu` file
 3. **NVIDIA Nsight remote debugging** — GPU debugging over SSH
 
 ---
@@ -143,6 +143,7 @@ The setup script runs automatically on the instance after SSH becomes available:
 | **GPU smoke test notebook** | Copies `gpu_smoke_test.ipynb` to `~/gpu_smoke_test.ipynb` (open in JupyterLab) |
 | **Jupyter** | Configures and starts JupyterLab as a systemd service on port 8888 |
 | **SSH keepalive** | Configures server-side keepalive to prevent idle disconnects |
+| **VSCode workspace** | Creates `~/workspace/.vscode/` with `launch.json` and `tasks.json` (auto-detected `cuda-gdb` path and GPU arch), plus an example `saxpy.cu` |
 
 ### 📊 GPU Benchmark
 
@@ -180,6 +181,28 @@ ssh -i ~/.ssh/id_ed25519 -NL 8888:localhost:8888 ubuntu@<public-ip>
 ```
 
 A **GPU smoke test notebook** (`~/gpu_smoke_test.ipynb`) is pre-installed on every instance. Open it in JupyterLab to interactively verify the CUDA stack, run FP32/FP16 matmuls, train a small CNN on MNIST, and visualise training loss and GPU memory usage.
+
+### 🖥️ VSCode Remote SSH
+
+The remote setup creates a `~/workspace` folder with pre-configured CUDA debug and build tasks:
+
+```
+~/workspace/
+├── .vscode/
+│   ├── launch.json   # CUDA debug configs (cuda-gdb path auto-detected)
+│   └── tasks.json    # nvcc build tasks (GPU arch auto-detected, e.g. sm_75)
+└── saxpy.cu          # Example CUDA source — open and press F5 to debug
+```
+
+Connect directly from your terminal:
+
+```bash
+code --folder-uri vscode-remote://ssh-remote+aws-gpu1/home/ubuntu/workspace
+```
+
+Then install the [Nsight VSCE extension](https://marketplace.visualstudio.com/items?itemName=NVIDIA.nsight-vscode-edition) on the remote when prompted. Open `saxpy.cu`, set a breakpoint, and press F5.
+
+See [Nsight remote profiling guide](docs/nsight-remote-profiling.md) for more details on CUDA debugging and profiling workflows.
 
 ### 📋 Listing Resources
 

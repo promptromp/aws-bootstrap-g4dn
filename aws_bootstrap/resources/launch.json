@@ -1,0 +1,42 @@
+{
+    // CUDA debug configurations for VSCode
+    // Deployed to: ~/workspace/.vscode/launch.json
+    //
+    // Usage: Open any .cu file, press F5 to build and debug
+    "version": "0.2.0",
+    "configurations": [
+        {
+            "name": "CUDA: Build and Debug Active File",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "${fileDirname}/${fileBasenameNoExtension}",
+            "args": [],
+            "cwd": "${fileDirname}",
+            "miDebuggerPath": "__CUDA_GDB_PATH__",
+            "stopAtEntry": false,
+            "preLaunchTask": "nvcc: build active file (debug)"
+        },
+        {
+            "name": "CUDA: Build and Debug (stop at main)",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "${fileDirname}/${fileBasenameNoExtension}",
+            "args": [],
+            "cwd": "${fileDirname}",
+            "miDebuggerPath": "__CUDA_GDB_PATH__",
+            "stopAtEntry": true,
+            "preLaunchTask": "nvcc: build active file (debug)"
+        },
+        {
+            "name": "CUDA: Run Active File (no debug)",
+            "type": "cuda-gdb",
+            "request": "launch",
+            "program": "${fileDirname}/${fileBasenameNoExtension}",
+            "args": [],
+            "cwd": "${fileDirname}",
+            "miDebuggerPath": "__CUDA_GDB_PATH__",
+            "stopAtEntry": false,
+            "preLaunchTask": "nvcc: build active file (release)"
+        }
+    ]
+}

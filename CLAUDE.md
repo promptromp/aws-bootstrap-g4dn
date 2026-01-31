@@ -39,6 +39,9 @@ aws_bootstrap/
         __init__.py
         gpu_benchmark.py       # GPU throughput benchmark (CNN + Transformer), copied to ~/gpu_benchmark.py on instance
         gpu_smoke_test.ipynb   # Interactive Jupyter notebook for GPU verification, copied to ~/gpu_smoke_test.ipynb
+        launch.json            # VSCode CUDA debug config template (deployed to ~/workspace/.vscode/launch.json)
+        saxpy.cu               # Example CUDA SAXPY source (deployed to ~/workspace/saxpy.cu)
+        tasks.json             # VSCode CUDA build tasks template (deployed to ~/workspace/.vscode/tasks.json)
         remote_setup.sh        # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
         requirements.txt       # Python dependencies installed on the remote instance
     tests/               # Unit tests (pytest)
@@ -102,6 +105,7 @@ The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags publi
 - Creates `~/venv` and appends `source ~/venv/bin/activate` to `~/.bashrc` so the venv is auto-activated on SSH login. When `--python-version` is passed to `launch`, the CLI sets `PYTHON_VERSION` as an inline env var on the SSH command; `remote_setup.sh` reads it to run `uv python install` and `uv venv --python` with the requested version
 - Runs a quick CUDA smoke test (`torch.cuda.is_available()` + GPU matmul) after PyTorch installation to verify the GPU stack; prints a WARNING on failure but does not abort
 - Copies `gpu_benchmark.py` to `~/gpu_benchmark.py` and `gpu_smoke_test.ipynb` to `~/gpu_smoke_test.ipynb`
+- Sets up `~/workspace/.vscode/` with `launch.json` and `tasks.json` for CUDA debugging. Detects `cuda-gdb` path and GPU SM architecture (via `nvidia-smi --query-gpu=compute_cap`) at deploy time, replacing `__CUDA_GDB_PATH__` and `__GPU_ARCH__` placeholders in the template files via `sed`
 
 ## GPU Benchmark
 

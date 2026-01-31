@@ -1,0 +1,48 @@
+{
+    // CUDA build tasks for VSCode
+    // Deployed to: ~/workspace/.vscode/tasks.json
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "nvcc: build active file (debug)",
+            "type": "shell",
+            "command": "nvcc",
+            "args": [
+                "-g",                           // Host debug symbols
+                "-G",                           // Device (GPU) debug symbols
+                "-O0",                          // No optimization
+                "-arch=__GPU_ARCH__",            // GPU arch (auto-detected)
+                "-o",
+                "${fileDirname}/${fileBasenameNoExtension}",
+                "${file}"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": ["$nvcc"],
+            "group": {
+                "kind": "build",
+                "isDefault": true
+            },
+            "detail": "Compile active .cu file with debug symbols (-g -G)"
+        },
+        {
+            "label": "nvcc: build active file (release)",
+            "type": "shell",
+            "command": "nvcc",
+            "args": [
+                "-O3",
+                "-arch=__GPU_ARCH__",
+                "-o",
+                "${fileDirname}/${fileBasenameNoExtension}",
+                "${file}"
+            ],
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": ["$nvcc"],
+            "group": "build",
+            "detail": "Compile active .cu file optimized (no debug)"
+        }
+    ]
+}
