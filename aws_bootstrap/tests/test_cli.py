@@ -5,6 +5,7 @@ from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import patch
 
+import botocore.exceptions
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import main
@@ -526,3 +527,112 @@ def test_status_without_gpu_flag_no_ssh(mock_find, mock_spot, mock_session, mock
     assert result.exit_code == 0
     mock_gpu.assert_not_called()
     mock_details.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# AWS credential / auth error handling tests
+# ---------------------------------------------------------------------------
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_no_credentials_shows_friendly_error(mock_session, mock_find):
+    """NoCredentialsError should show a helpful message, not a raw traceback."""
+    mock_find.side_effect = botocore.exceptions.NoCredentialsError()
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code != 0
+    assert "Unable to locate AWS credentials" in result.output
+    assert "AWS_PROFILE" in result.output
+    assert "--profile" in result.output
+    assert "aws configure" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_profile_not_found_shows_friendly_error(mock_session):
+    """ProfileNotFound should show the missing profile name and list command."""
+    mock_session.side_effect = botocore.exceptions.ProfileNotFound(profile="nonexistent")
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--profile", "nonexistent"])
+    assert result.exit_code != 0
+    assert "nonexistent" in result.output
+    assert "aws configure list-profiles" in result.output
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_partial_credentials_shows_friendly_error(mock_session, mock_find):
+    """PartialCredentialsError should mention incomplete credentials."""
+    mock_find.side_effect = botocore.exceptions.PartialCredentialsError(
+        provider="env", cred_var="AWS_SECRET_ACCESS_KEY"
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code != 0
+    assert "Incomplete AWS credentials" in result.output
+    assert "aws configure list" in result.output
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_expired_token_shows_friendly_error(mock_session, mock_find):
+    """ExpiredTokenException should show authorization failure with context."""
+    mock_find.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "ExpiredTokenException", "Message": "The security token is expired"}},
+        "DescribeInstances",
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code != 0
+    assert "AWS authorization failed" in result.output
+    assert "expired" in result.output.lower()
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_auth_failure_shows_friendly_error(mock_session, mock_find):
+    """AuthFailure ClientError should show authorization failure message."""
+    mock_find.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "AuthFailure", "Message": "credentials are invalid"}},
+        "DescribeInstances",
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code != 0
+    assert "AWS authorization failed" in result.output
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_unhandled_client_error_propagates(mock_session, mock_find):
+    """Non-auth ClientErrors should propagate without being caught."""
+    mock_find.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "UnknownError", "Message": "something else"}},
+        "DescribeInstances",
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code != 0
+    assert isinstance(result.exception, botocore.exceptions.ClientError)
+
+
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_no_credentials_caught_on_terminate(mock_session, mock_find):
+    """Credential errors are caught for all subcommands, not just status."""
+    mock_find.side_effect = botocore.exceptions.NoCredentialsError()
+    runner = CliRunner()
+    result = runner.invoke(main, ["terminate"])
+    assert result.exit_code != 0
+    assert "Unable to locate AWS credentials" in result.output
+
+
+@patch("aws_bootstrap.cli.list_instance_types")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_no_credentials_caught_on_list(mock_session, mock_list):
+    """Credential errors are caught for nested subcommands (list instance-types)."""
+    mock_list.side_effect = botocore.exceptions.NoCredentialsError()
+    runner = CliRunner()
+    result = runner.invoke(main, ["list", "instance-types"])
+    assert result.exit_code != 0
+    assert "Unable to locate AWS credentials" in result.output
