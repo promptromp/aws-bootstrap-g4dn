@@ -33,7 +33,7 @@ aws_bootstrap/
     cli.py               # Click CLI entry point (launch, status, terminate commands)
     config.py            # LaunchConfig dataclass with defaults
     ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing
-    ssh.py               # SSH key pair import, SSH readiness check, remote setup
+    ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
         remote_setup.sh  # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
@@ -42,15 +42,17 @@ aws_bootstrap/
         test_config.py
         test_cli.py
         test_ec2.py
+        test_ssh_config.py
+        test_ssh_gpu.py
 ```
 
 Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`)
 
 ## CLI Commands
 
-- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors)
-- **`status`** — lists active instances with type, IP, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances
-- **`terminate`** — terminates instances by ID or all aws-bootstrap instances in the region
+- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`
+- **`status`** — lists active instances with type, IP, SSH alias, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info (CUDA version, driver, GPU name/architecture) via SSH
+- **`terminate`** — terminates instances by ID or all aws-bootstrap instances in the region; removes SSH config aliases
 - **`list instance-types`** — lists EC2 instance types matching a family prefix (default: `g4dn`), showing vCPUs, memory, and GPU info
 - **`list amis`** — lists available AMIs matching a name pattern (default: Deep Learning Base OSS Nvidia Driver GPU AMIs), sorted newest-first
 

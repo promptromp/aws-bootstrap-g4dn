@@ -78,12 +78,21 @@ aws-bootstrap launch --no-setup
 aws-bootstrap launch --profile my-aws-profile
 ```
 
-After launch, the CLI prints SSH and Jupyter tunnel commands:
+After launch, the CLI automatically adds an SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`, so you can connect with just:
+
+```bash
+ssh aws-gpu1
+```
+
+The CLI also prints Jupyter tunnel and raw IP commands:
 
 ```
+ssh -NL 8888:localhost:8888 aws-gpu1
+# or with explicit key/IP:
 ssh -i ~/.ssh/id_ed25519 ubuntu@<public-ip>
-ssh -i ~/.ssh/id_ed25519 -NL 8888:localhost:8888 ubuntu@<public-ip>
 ```
+
+SSH aliases are managed automatically — they're created on `launch`, shown in `status`, and cleaned up on `terminate`. Aliases use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and never reuse numbers from previous instances.
 
 ### Listing Resources
 
@@ -110,6 +119,9 @@ aws-bootstrap list amis --region us-east-1
 ```bash
 # List all running aws-bootstrap instances
 aws-bootstrap status
+
+# Include GPU info (CUDA version, driver, GPU name) via SSH
+aws-bootstrap status --gpu
 
 # List instances in a specific region
 aws-bootstrap status --region us-east-1

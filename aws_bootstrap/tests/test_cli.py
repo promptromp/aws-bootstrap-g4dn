@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 from datetime import UTC, datetime
+from pathlib import Path
 from unittest.mock import patch
 
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import main
+from aws_bootstrap.ssh import GpuInfo, SSHHostDetails
 
 
 def test_help():
@@ -70,10 +72,11 @@ def test_status_no_instances(mock_find, mock_session):
     assert "No active" in result.output
 
 
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
 @patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_shows_instances(mock_find, mock_spot_price, mock_session):
+def test_status_shows_instances(mock_find, mock_spot_price, mock_session, mock_ssh_hosts):
     mock_find.return_value = [
         {
             "InstanceId": "i-abc123",
@@ -97,10 +100,11 @@ def test_status_shows_instances(mock_find, mock_spot_price, mock_session):
     assert "Est. cost" in result.output
 
 
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
 @patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_on_demand_no_cost(mock_find, mock_spot_price, mock_session):
+def test_status_on_demand_no_cost(mock_find, mock_spot_price, mock_session, mock_ssh_hosts):
     mock_find.return_value = [
         {
             "InstanceId": "i-ondemand",
@@ -132,10 +136,11 @@ def test_terminate_no_instances(mock_find, mock_session):
     assert "No active" in result.output
 
 
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value=None)
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.find_tagged_instances")
 @patch("aws_bootstrap.cli.terminate_tagged_instances")
-def test_terminate_with_confirm(mock_terminate, mock_find, mock_session):
+def test_terminate_with_confirm(mock_terminate, mock_find, mock_session, mock_remove_ssh):
     mock_find.return_value = [
         {
             "InstanceId": "i-abc123",
@@ -265,3 +270,257 @@ def test_list_amis_empty(mock_list, mock_session):
     result = runner.invoke(main, ["list", "amis", "--filter", "nonexistent*"])
     assert result.exit_code == 0
     assert "No AMIs found" in result.output
+
+
+# ---------------------------------------------------------------------------
+# SSH config integration tests
+# ---------------------------------------------------------------------------
+
+
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_launch_output_shows_ssh_alias(
+    mock_session, mock_ami, mock_import, mock_sg, mock_launch, mock_wait, mock_ssh, mock_setup, mock_add_ssh, tmp_path
+):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_wait.return_value = {"PublicIpAddress": "1.2.3.4"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--no-setup"])
+    assert result.exit_code == 0
+    assert "ssh aws-gpu1" in result.output
+    assert "SSH alias: aws-gpu1" in result.output
+    mock_add_ssh.assert_called_once()
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+@patch("aws_bootstrap.cli.add_ssh_host")
+def test_launch_dry_run_no_ssh_config(mock_add_ssh, mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run"])
+    assert result.exit_code == 0
+    mock_add_ssh.assert_not_called()
+
+
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.terminate_tagged_instances")
+def test_terminate_removes_ssh_config(mock_terminate, mock_find, mock_session, mock_remove_ssh):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "test",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+        }
+    ]
+    mock_terminate.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "PreviousState": {"Name": "running"},
+            "CurrentState": {"Name": "shutting-down"},
+        }
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["terminate", "--yes"])
+    assert result.exit_code == 0
+    assert "Removed SSH config alias: aws-gpu1" in result.output
+    mock_remove_ssh.assert_called_once_with("i-abc123")
+
+
+@patch("aws_bootstrap.cli.list_ssh_hosts")
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_shows_alias(mock_find, mock_spot_price, mock_session, mock_ssh_hosts):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "aws-bootstrap-g4dn.xlarge",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+            "Lifecycle": "spot",
+            "AvailabilityZone": "us-west-2a",
+        }
+    ]
+    mock_spot_price.return_value = 0.15
+    mock_ssh_hosts.return_value = {"i-abc123": "aws-gpu1"}
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "aws-gpu1" in result.output
+
+
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_no_alias_graceful(mock_find, mock_spot_price, mock_session, mock_ssh_hosts):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-old999",
+            "Name": "aws-bootstrap-g4dn.xlarge",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "9.8.7.6",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+            "Lifecycle": "spot",
+            "AvailabilityZone": "us-west-2a",
+        }
+    ]
+    mock_spot_price.return_value = 0.15
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "i-old999" in result.output
+
+
+# ---------------------------------------------------------------------------
+# --gpu flag tests
+# ---------------------------------------------------------------------------
+
+_RUNNING_INSTANCE = {
+    "InstanceId": "i-abc123",
+    "Name": "aws-bootstrap-g4dn.xlarge",
+    "State": "running",
+    "InstanceType": "g4dn.xlarge",
+    "PublicIp": "1.2.3.4",
+    "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+    "Lifecycle": "spot",
+    "AvailabilityZone": "us-west-2a",
+}
+
+_SAMPLE_GPU_INFO = GpuInfo(
+    driver_version="560.35.03",
+    cuda_version="12.8",
+    gpu_name="Tesla T4",
+    compute_capability="7.5",
+    architecture="Turing",
+)
+
+
+def test_status_help_shows_gpu_flag():
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--help"])
+    assert result.exit_code == 0
+    assert "--gpu" in result.output
+
+
+@patch("aws_bootstrap.cli.query_gpu_info", return_value=_SAMPLE_GPU_INFO)
+@patch("aws_bootstrap.cli.get_ssh_host_details")
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={"i-abc123": "aws-gpu1"})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_gpu_shows_info(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu):
+    mock_find.return_value = [_RUNNING_INSTANCE]
+    mock_details.return_value = SSHHostDetails(
+        hostname="1.2.3.4", user="ubuntu", identity_file=Path("/home/user/.ssh/id_ed25519")
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--gpu"])
+    assert result.exit_code == 0
+    assert "Tesla T4 (Turing)" in result.output
+    assert "12.8" in result.output
+    assert "560.35.03" in result.output
+    mock_gpu.assert_called_once()
+
+
+@patch("aws_bootstrap.cli.query_gpu_info", return_value=None)
+@patch("aws_bootstrap.cli.get_ssh_host_details")
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_gpu_ssh_fails_gracefully(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu):
+    mock_find.return_value = [_RUNNING_INSTANCE]
+    mock_details.return_value = SSHHostDetails(
+        hostname="1.2.3.4", user="ubuntu", identity_file=Path("/home/user/.ssh/id_ed25519")
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--gpu"])
+    assert result.exit_code == 0
+    assert "unavailable" in result.output
+
+
+@patch("aws_bootstrap.cli.query_gpu_info", return_value=_SAMPLE_GPU_INFO)
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_gpu_no_ssh_config_uses_defaults(
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu
+):
+    mock_find.return_value = [_RUNNING_INSTANCE]
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--gpu"])
+    assert result.exit_code == 0
+    # Should have been called with the instance IP and default user/key
+    mock_gpu.assert_called_once()
+    call_args = mock_gpu.call_args
+    assert call_args[0][0] == "1.2.3.4"
+    assert call_args[0][1] == "ubuntu"
+
+
+@patch("aws_bootstrap.cli.query_gpu_info")
+@patch("aws_bootstrap.cli.get_ssh_host_details")
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_gpu_skips_non_running(mock_find, mock_session, mock_ssh_hosts, mock_details, mock_gpu):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-stopped",
+            "Name": "aws-bootstrap-g4dn.xlarge",
+            "State": "stopped",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+            "Lifecycle": "on-demand",
+            "AvailabilityZone": "us-west-2a",
+        }
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--gpu"])
+    assert result.exit_code == 0
+    mock_gpu.assert_not_called()
+
+
+@patch("aws_bootstrap.cli.query_gpu_info")
+@patch("aws_bootstrap.cli.get_ssh_host_details")
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={"i-abc123": "aws-gpu1"})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_without_gpu_flag_no_ssh(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu):
+    mock_find.return_value = [_RUNNING_INSTANCE]
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    mock_gpu.assert_not_called()
+    mock_details.assert_not_called()
