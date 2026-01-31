@@ -78,9 +78,39 @@ ssh -i ~/.ssh/id_ed25519 ubuntu@<public-ip>
 ssh -i ~/.ssh/id_ed25519 -NL 8888:localhost:8888 ubuntu@<public-ip>
 ```
 
+## Spot Instance Quotas
+
+AWS accounts have [service quotas](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-limits.html) that limit how many vCPUs you can run per instance family. New or lightly-used accounts often have a **default spot quota of 0 vCPUs** for GPU instance families (G and VT), which will cause a `MaxSpotInstanceCountExceeded` error on launch.
+
+To check your current G/VT spot quota:
+
+```bash
+aws service-quotas get-service-quota \
+  --service-code ec2 \
+  --quota-code L-3819A6DF \
+  --region us-west-2
+```
+
+To request an increase (g4dn.xlarge requires at least 4 vCPUs):
+
+```bash
+aws service-quotas request-service-quota-increase \
+  --service-code ec2 \
+  --quota-code L-3819A6DF \
+  --desired-value 4 \
+  --region us-west-2
+```
+
+Relevant quota codes:
+- `L-3819A6DF` — All G and VT **Spot** Instance Requests
+- `L-DB2BBE81` — Running **On-Demand** G and VT instances
+
+Small increases (4-8 vCPUs) are typically auto-approved within minutes. In the meantime, you can use `--on-demand` if your on-demand quota is non-zero, or test the flow with a non-GPU instance type like `--instance-type t3.medium`.
+
 ## Additional Resources
 
 For pricing information on GPU instances see [here](https://instances.vantage.sh/aws/ec2/g4dn.xlarge).
+Spot Instances Quotas see [here](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/using-spot-limits.html)
 Deep Learning AMIs - see [here](https://docs.aws.amazon.com/dlami/latest/devguide/what-is-dlami.html)
 Nvidia Nsight - Setup Remote Debugging - see [here](https://docs.nvidia.com/nsight-visual-studio-edition/3.2/Content/Setup_Remote_Debugging.htm)
 
