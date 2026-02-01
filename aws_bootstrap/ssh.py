@@ -374,6 +374,34 @@ def list_ssh_hosts(config_path: Path | None = None) -> dict[str, str]:
     return result
 
 
+_INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
+
+
+def _is_instance_id(value: str) -> bool:
+    """Return ``True`` if *value* looks like an EC2 instance ID (``i-`` + hex)."""
+    return _INSTANCE_ID_RE.match(value) is not None
+
+
+def resolve_instance_id(value: str, config_path: Path | None = None) -> str | None:
+    """Resolve *value* to an EC2 instance ID.
+
+    If *value* already looks like an instance ID (``i-`` prefix followed by hex
+    digits) it is returned as-is.  Otherwise it is treated as an SSH host alias
+    and looked up in the managed SSH config blocks.
+
+    Returns the instance ID on success, or ``None`` if the alias was not found.
+    """
+    if _is_instance_id(value):
+        return value
+
+    hosts = list_ssh_hosts(config_path)
+    # Reverse lookup: alias -> instance_id
+    for iid, alias in hosts.items():
+        if alias == value:
+            return iid
+    return None
+
+
 @dataclass
 class SSHHostDetails:
     """Connection details parsed from an SSH config stanza."""
