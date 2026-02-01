@@ -170,6 +170,58 @@ def test_terminate_with_confirm(mock_terminate, mock_find, mock_session, mock_re
     assert mock_terminate.call_args[0][1] == ["i-abc123"]
 
 
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value=None)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.terminate_tagged_instances")
+@patch("aws_bootstrap.cli.resolve_instance_id", return_value="i-abc123")
+def test_terminate_by_alias(mock_resolve, mock_terminate, mock_session, mock_remove_ssh):
+    mock_terminate.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "PreviousState": {"Name": "running"},
+            "CurrentState": {"Name": "shutting-down"},
+        }
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["terminate", "--yes", "aws-gpu1"])
+    assert result.exit_code == 0
+    assert "Resolved alias 'aws-gpu1' -> i-abc123" in result.output
+    assert "Terminated 1" in result.output
+    mock_resolve.assert_called_once_with("aws-gpu1")
+    mock_terminate.assert_called_once()
+    assert mock_terminate.call_args[0][1] == ["i-abc123"]
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.resolve_instance_id", return_value=None)
+def test_terminate_unknown_alias_errors(mock_resolve, mock_session):
+    runner = CliRunner()
+    result = runner.invoke(main, ["terminate", "--yes", "aws-gpu99"])
+    assert result.exit_code != 0
+    assert "Could not resolve 'aws-gpu99'" in result.output
+
+
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value=None)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.terminate_tagged_instances")
+@patch("aws_bootstrap.cli.resolve_instance_id", return_value="i-abc123")
+def test_terminate_by_instance_id_passthrough(mock_resolve, mock_terminate, mock_session, mock_remove_ssh):
+    """Instance IDs are passed through without resolution message."""
+    mock_resolve.return_value = "i-abc123"
+    mock_terminate.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "PreviousState": {"Name": "running"},
+            "CurrentState": {"Name": "shutting-down"},
+        }
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["terminate", "--yes", "i-abc123"])
+    assert result.exit_code == 0
+    assert "Resolved alias" not in result.output
+    assert "Terminated 1" in result.output
+
+
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.find_tagged_instances")
 def test_terminate_cancelled(mock_find, mock_session):

@@ -29,6 +29,7 @@ from .ssh import (
     private_key_path,
     query_gpu_info,
     remove_ssh_host,
+    resolve_instance_id,
     run_remote_setup,
     wait_for_ssh,
 )
@@ -288,7 +289,7 @@ def launch(
 
     click.echo()
     click.secho("  Terminate:", fg="cyan")
-    click.secho(f"    aws-bootstrap terminate {instance_id} --region {config.region}", bold=True)
+    click.secho(f"    aws-bootstrap terminate {alias} --region {config.region}", bold=True)
     click.echo()
 
 
@@ -419,7 +420,8 @@ def status(region, profile, gpu, instructions):
 
     click.echo()
     first_id = instances[0]["InstanceId"]
-    click.echo("  To terminate:  " + click.style(f"aws-bootstrap terminate {first_id}", bold=True))
+    first_ref = ssh_hosts.get(first_id, first_id)
+    click.echo("  To terminate:  " + click.style(f"aws-bootstrap terminate {first_ref}", bold=True))
     click.echo()
 
 
@@ -427,18 +429,28 @@ def status(region, profile, gpu, instructions):
 @click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
-@click.argument("instance_ids", nargs=-1)
+@click.argument("instance_ids", nargs=-1, metavar="[INSTANCE_ID_OR_ALIAS]...")
 def terminate(region, profile, yes, instance_ids):
     """Terminate instances created by aws-bootstrap.
 
-    Pass specific instance IDs to terminate, or omit to terminate all
-    aws-bootstrap instances in the region.
+    Pass specific instance IDs or SSH aliases (e.g. aws-gpu1) to terminate,
+    or omit to terminate all aws-bootstrap instances in the region.
     """
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
 
     if instance_ids:
-        targets = list(instance_ids)
+        targets = []
+        for value in instance_ids:
+            resolved = resolve_instance_id(value)
+            if resolved is None:
+                raise CLIError(
+                    f"Could not resolve '{value}' to an instance ID.\n\n"
+                    "  It is not a valid instance ID or a known SSH alias."
+                )
+            if resolved != value:
+                info(f"Resolved alias '{value}' -> {resolved}")
+            targets.append(resolved)
     else:
         instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
         if not instances:

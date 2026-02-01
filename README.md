@@ -242,8 +242,14 @@ aws-bootstrap status --region us-east-1
 # Terminate all aws-bootstrap instances (with confirmation prompt)
 aws-bootstrap terminate
 
-# Terminate specific instances
-aws-bootstrap terminate i-abc123 i-def456
+# Terminate by SSH alias (resolved via ~/.ssh/config)
+aws-bootstrap terminate aws-gpu1
+
+# Terminate by instance ID
+aws-bootstrap terminate i-abc123
+
+# Mix aliases and instance IDs
+aws-bootstrap terminate aws-gpu1 i-def456
 
 # Skip confirmation prompt
 aws-bootstrap terminate --yes
@@ -255,7 +261,7 @@ aws-bootstrap terminate --yes
 CUDA: 12.8 (driver supports up to 13.0)
 ```
 
-SSH aliases are managed automatically — they're created on `launch`, shown in `status`, and cleaned up on `terminate`. Aliases use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and never reuse numbers from previous instances.
+SSH aliases are managed automatically — they're created on `launch`, shown in `status`, and cleaned up on `terminate`. Aliases use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and never reuse numbers from previous instances. You can use aliases anywhere you'd use an instance ID, e.g. `aws-bootstrap terminate aws-gpu1`.
 
 ## EC2 vCPU Quotas
 

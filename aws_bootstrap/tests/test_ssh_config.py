@@ -6,6 +6,7 @@ import stat
 from pathlib import Path
 
 from aws_bootstrap.ssh import (
+    _is_instance_id,
     _next_alias,
     _read_ssh_config,
     add_ssh_host,
@@ -13,6 +14,7 @@ from aws_bootstrap.ssh import (
     get_ssh_host_details,
     list_ssh_hosts,
     remove_ssh_host,
+    resolve_instance_id,
 )
 
 
@@ -331,3 +333,77 @@ def test_get_ssh_host_details_default_port(tmp_path):
     details = get_ssh_host_details("i-abc123", config_path=cfg)
     assert details is not None
     assert details.port == 22
+
+
+# ---------------------------------------------------------------------------
+# Instance ID detection
+# ---------------------------------------------------------------------------
+
+
+def test_is_instance_id_valid_short():
+    assert _is_instance_id("i-abcdef01") is True
+
+
+def test_is_instance_id_valid_long():
+    assert _is_instance_id("i-0123456789abcdef0") is True
+
+
+def test_is_instance_id_rejects_alias():
+    assert _is_instance_id("aws-gpu1") is False
+
+
+def test_is_instance_id_rejects_empty():
+    assert _is_instance_id("") is False
+
+
+def test_is_instance_id_rejects_prefix_only():
+    assert _is_instance_id("i-") is False
+
+
+def test_is_instance_id_rejects_uppercase():
+    assert _is_instance_id("i-ABCDEF01") is False
+
+
+def test_is_instance_id_rejects_too_short():
+    assert _is_instance_id("i-abc") is False
+
+
+# ---------------------------------------------------------------------------
+# resolve_instance_id
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_passthrough_instance_id(tmp_path):
+    """Instance IDs are returned as-is without consulting SSH config."""
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("")
+    result = resolve_instance_id("i-0123456789abcdef0", config_path=cfg)
+    assert result == "i-0123456789abcdef0"
+
+
+def test_resolve_alias_to_instance_id(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-abc12345", "1.2.3.4", "ubuntu", KEY_PATH, config_path=cfg)
+    result = resolve_instance_id("aws-gpu1", config_path=cfg)
+    assert result == "i-abc12345"
+
+
+def test_resolve_alias_multiple_hosts(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-111aaa11", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
+    add_ssh_host("i-222bbb22", "2.2.2.2", "ubuntu", KEY_PATH, config_path=cfg)
+    assert resolve_instance_id("aws-gpu1", config_path=cfg) == "i-111aaa11"
+    assert resolve_instance_id("aws-gpu2", config_path=cfg) == "i-222bbb22"
+
+
+def test_resolve_unknown_alias_returns_none(tmp_path):
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("")
+    assert resolve_instance_id("aws-gpu99", config_path=cfg) is None
+
+
+def test_resolve_nonexistent_config_returns_none(tmp_path):
+    cfg = tmp_path / "no_such_file"
+    assert resolve_instance_id("aws-gpu1", config_path=cfg) is None
