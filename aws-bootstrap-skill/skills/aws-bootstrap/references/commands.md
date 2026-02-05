@@ -301,9 +301,9 @@ aws-bootstrap quota show [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--family` | `gvt\|p5` | all | Instance family to show |
+| `--family` | `gvt\|p5\|p\|dl` | all | Instance family to show |
 
-Supported families: `gvt` (G and VT: g4dn, g5, g6, vt1), `p5` (P5: p5.48xlarge).
+Supported families: `gvt` (g3, g4dn, g5, g6, g6e, vt1), `p5` (p5, p5e), `p` (p4d, p4de, p3, p2), `dl` (dl1, dl2q).
 
 ### JSON Output
 
@@ -336,6 +336,34 @@ Supported families: `gvt` (G and VT: g4dn, g5, g6, vt1), `p5` (P5: p5.48xlarge).
       "quota_type": "on-demand",
       "quota_code": "L-417A185B",
       "quota_name": "Running On-Demand P instances",
+      "value": 0.0
+    },
+    {
+      "family": "p",
+      "quota_type": "spot",
+      "quota_code": "L-7212CCBC",
+      "quota_name": "All P4, P3 and P2 Spot Instance Requests",
+      "value": 0.0
+    },
+    {
+      "family": "p",
+      "quota_type": "on-demand",
+      "quota_code": "L-417A185B",
+      "quota_name": "Running On-Demand P instances",
+      "value": 0.0
+    },
+    {
+      "family": "dl",
+      "quota_type": "spot",
+      "quota_code": "L-85EED4F7",
+      "quota_name": "All DL Spot Instance Requests",
+      "value": 0.0
+    },
+    {
+      "family": "dl",
+      "quota_type": "on-demand",
+      "quota_code": "L-6E869C2A",
+      "quota_name": "Running On-Demand DL instances",
       "value": 0.0
     }
   ]

@@ -300,9 +300,15 @@ def test_get_all_gvt_quotas_delegates_to_get_family_quotas():
 
 
 def test_quota_families_has_expected_keys():
-    """QUOTA_FAMILIES should have gvt and p5 with spot and on-demand each."""
-    assert "gvt" in QUOTA_FAMILIES
-    assert "p5" in QUOTA_FAMILIES
+    """QUOTA_FAMILIES should have all GPU families with spot and on-demand each."""
+    for key in ("gvt", "p5", "p", "dl"):
+        assert key in QUOTA_FAMILIES
     for family in QUOTA_FAMILIES.values():
         assert "spot" in family
         assert "on-demand" in family
+
+
+def test_p_and_p5_share_on_demand_code():
+    """P4/P3/P2 and P5 families share the same on-demand quota code."""
+    assert QUOTA_FAMILIES["p"]["on-demand"] == QUOTA_FAMILIES["p5"]["on-demand"]
+    assert QUOTA_FAMILIES["p"]["spot"] != QUOTA_FAMILIES["p5"]["spot"]

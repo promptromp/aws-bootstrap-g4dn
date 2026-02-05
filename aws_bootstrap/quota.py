@@ -21,13 +21,23 @@ QUOTA_FAMILIES: dict[str, dict[str, str]] = {
     },
     "p5": {
         "spot": "L-C4BD4855",
-        "on-demand": "L-417A185B",  # shared across P2/P3/P4/P5
+        "on-demand": "L-417A185B",  # "Running On-Demand P instances" (shared across all P)
+    },
+    "p": {
+        "spot": "L-7212CCBC",
+        "on-demand": "L-417A185B",  # same on-demand quota as P5
+    },
+    "dl": {
+        "spot": "L-85EED4F7",
+        "on-demand": "L-6E869C2A",
     },
 }
 
 QUOTA_FAMILY_LABELS: dict[str, str] = {
-    "gvt": "G and VT (g4dn, g5, g6, vt1)",
-    "p5": "P5 (p5.48xlarge)",
+    "gvt": "G and VT (g3, g4dn, g5, g5g, g6, g6e, vt1)",
+    "p5": "P5 (p5, p5e)",
+    "p": "P4, P3, P2 (p4d, p4de, p3, p2)",
+    "dl": "DL (dl1, dl2q)",
 }
 
 DEFAULT_FAMILY = "gvt"

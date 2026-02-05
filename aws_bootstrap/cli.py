@@ -1099,6 +1099,11 @@ def quota_show(ctx, family, region, profile):
     click.echo(
         "  " + click.style("Tip: ", fg="bright_black") + click.style("g4dn.xlarge requires 4 vCPUs", fg="bright_black")
     )
+    click.echo(
+        "  "
+        + click.style("To request an increase: ", fg="bright_black")
+        + click.style("aws-bootstrap quota request --type spot --desired-value 4", fg="bright_black")
+    )
     click.echo()
 
 

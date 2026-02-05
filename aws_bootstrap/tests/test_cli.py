@@ -1881,8 +1881,8 @@ def test_quota_history_all_families(mock_session, mock_history):
     runner = CliRunner()
     result = runner.invoke(main, ["quota", "history"])
     assert result.exit_code == 0
-    # Should be called 4 times (2 families x 2 types each)
-    assert mock_history.call_count == 4
+    # Should be called 8 times (4 families x 2 types each)
+    assert mock_history.call_count == 8
 
 
 @patch("aws_bootstrap.cli.get_quota_request_history")
@@ -1921,7 +1921,7 @@ def test_quota_history_empty_json(mock_session, mock_history):
 @patch("aws_bootstrap.cli.get_family_quotas")
 @patch("aws_bootstrap.cli.boto3.Session")
 def test_quota_show_all_families(mock_session, mock_quotas):
-    """Without --family, shows all families."""
+    """Without --family, shows all families (gvt, p5, p, dl)."""
     mock_quotas.side_effect = [
         [_SPOT_QUOTA, _ON_DEMAND_QUOTA],
         [
@@ -1934,13 +1934,33 @@ def test_quota_show_all_families(mock_session, mock_quotas):
                 "family": "p5",
             },
         ],
+        [
+            {"quota_code": "L-7212CCBC", "quota_name": "P4/P3 Spot", "value": 0.0, "quota_type": "spot", "family": "p"},
+            {
+                "quota_code": "L-417A185B",
+                "quota_name": "P On-Demand",
+                "value": 0.0,
+                "quota_type": "on-demand",
+                "family": "p",
+            },
+        ],
+        [
+            {"quota_code": "L-85EED4F7", "quota_name": "DL Spot", "value": 0.0, "quota_type": "spot", "family": "dl"},
+            {
+                "quota_code": "L-6E869C2A",
+                "quota_name": "DL On-Demand",
+                "value": 0.0,
+                "quota_type": "on-demand",
+                "family": "dl",
+            },
+        ],
     ]
     runner = CliRunner()
     result = runner.invoke(main, ["-o", "json", "quota", "show"])
     assert result.exit_code == 0
     data = json.loads(result.output)
-    assert len(data["quotas"]) == 4
-    assert mock_quotas.call_count == 2
+    assert len(data["quotas"]) == 8
+    assert mock_quotas.call_count == 4
 
 
 @patch("aws_bootstrap.cli.get_family_quotas")

@@ -360,6 +360,9 @@ aws-bootstrap quota show --family gvt
 # Show only P5 family quotas
 aws-bootstrap quota show --family p5
 
+# Show P4/P3/P2 family quotas
+aws-bootstrap quota show --family p
+
 # Or use the AWS CLI directly:
 aws service-quotas get-service-quota \
   --service-code ec2 \
@@ -405,7 +408,10 @@ Common quota codes:
 | G/VT | Spot | `L-3819A6DF` | All G and VT Spot Instance Requests |
 | G/VT | On-Demand | `L-DB2E81BA` | Running On-Demand G and VT instances |
 | P5 | Spot | `L-C4BD4855` | All P5 Spot Instance Requests |
-| P5 | On-Demand | `L-417A185B` | Running On-Demand P instances (shared across P2-P5) |
+| P4/P3/P2 | Spot | `L-7212CCBC` | All P4, P3 and P2 Spot Instance Requests |
+| P (all) | On-Demand | `L-417A185B` | Running On-Demand P instances (shared across P2-P5) |
+| DL | Spot | `L-85EED4F7` | All DL Spot Instance Requests |
+| DL | On-Demand | `L-6E869C2A` | Running On-Demand DL instances |
 
 Small increases (4-8 vCPUs) are typically auto-approved within minutes. You can also request increases via the [Service Quotas console](https://console.aws.amazon.com/servicequotas/home). While waiting, you can test the full launch/poll/SSH flow with a non-GPU instance type:
 
