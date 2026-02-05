@@ -48,8 +48,8 @@ fi
 # 2. Install utilities
 echo ""
 echo "[2/6] Installing utilities..."
-sudo apt-get update -qq
-sudo apt-get install -y -qq htop tmux tree jq
+sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq htop tmux tree jq
 
 # 3. Set up Python environment with uv
 echo ""
