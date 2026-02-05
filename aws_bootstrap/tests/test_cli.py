@@ -1259,6 +1259,103 @@ def test_cleanup_with_yes(mock_find, mock_session, mock_stale, mock_cleanup):
 
 
 # ---------------------------------------------------------------------------
+# cleanup --include-ebs
+# ---------------------------------------------------------------------------
+
+
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes", return_value=[])
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_include_ebs_no_orphans(mock_find, mock_session, mock_stale, mock_orphan):
+    runner = CliRunner()
+    result = runner.invoke(main, ["cleanup", "--include-ebs"])
+    assert result.exit_code == 0
+    assert "No stale SSH config entries or orphan EBS volumes found." in result.output
+    mock_orphan.assert_called_once()
+
+
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_include_ebs_dry_run(mock_find, mock_session, mock_stale, mock_orphan):
+    mock_orphan.return_value = [
+        {"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-dead1234"},
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["cleanup", "--include-ebs", "--dry-run"])
+    assert result.exit_code == 0
+    assert "Would delete vol-orphan1" in result.output
+    assert "50 GB" in result.output
+
+
+@patch("aws_bootstrap.cli.delete_ebs_volume")
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_include_ebs_delete_with_yes(mock_find, mock_session, mock_stale, mock_orphan, mock_delete):
+    mock_orphan.return_value = [
+        {"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-dead1234"},
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["cleanup", "--include-ebs", "--yes"])
+    assert result.exit_code == 0
+    assert "Deleted vol-orphan1" in result.output
+    mock_delete.assert_called_once_with(mock_session.return_value.client.return_value, "vol-orphan1")
+
+
+@patch("aws_bootstrap.cli.delete_ebs_volume")
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_include_ebs_json(mock_find, mock_session, mock_stale, mock_orphan, mock_delete):
+    mock_orphan.return_value = [
+        {"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-dead1234"},
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "cleanup", "--include-ebs", "--yes"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "deleted_volumes" in data
+    assert len(data["deleted_volumes"]) == 1
+    assert data["deleted_volumes"][0]["volume_id"] == "vol-orphan1"
+    assert data["deleted_volumes"][0]["deleted"] is True
+
+
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_include_ebs_dry_run_json(mock_find, mock_session, mock_stale, mock_orphan):
+    mock_orphan.return_value = [
+        {"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-dead1234"},
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "cleanup", "--include-ebs", "--dry-run"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["dry_run"] is True
+    assert "orphan_volumes" in data
+    assert data["orphan_volumes"][0]["volume_id"] == "vol-orphan1"
+    assert data["orphan_volumes"][0]["size_gb"] == 50
+
+
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes", return_value=[])
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_without_include_ebs_skips_volume_check(mock_find, mock_session, mock_stale, mock_orphan):
+    """Without --include-ebs, orphan volume discovery should not be called."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["cleanup"])
+    assert result.exit_code == 0
+    mock_orphan.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
 # --output structured format tests
 # ---------------------------------------------------------------------------
 

@@ -296,6 +296,12 @@ aws-bootstrap cleanup
 # Preview what would be removed without modifying config
 aws-bootstrap cleanup --dry-run
 
+# Also find and delete orphan EBS data volumes
+aws-bootstrap cleanup --include-ebs
+
+# Preview orphan volumes without deleting
+aws-bootstrap cleanup --include-ebs --dry-run
+
 # Skip confirmation prompt
 aws-bootstrap cleanup --yes
 ```
@@ -329,6 +335,7 @@ Key behaviors:
 - New volumes are formatted as ext4; existing volumes are mounted as-is
 - Volumes are tagged for automatic discovery by `status` and `terminate`
 - `terminate` deletes data volumes by default; use `--keep-ebs` to preserve them
+- **Orphan cleanup** — use `aws-bootstrap cleanup --include-ebs` to find and delete orphan volumes (e.g. from spot interruptions or forgotten `--keep-ebs` volumes). Use `--dry-run` to preview
 - **Spot-safe** — data volumes survive spot interruptions. If AWS reclaims your instance, the volume detaches automatically and can be reattached to a new instance with `--ebs-volume-id`
 - EBS volumes must be in the same availability zone as the instance
 - Mount failures are non-fatal — the instance remains usable

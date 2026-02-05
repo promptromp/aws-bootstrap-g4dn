@@ -17,6 +17,7 @@ from .ec2 import (
     delete_ebs_volume,
     ensure_security_group,
     find_ebs_volumes_for_instance,
+    find_orphan_ebs_volumes,
     find_tagged_instances,
     get_latest_ami,
     get_spot_price,
@@ -778,10 +779,11 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
 @main.command()
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would be removed without removing.")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
+@click.option("--include-ebs", is_flag=True, default=False, help="Also find and delete orphan EBS data volumes.")
 @click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
-def cleanup(ctx, dry_run, yes, region, profile):
+def cleanup(ctx, dry_run, yes, include_ebs, region, profile):
     """Remove stale SSH config entries for terminated instances."""
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
@@ -794,57 +796,113 @@ def cleanup(ctx, dry_run, yes, region, profile):
     live_ids = {inst["InstanceId"] for inst in live_instances}
 
     stale = find_stale_ssh_hosts(live_ids)
-    if not stale:
+
+    # Orphan EBS discovery
+    orphan_volumes: list[dict] = []
+    if include_ebs:
+        orphan_volumes = find_orphan_ebs_volumes(ec2, "aws-bootstrap-g4dn", live_ids)
+
+    if not stale and not orphan_volumes:
         if is_text(ctx):
-            click.secho("No stale SSH config entries found.", fg="green")
+            msg = "No stale SSH config entries found."
+            if include_ebs:
+                msg = "No stale SSH config entries or orphan EBS volumes found."
+            click.secho(msg, fg="green")
         else:
             result_key = "stale" if dry_run else "cleaned"
-            emit({result_key: []}, ctx=ctx)
+            result: dict = {result_key: []}
+            if include_ebs:
+                ebs_key = "orphan_volumes" if dry_run else "deleted_volumes"
+                result[ebs_key] = []
+            emit(result, ctx=ctx)
         return
 
     if is_text(ctx):
-        click.secho(f"\n  Found {len(stale)} stale SSH config entry(ies):\n", bold=True, fg="cyan")
-        for iid, alias in stale:
-            click.echo("  " + click.style(alias, fg="bright_white") + f"  ({iid})")
+        if stale:
+            click.secho(f"\n  Found {len(stale)} stale SSH config entry(ies):\n", bold=True, fg="cyan")
+            for iid, alias in stale:
+                click.echo("  " + click.style(alias, fg="bright_white") + f"  ({iid})")
+        if orphan_volumes:
+            click.secho(f"\n  Found {len(orphan_volumes)} orphan EBS volume(s):\n", bold=True, fg="cyan")
+            for vol in orphan_volumes:
+                click.echo(
+                    "  "
+                    + click.style(vol["VolumeId"], fg="bright_white")
+                    + f"  ({vol['Size']} GB, was {vol['InstanceId']})"
+                )
 
     if dry_run:
         if is_text(ctx):
             click.echo()
             for iid, alias in stale:
                 info(f"Would remove {alias} ({iid})")
+            for vol in orphan_volumes:
+                info(f"Would delete {vol['VolumeId']} ({vol['Size']} GB)")
         else:
-            emit(
-                {
-                    "stale": [{"instance_id": iid, "alias": alias} for iid, alias in stale],
-                    "dry_run": True,
-                },
-                ctx=ctx,
-            )
+            result = {
+                "stale": [{"instance_id": iid, "alias": alias} for iid, alias in stale],
+                "dry_run": True,
+            }
+            if include_ebs:
+                result["orphan_volumes"] = [
+                    {
+                        "volume_id": vol["VolumeId"],
+                        "size_gb": vol["Size"],
+                        "instance_id": vol["InstanceId"],
+                    }
+                    for vol in orphan_volumes
+                ]
+            emit(result, ctx=ctx)
         return
 
     if not yes:
         click.echo()
-        if not click.confirm(f"  Remove {len(stale)} stale entry(ies)?"):
+        parts = []
+        if stale:
+            parts.append(f"{len(stale)} stale SSH entry(ies)")
+        if orphan_volumes:
+            parts.append(f"{len(orphan_volumes)} orphan EBS volume(s)")
+        if not click.confirm(f"  Remove {' and '.join(parts)}?"):
             click.secho("  Cancelled.", fg="yellow")
             return
 
-    results = cleanup_stale_ssh_hosts(live_ids)
+    ssh_results = cleanup_stale_ssh_hosts(live_ids) if stale else []
+
+    # Delete orphan EBS volumes
+    deleted_volumes: list[dict] = []
+    for vol in orphan_volumes:
+        try:
+            delete_ebs_volume(ec2, vol["VolumeId"])
+            deleted_volumes.append({"volume_id": vol["VolumeId"], "size_gb": vol["Size"], "deleted": True})
+        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+            if is_text(ctx):
+                warn(f"Failed to delete {vol['VolumeId']}: {exc}")
+            deleted_volumes.append({"volume_id": vol["VolumeId"], "size_gb": vol["Size"], "deleted": False})
 
     if not is_text(ctx):
-        emit(
-            {
-                "cleaned": [{"instance_id": r.instance_id, "alias": r.alias, "removed": r.removed} for r in results],
-            },
-            ctx=ctx,
-        )
+        result = {
+            "cleaned": [{"instance_id": r.instance_id, "alias": r.alias, "removed": r.removed} for r in ssh_results],
+        }
+        if include_ebs:
+            result["deleted_volumes"] = deleted_volumes
+        emit(result, ctx=ctx)
         return
 
     click.echo()
-    for r in results:
+    for r in ssh_results:
         success(f"Removed {r.alias} ({r.instance_id})")
+    for vol in deleted_volumes:
+        if vol["deleted"]:
+            success(f"Deleted {vol['volume_id']} ({vol['size_gb']} GB)")
 
     click.echo()
-    success(f"Cleaned up {len(results)} stale entry(ies).")
+    parts = []
+    if ssh_results:
+        parts.append(f"{len(ssh_results)} stale entry(ies)")
+    if deleted_volumes:
+        ok_count = sum(1 for v in deleted_volumes if v["deleted"])
+        parts.append(f"{ok_count} orphan volume(s)")
+    success(f"Cleaned up {' and '.join(parts)}.")
 
 
 # ---------------------------------------------------------------------------
