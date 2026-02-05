@@ -3,7 +3,7 @@
 from __future__ import annotations
 from datetime import UTC, datetime
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import botocore.exceptions
 from click.testing import CliRunner
@@ -347,7 +347,10 @@ def test_launch_output_shows_ssh_alias(
 ):
     mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
     mock_launch.return_value = {"InstanceId": "i-test123"}
-    mock_wait.return_value = {"PublicIpAddress": "1.2.3.4"}
+    mock_wait.return_value = {
+        "PublicIpAddress": "1.2.3.4",
+        "Placement": {"AvailabilityZone": "us-west-2a"},
+    }
 
     key_path = tmp_path / "id_ed25519.pub"
     key_path.write_text("ssh-ed25519 AAAA test@host")
@@ -799,7 +802,10 @@ def test_launch_python_version_passed_to_setup(
 ):
     mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
     mock_launch.return_value = {"InstanceId": "i-test123"}
-    mock_wait.return_value = {"PublicIpAddress": "1.2.3.4"}
+    mock_wait.return_value = {
+        "PublicIpAddress": "1.2.3.4",
+        "Placement": {"AvailabilityZone": "us-west-2a"},
+    }
 
     key_path = tmp_path / "id_ed25519.pub"
     key_path.write_text("ssh-ed25519 AAAA test@host")
@@ -886,3 +892,314 @@ def test_launch_dry_run_omits_ssh_port_when_default(mock_sg, mock_import, mock_a
     result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run"])
     assert result.exit_code == 0
     assert "SSH port" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# EBS data volume tests
+# ---------------------------------------------------------------------------
+
+
+def test_launch_help_shows_ebs_options():
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--help"])
+    assert result.exit_code == 0
+    assert "--ebs-storage" in result.output
+    assert "--ebs-volume-id" in result.output
+
+
+def test_launch_ebs_mutual_exclusivity(tmp_path):
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["launch", "--key-path", str(key_path), "--ebs-storage", "96", "--ebs-volume-id", "vol-abc"]
+    )
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_with_ebs_storage(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run", "--ebs-storage", "96"])
+    assert result.exit_code == 0
+    assert "96 GB gp3" in result.output
+    assert "/data" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_with_ebs_volume_id(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run", "--ebs-volume-id", "vol-abc"])
+    assert result.exit_code == 0
+    assert "vol-abc" in result.output
+    assert "/data" in result.output
+
+
+@patch("aws_bootstrap.cli.mount_ebs_volume", return_value=True)
+@patch("aws_bootstrap.cli.attach_ebs_volume")
+@patch("aws_bootstrap.cli.create_ebs_volume", return_value="vol-new123")
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_launch_with_ebs_storage_full_flow(
+    mock_session,
+    mock_ami,
+    mock_import,
+    mock_sg,
+    mock_launch,
+    mock_wait,
+    mock_ssh,
+    mock_setup,
+    mock_add_ssh,
+    mock_create_ebs,
+    mock_attach_ebs,
+    mock_mount_ebs,
+    tmp_path,
+):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_wait.return_value = {
+        "PublicIpAddress": "1.2.3.4",
+        "Placement": {"AvailabilityZone": "us-west-2a"},
+    }
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--ebs-storage", "96", "--no-setup"])
+    assert result.exit_code == 0
+    assert "vol-new123" in result.output
+    mock_create_ebs.assert_called_once()
+    mock_attach_ebs.assert_called_once()
+    mock_mount_ebs.assert_called_once()
+    # Verify format_volume=True for new volumes
+    assert mock_mount_ebs.call_args[1]["format_volume"] is True
+
+
+@patch("aws_bootstrap.cli.mount_ebs_volume", return_value=True)
+@patch("aws_bootstrap.cli.attach_ebs_volume")
+@patch("aws_bootstrap.cli.validate_ebs_volume")
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_launch_with_ebs_volume_id_full_flow(
+    mock_session,
+    mock_ami,
+    mock_import,
+    mock_sg,
+    mock_launch,
+    mock_wait,
+    mock_ssh,
+    mock_setup,
+    mock_add_ssh,
+    mock_validate,
+    mock_attach_ebs,
+    mock_mount_ebs,
+    tmp_path,
+):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_wait.return_value = {
+        "PublicIpAddress": "1.2.3.4",
+        "Placement": {"AvailabilityZone": "us-west-2a"},
+    }
+    mock_validate.return_value = {"VolumeId": "vol-existing", "Size": 200}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["launch", "--key-path", str(key_path), "--ebs-volume-id", "vol-existing", "--no-setup"]
+    )
+    assert result.exit_code == 0
+    mock_validate.assert_called_once()
+    mock_attach_ebs.assert_called_once()
+    mock_mount_ebs.assert_called_once()
+    # Verify format_volume=False for existing volumes
+    assert mock_mount_ebs.call_args[1]["format_volume"] is False
+
+
+@patch("aws_bootstrap.cli.mount_ebs_volume", return_value=False)
+@patch("aws_bootstrap.cli.attach_ebs_volume")
+@patch("aws_bootstrap.cli.create_ebs_volume", return_value="vol-new123")
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_launch_ebs_mount_failure_warns(
+    mock_session,
+    mock_ami,
+    mock_import,
+    mock_sg,
+    mock_launch,
+    mock_wait,
+    mock_ssh,
+    mock_add_ssh,
+    mock_create_ebs,
+    mock_attach_ebs,
+    mock_mount_ebs,
+    tmp_path,
+):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_wait.return_value = {
+        "PublicIpAddress": "1.2.3.4",
+        "Placement": {"AvailabilityZone": "us-west-2a"},
+    }
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--ebs-storage", "96", "--no-setup"])
+    # Should succeed despite mount failure (just a warning)
+    assert result.exit_code == 0
+    assert "WARNING" in result.output or "Failed to mount" in result.output
+
+
+def test_terminate_help_shows_keep_ebs():
+    runner = CliRunner()
+    result = runner.invoke(main, ["terminate", "--help"])
+    assert result.exit_code == 0
+    assert "--keep-ebs" in result.output
+
+
+@patch("aws_bootstrap.cli.delete_ebs_volume")
+@patch("aws_bootstrap.cli.find_ebs_volumes_for_instance")
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value=None)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.terminate_tagged_instances")
+def test_terminate_deletes_ebs_by_default(
+    mock_terminate, mock_find, mock_session, mock_remove_ssh, mock_find_ebs, mock_delete_ebs
+):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "test",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+        }
+    ]
+    mock_terminate.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "PreviousState": {"Name": "running"},
+            "CurrentState": {"Name": "shutting-down"},
+        }
+    ]
+    mock_find_ebs.return_value = [{"VolumeId": "vol-data1", "Size": 96, "Device": "/dev/sdf", "State": "in-use"}]
+
+    # Mock the ec2 client's get_waiter for volume_available
+    mock_ec2 = mock_session.return_value.client.return_value
+    mock_waiter = MagicMock()
+    mock_ec2.get_waiter.return_value = mock_waiter
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["terminate", "--yes"])
+    assert result.exit_code == 0
+    mock_delete_ebs.assert_called_once_with(mock_ec2, "vol-data1")
+
+
+@patch("aws_bootstrap.cli.delete_ebs_volume")
+@patch("aws_bootstrap.cli.find_ebs_volumes_for_instance")
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value=None)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.terminate_tagged_instances")
+def test_terminate_keep_ebs_preserves(
+    mock_terminate, mock_find, mock_session, mock_remove_ssh, mock_find_ebs, mock_delete_ebs
+):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "test",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+        }
+    ]
+    mock_terminate.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "PreviousState": {"Name": "running"},
+            "CurrentState": {"Name": "shutting-down"},
+        }
+    ]
+    mock_find_ebs.return_value = [{"VolumeId": "vol-data1", "Size": 96, "Device": "/dev/sdf", "State": "in-use"}]
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["terminate", "--yes", "--keep-ebs"])
+    assert result.exit_code == 0
+    assert "Preserving EBS volume: vol-data1" in result.output
+    assert "aws-bootstrap launch --ebs-volume-id vol-data1" in result.output
+    mock_delete_ebs.assert_not_called()
+
+
+@patch("aws_bootstrap.cli.find_ebs_volumes_for_instance")
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_shows_ebs_volumes(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "aws-bootstrap-g4dn.xlarge",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+            "Lifecycle": "spot",
+            "AvailabilityZone": "us-west-2a",
+        }
+    ]
+    mock_spot_price.return_value = 0.15
+    mock_ebs.return_value = [{"VolumeId": "vol-data1", "Size": 96, "Device": "/dev/sdf", "State": "in-use"}]
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "vol-data1" in result.output
+    assert "96 GB" in result.output
+    assert "/data" in result.output
