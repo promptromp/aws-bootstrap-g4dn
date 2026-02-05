@@ -468,3 +468,39 @@ def find_ebs_volumes_for_instance(ec2_client, instance_id: str, tag_value: str) 
             }
         )
     return volumes
+
+
+def find_orphan_ebs_volumes(ec2_client, tag_value: str, live_instance_ids: set[str]) -> list[dict]:
+    """Find aws-bootstrap EBS volumes whose linked instance no longer exists.
+
+    Only returns volumes in ``available`` state (not attached to any instance).
+    Volumes that are ``in-use`` are never considered orphans, even if their
+    tagged instance ID is not in *live_instance_ids*.
+
+    Returns a list of dicts with VolumeId, Size, State, and InstanceId
+    (the instance ID from the ``aws-bootstrap-instance`` tag).
+    """
+    try:
+        response = ec2_client.describe_volumes(
+            Filters=[
+                {"Name": "tag:created-by", "Values": [tag_value]},
+                {"Name": "status", "Values": ["available"]},
+            ]
+        )
+    except botocore.exceptions.ClientError:
+        return []
+
+    orphans = []
+    for vol in response.get("Volumes", []):
+        tags = {t["Key"]: t["Value"] for t in vol.get("Tags", [])}
+        linked_instance = tags.get("aws-bootstrap-instance", "")
+        if linked_instance and linked_instance not in live_instance_ids:
+            orphans.append(
+                {
+                    "VolumeId": vol["VolumeId"],
+                    "Size": vol["Size"],
+                    "State": vol["State"],
+                    "InstanceId": linked_instance,
+                }
+            )
+    return orphans

@@ -14,6 +14,7 @@ from aws_bootstrap.ec2 import (
     delete_ebs_volume,
     detach_ebs_volume,
     find_ebs_volumes_for_instance,
+    find_orphan_ebs_volumes,
     validate_ebs_volume,
 )
 
@@ -243,3 +244,92 @@ def test_find_ebs_volumes_client_error_returns_empty():
     )
     volumes = find_ebs_volumes_for_instance(ec2, "i-test", "aws-bootstrap-g4dn")
     assert volumes == []
+
+
+# ---------------------------------------------------------------------------
+# find_orphan_ebs_volumes
+# ---------------------------------------------------------------------------
+
+
+def test_find_orphan_ebs_volumes_returns_orphans():
+    """Volumes whose linked instance is not live should be returned."""
+    ec2 = MagicMock()
+    ec2.describe_volumes.return_value = {
+        "Volumes": [
+            {
+                "VolumeId": "vol-orphan1",
+                "Size": 50,
+                "State": "available",
+                "Tags": [
+                    {"Key": "created-by", "Value": "aws-bootstrap-g4dn"},
+                    {"Key": "aws-bootstrap-instance", "Value": "i-dead1234"},
+                ],
+            }
+        ]
+    }
+    orphans = find_orphan_ebs_volumes(ec2, "aws-bootstrap-g4dn", live_instance_ids=set())
+    assert len(orphans) == 1
+    assert orphans[0]["VolumeId"] == "vol-orphan1"
+    assert orphans[0]["InstanceId"] == "i-dead1234"
+    assert orphans[0]["Size"] == 50
+
+    # Verify the API was called with status=available filter
+    filters = ec2.describe_volumes.call_args[1]["Filters"]
+    filter_names = {f["Name"] for f in filters}
+    assert "status" in filter_names
+
+
+def test_find_orphan_ebs_volumes_excludes_live_instances():
+    """Volumes linked to a live instance should NOT be returned."""
+    ec2 = MagicMock()
+    ec2.describe_volumes.return_value = {
+        "Volumes": [
+            {
+                "VolumeId": "vol-attached",
+                "Size": 96,
+                "State": "available",
+                "Tags": [
+                    {"Key": "created-by", "Value": "aws-bootstrap-g4dn"},
+                    {"Key": "aws-bootstrap-instance", "Value": "i-live123"},
+                ],
+            }
+        ]
+    }
+    orphans = find_orphan_ebs_volumes(ec2, "aws-bootstrap-g4dn", live_instance_ids={"i-live123"})
+    assert orphans == []
+
+
+def test_find_orphan_ebs_volumes_empty():
+    """No volumes at all should return empty list."""
+    ec2 = MagicMock()
+    ec2.describe_volumes.return_value = {"Volumes": []}
+    orphans = find_orphan_ebs_volumes(ec2, "aws-bootstrap-g4dn", live_instance_ids=set())
+    assert orphans == []
+
+
+def test_find_orphan_ebs_volumes_skips_no_instance_tag():
+    """Volumes without aws-bootstrap-instance tag should be skipped."""
+    ec2 = MagicMock()
+    ec2.describe_volumes.return_value = {
+        "Volumes": [
+            {
+                "VolumeId": "vol-notag",
+                "Size": 10,
+                "State": "available",
+                "Tags": [{"Key": "created-by", "Value": "aws-bootstrap-g4dn"}],
+            }
+        ]
+    }
+    orphans = find_orphan_ebs_volumes(ec2, "aws-bootstrap-g4dn", live_instance_ids=set())
+    assert orphans == []
+
+
+def test_find_orphan_ebs_volumes_client_error():
+    """ClientError should return empty list."""
+    ec2 = MagicMock()
+    ec2.describe_volumes.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "UnauthorizedOperation", "Message": "no access"}},
+        "DescribeVolumes",
+    )
+    orphans = find_orphan_ebs_volumes(ec2, "aws-bootstrap-g4dn", live_instance_ids=set())
+    assert orphans == []
