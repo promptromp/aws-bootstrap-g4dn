@@ -9,7 +9,7 @@ description: >
 
 # aws-bootstrap -- AWS GPU Instance Management
 
-You have access to the `aws-bootstrap` CLI tool for provisioning and managing AWS EC2 GPU instances. Use it via the Bash tool. **Always use `--output json` when you need to parse results programmatically.**
+You have access to the `aws-bootstrap` CLI tool for provisioning and managing AWS EC2 GPU instances. Use it via the Bash tool. **Always pass `-o json` before the subcommand** (e.g., `aws-bootstrap -o json status`) **when you need to parse results programmatically.** The `--output`/`-o` flag is a global option and must come before the command name — placing it after (e.g., `aws-bootstrap status -o json`) will fail.
 
 ## Prerequisites
 
