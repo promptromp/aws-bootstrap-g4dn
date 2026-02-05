@@ -13,6 +13,7 @@ from pathlib import Path
 import click
 
 from .gpu import _GPU_ARCHITECTURES, GpuInfo
+from .output import echo, secho
 
 
 # ---------------------------------------------------------------------------
@@ -54,7 +55,7 @@ def import_key_pair(ec2_client, key_name: str, key_path: Path) -> str:
     # Check if key pair already exists
     try:
         existing = ec2_client.describe_key_pairs(KeyNames=[key_name])
-        click.echo("  Key pair " + click.style(f"'{key_name}'", fg="bright_white") + " already exists, reusing.")
+        echo("  Key pair " + click.style(f"'{key_name}'", fg="bright_white") + " already exists, reusing.")
         return existing["KeyPairs"][0]["KeyName"]
     except ec2_client.exceptions.ClientError as e:
         if "InvalidKeyPair.NotFound" not in str(e):
@@ -70,7 +71,7 @@ def import_key_pair(ec2_client, key_name: str, key_path: Path) -> str:
             }
         ],
     )
-    click.secho(f"  Imported key pair '{key_name}' from {key_path}", fg="green")
+    secho(f"  Imported key pair '{key_name}' from {key_path}", fg="green")
     return key_name
 
 
@@ -88,7 +89,7 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
             sock = socket.create_connection((host, port), timeout=5)
             sock.close()
         except (TimeoutError, ConnectionRefusedError, OSError):
-            click.echo("  SSH not ready " + click.style(f"(attempt {attempt}/{retries})", dim=True) + ", waiting...")
+            echo("  SSH not ready " + click.style(f"(attempt {attempt}/{retries})", dim=True) + ", waiting...")
             time.sleep(delay)
             continue
 
@@ -106,10 +107,10 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
         ]
         result = subprocess.run(cmd, capture_output=True, text=True)
         if result.returncode == 0:
-            click.secho("  SSH connection established.", fg="green")
+            secho("  SSH connection established.", fg="green")
             return True
 
-        click.echo("  SSH not ready " + click.style(f"(attempt {attempt}/{retries})", dim=True) + ", waiting...")
+        echo("  SSH not ready " + click.style(f"(attempt {attempt}/{retries})", dim=True) + ", waiting...")
         time.sleep(delay)
 
     return False
@@ -125,89 +126,89 @@ def run_remote_setup(
     requirements_path = script_path.parent / "requirements.txt"
 
     # SCP the requirements file
-    click.echo("  Uploading requirements.txt...")
+    echo("  Uploading requirements.txt...")
     req_result = subprocess.run(
         ["scp", *ssh_opts, *scp_port_opts, str(requirements_path), f"{user}@{host}:/tmp/requirements.txt"],
         capture_output=True,
         text=True,
     )
     if req_result.returncode != 0:
-        click.secho(f"  SCP failed: {req_result.stderr}", fg="red", err=True)
+        secho(f"  SCP failed: {req_result.stderr}", fg="red", err=True)
         return False
 
     # SCP the GPU benchmark script
     benchmark_path = script_path.parent / "gpu_benchmark.py"
-    click.echo("  Uploading gpu_benchmark.py...")
+    echo("  Uploading gpu_benchmark.py...")
     bench_result = subprocess.run(
         ["scp", *ssh_opts, *scp_port_opts, str(benchmark_path), f"{user}@{host}:/tmp/gpu_benchmark.py"],
         capture_output=True,
         text=True,
     )
     if bench_result.returncode != 0:
-        click.secho(f"  SCP failed: {bench_result.stderr}", fg="red", err=True)
+        secho(f"  SCP failed: {bench_result.stderr}", fg="red", err=True)
         return False
 
     # SCP the GPU smoke test notebook
     notebook_path = script_path.parent / "gpu_smoke_test.ipynb"
-    click.echo("  Uploading gpu_smoke_test.ipynb...")
+    echo("  Uploading gpu_smoke_test.ipynb...")
     nb_result = subprocess.run(
         ["scp", *ssh_opts, *scp_port_opts, str(notebook_path), f"{user}@{host}:/tmp/gpu_smoke_test.ipynb"],
         capture_output=True,
         text=True,
     )
     if nb_result.returncode != 0:
-        click.secho(f"  SCP failed: {nb_result.stderr}", fg="red", err=True)
+        secho(f"  SCP failed: {nb_result.stderr}", fg="red", err=True)
         return False
 
     # SCP the CUDA example source
     saxpy_path = script_path.parent / "saxpy.cu"
-    click.echo("  Uploading saxpy.cu...")
+    echo("  Uploading saxpy.cu...")
     saxpy_result = subprocess.run(
         ["scp", *ssh_opts, *scp_port_opts, str(saxpy_path), f"{user}@{host}:/tmp/saxpy.cu"],
         capture_output=True,
         text=True,
     )
     if saxpy_result.returncode != 0:
-        click.secho(f"  SCP failed: {saxpy_result.stderr}", fg="red", err=True)
+        secho(f"  SCP failed: {saxpy_result.stderr}", fg="red", err=True)
         return False
 
     # SCP the VSCode launch.json
     launch_json_path = script_path.parent / "launch.json"
-    click.echo("  Uploading launch.json...")
+    echo("  Uploading launch.json...")
     launch_result = subprocess.run(
         ["scp", *ssh_opts, *scp_port_opts, str(launch_json_path), f"{user}@{host}:/tmp/launch.json"],
         capture_output=True,
         text=True,
     )
     if launch_result.returncode != 0:
-        click.secho(f"  SCP failed: {launch_result.stderr}", fg="red", err=True)
+        secho(f"  SCP failed: {launch_result.stderr}", fg="red", err=True)
         return False
 
     # SCP the VSCode tasks.json
     tasks_json_path = script_path.parent / "tasks.json"
-    click.echo("  Uploading tasks.json...")
+    echo("  Uploading tasks.json...")
     tasks_result = subprocess.run(
         ["scp", *ssh_opts, *scp_port_opts, str(tasks_json_path), f"{user}@{host}:/tmp/tasks.json"],
         capture_output=True,
         text=True,
     )
     if tasks_result.returncode != 0:
-        click.secho(f"  SCP failed: {tasks_result.stderr}", fg="red", err=True)
+        secho(f"  SCP failed: {tasks_result.stderr}", fg="red", err=True)
         return False
 
     # SCP the script
-    click.echo("  Uploading remote_setup.sh...")
+    echo("  Uploading remote_setup.sh...")
     scp_result = subprocess.run(
         ["scp", *ssh_opts, *scp_port_opts, str(script_path), f"{user}@{host}:/tmp/remote_setup.sh"],
         capture_output=True,
         text=True,
     )
     if scp_result.returncode != 0:
-        click.secho(f"  SCP failed: {scp_result.stderr}", fg="red", err=True)
+        secho(f"  SCP failed: {scp_result.stderr}", fg="red", err=True)
         return False
 
     # Execute the script, passing PYTHON_VERSION as an inline env var if specified
-    click.echo("  Running remote_setup.sh on instance...")
+    echo("  Running remote_setup.sh on instance...")
     remote_cmd = "chmod +x /tmp/remote_setup.sh && "
     if python_version:
         remote_cmd += f"PYTHON_VERSION={python_version} "

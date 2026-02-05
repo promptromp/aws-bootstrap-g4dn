@@ -17,7 +17,7 @@ repos:
     - id: end-of-file-fixer
     - id: trailing-whitespace
 - repo: https://github.com/astral-sh/ruff-pre-commit
-  rev: v0.14.7
+  rev: v0.15.0
   hooks:
     # Run the linter.
     - id: ruff-check
@@ -28,7 +28,7 @@ repos:
   rev: v1.19.0
   hooks:
     - id: mypy
-      additional_dependencies: [types-pyyaml>=6.0.12]
+      additional_dependencies: [types-pyyaml>=6.0.12, types-tabulate>=0.9]
 - repo: local
   hooks:
   - id: pytest

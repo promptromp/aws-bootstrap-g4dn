@@ -7,6 +7,7 @@ import botocore.exceptions
 import click
 
 from .config import LaunchConfig
+from .output import echo, is_text, secho
 
 
 EBS_DEVICE_NAME = "/dev/sdf"
@@ -81,7 +82,7 @@ def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int =
     if existing["SecurityGroups"]:
         sg_id = existing["SecurityGroups"][0]["GroupId"]
         msg = "  Security group " + click.style(f"'{name}'", fg="bright_white")
-        click.echo(msg + f" already exists ({sg_id}), reusing.")
+        echo(msg + f" already exists ({sg_id}), reusing.")
         return sg_id
 
     # Create new SG
@@ -113,7 +114,7 @@ def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int =
             }
         ],
     )
-    click.secho(f"  Created security group '{name}' ({sg_id}) with SSH ingress.", fg="green")
+    secho(f"  Created security group '{name}' ({sg_id}) with SSH ingress.", fg="green")
     return sg_id
 
 
@@ -163,8 +164,8 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
         if code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
             _raise_quota_error(code, config)
         elif code in ("InsufficientInstanceCapacity", "SpotMaxPriceTooLow") and config.spot:
-            click.secho(f"\n  Spot request failed: {e.response['Error']['Message']}", fg="yellow")
-            if click.confirm("  Retry as on-demand instance?"):
+            secho(f"\n  Spot request failed: {e.response['Error']['Message']}", fg="yellow")
+            if not is_text() or click.confirm("  Retry as on-demand instance?"):
                 launch_params.pop("InstanceMarketOptions", None)
                 try:
                     response = ec2_client.run_instances(**launch_params)
@@ -329,15 +330,15 @@ def terminate_tagged_instances(ec2_client, instance_ids: list[str]) -> list[dict
 
 def wait_instance_ready(ec2_client, instance_id: str) -> dict:
     """Wait for the instance to be running and pass status checks."""
-    click.echo("  Waiting for instance " + click.style(instance_id, fg="bright_white") + " to enter 'running' state...")
+    echo("  Waiting for instance " + click.style(instance_id, fg="bright_white") + " to enter 'running' state...")
     waiter = ec2_client.get_waiter("instance_running")
     waiter.wait(InstanceIds=[instance_id], WaiterConfig={"Delay": 10, "MaxAttempts": 60})
-    click.secho("  Instance running.", fg="green")
+    secho("  Instance running.", fg="green")
 
-    click.echo("  Waiting for instance status checks to pass...")
+    echo("  Waiting for instance status checks to pass...")
     waiter = ec2_client.get_waiter("instance_status_ok")
     waiter.wait(InstanceIds=[instance_id], WaiterConfig={"Delay": 15, "MaxAttempts": 60})
-    click.secho("  Status checks passed.", fg="green")
+    secho("  Status checks passed.", fg="green")
 
     # Refresh instance info to get public IP
     desc = ec2_client.describe_instances(InstanceIds=[instance_id])

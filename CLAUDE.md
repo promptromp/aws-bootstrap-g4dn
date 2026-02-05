@@ -13,6 +13,8 @@ Target workflows: Jupyter server-client, VSCode Remote SSH, and NVIDIA Nsight re
 - **Python 3.12+** with **uv** package manager (astral-sh/uv) — used for venv creation, dependency management, and running the project
 - **boto3** — AWS SDK for EC2 provisioning (AMI lookup, security groups, instance launch, waiters)
 - **click** — CLI framework with built-in color support (`click.secho`, `click.style`)
+- **pyyaml** — YAML serialization for `--output yaml`
+- **tabulate** — Table formatting for `--output table`
 - **setuptools + setuptools-scm** — build backend with git-tag-based versioning (configured in pyproject.toml)
 - **AWS CLI v2** with a configured AWS profile (`AWS_PROFILE` env var or `--profile` flag)
 - **direnv** for automatic venv activation (`.envrc` sources `.venv/bin/activate`)
@@ -34,6 +36,7 @@ aws_bootstrap/
     config.py            # LaunchConfig dataclass with defaults
     ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing, EBS volume ops
     gpu.py               # GPU architecture mapping and GpuInfo dataclass
+    output.py            # Output formatting: OutputFormat enum, emit(), echo/secho wrappers for structured output
     ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management, GPU queries, EBS mount
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
@@ -48,6 +51,7 @@ aws_bootstrap/
         test_config.py
         test_cli.py
         test_ec2.py
+        test_output.py
         test_gpu.py
         test_ssh_config.py
         test_ssh_gpu.py
@@ -61,6 +65,8 @@ docs/
 Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`)
 
 ## CLI Commands
+
+**Global option:** `--output` / `-o` controls output format: `text` (default, human-readable with color), `json`, `yaml`, `table`. Structured formats (json/yaml/table) suppress all progress messages and emit machine-readable output. Commands requiring confirmation (`terminate`, `cleanup`) require `--yes` in structured modes.
 
 - **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`; `--python-version` controls which Python `uv` installs in the remote venv; `--ssh-port` overrides the default SSH port (22) for security group ingress, connection checks, and SSH config; `--ebs-storage SIZE` creates and attaches a new gp3 EBS data volume (mounted at `/data`); `--ebs-volume-id ID` attaches an existing EBS volume (mutually exclusive with `--ebs-storage`)
 - **`status`** — lists all non-terminated instances (including `shutting-down`) with type, IP, SSH alias, EBS data volumes, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`); `--instructions` (default: on) prints connection commands (SSH, Jupyter tunnel, VSCode Remote SSH, GPU benchmark) for each running instance; suppress with `--no-instructions`
@@ -93,6 +99,18 @@ uv run pytest
 ```
 
 Use `uv add <package>` to add dependencies and `uv add --group dev <package>` for dev dependencies.
+
+## Structured Output Architecture
+
+The `--output` option uses a context-aware suppression pattern via `aws_bootstrap/output.py`:
+
+- **`output.echo()` / `output.secho()`** — wrap `click.echo`/`click.secho`; silent in non-text modes. Used in `ec2.py` and `ssh.py` for progress messages.
+- **`is_text(ctx)`** — checks if the current output format is text. Used in `cli.py` to guard text-only blocks.
+- **`emit(data, headers=..., ctx=...)`** — dispatches structured data to JSON/YAML/table renderers. No-op in text mode.
+- **CLI helper guards** — `step()`, `info()`, `val()`, `success()`, `warn()` in `cli.py` check `is_text()` and return early in structured modes.
+- Each CLI command builds a result dict alongside existing logic, emits it via `emit()` for non-text formats, and falls through to text output for text mode.
+- **Confirmation prompts** (`terminate`, `cleanup`) require `--yes` in structured modes to avoid corrupting output.
+- The spot-fallback `click.confirm()` in `ec2.py` auto-confirms in structured modes.
 
 ## CUDA-Aware PyTorch Installation
 
