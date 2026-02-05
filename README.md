@@ -126,10 +126,12 @@ aws-bootstrap launch --profile my-aws-profile
 
 After launch, the CLI:
 
-1. **Adds an SSH alias** (e.g. `aws-gpu1`) to `~/.ssh/config`
-2. **Runs remote setup** — installs utilities, creates a Python venv, installs CUDA-matched PyTorch, sets up Jupyter
-3. **Runs a CUDA smoke test** — verifies `torch.cuda.is_available()` and runs a quick GPU matmul
-4. **Prints connection commands** — SSH, Jupyter tunnel, GPU benchmark, and terminate
+1. **Creates/attaches EBS volume** (if `--ebs-storage` or `--ebs-volume-id` was specified)
+2. **Adds an SSH alias** (e.g. `aws-gpu1`) to `~/.ssh/config`
+3. **Runs remote setup** — installs utilities, creates a Python venv, installs CUDA-matched PyTorch, sets up Jupyter
+4. **Mounts EBS volume** at `/data` (if applicable — formats new volumes, mounts existing ones as-is)
+5. **Runs a CUDA smoke test** — verifies `torch.cuda.is_available()` and runs a quick GPU matmul
+6. **Prints connection commands** — SSH, Jupyter tunnel, GPU benchmark, and terminate
 
 ```bash
 ssh aws-gpu1                  # venv auto-activates on login
@@ -142,7 +144,7 @@ The setup script runs automatically on the instance after SSH becomes available:
 | Step | What |
 |------|------|
 | **GPU verify** | Confirms `nvidia-smi` and `nvcc` are working |
-| **Utilities** | Installs `htop`, `tmux`, `tree`, `jq` |
+| **Utilities** | Installs `htop`, `tmux`, `tree`, `jq`, `ffmpeg` |
 | **Python venv** | Creates `~/venv` with `uv`, auto-activates in `~/.bashrc`. Use `--python-version` to pin a specific Python (e.g. `3.13`) |
 | **CUDA-aware PyTorch** | Detects CUDA toolkit version → installs PyTorch from the matching `cu{TAG}` wheel index |
 | **CUDA smoke test** | Runs `torch.cuda.is_available()` + GPU matmul to verify the stack |

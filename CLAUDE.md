@@ -114,6 +114,32 @@ The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags publi
 
 `resources/gpu_benchmark.py` is uploaded to `~/gpu_benchmark.py` on the remote instance during setup. It benchmarks GPU throughput with two modes: CNN on MNIST and a GPT-style Transformer on synthetic data. It reports samples/sec, batch times, and peak GPU memory. Supports `--precision` (fp32/fp16/bf16/tf32), `--diagnose` for CUDA smoke tests, and separate `--transformer-batch-size` (default 32, T4-safe). Dependencies (`torch`, `torchvision`, `tqdm`) are already installed by the setup script.
 
+## EBS Data Volumes
+
+The `--ebs-storage` and `--ebs-volume-id` options on `launch` create or attach persistent gp3 EBS volumes mounted at `/data`. The implementation spans three modules:
+
+- **`ec2.py`** — Volume lifecycle: `create_ebs_volume`, `validate_ebs_volume`, `attach_ebs_volume`, `detach_ebs_volume`, `delete_ebs_volume`, `find_ebs_volumes_for_instance`. Constants `EBS_DEVICE_NAME` (`/dev/sdf`) and `EBS_MOUNT_POINT` (`/data`).
+- **`ssh.py`** — `mount_ebs_volume()` SSHs to the instance and runs a shell script that detects the device, optionally formats it, mounts it, and adds an fstab entry.
+- **`cli.py`** — Orchestrates the flow: create/validate → attach → wait for SSH → mount. Mount failures are non-fatal (warn and continue).
+
+### Tagging strategy
+
+Volumes are tagged for discovery by `status` and `terminate`:
+
+| Tag | Value | Purpose |
+|-----|-------|---------|
+| `created-by` | `aws-bootstrap-g4dn` | Standard tool-managed resource tag |
+| `Name` | `aws-bootstrap-data-{instance_id}` | Human-readable in AWS console |
+| `aws-bootstrap-instance` | `i-xxxxxxxxx` | Links volume to instance for `find_ebs_volumes_for_instance` |
+
+### NVMe device detection
+
+On Nitro instances (g4dn), `/dev/sdf` is remapped to `/dev/nvmeXn1`. The mount script detects the correct device by matching the volume ID serial number via `lsblk -o NAME,SERIAL -dpn`, with fallbacks to `/dev/nvme1n1`, `/dev/xvdf`, `/dev/sdf`.
+
+### Terminate cleanup
+
+Non-root EBS volumes attached via API do **not** auto-delete on termination. The `terminate` command discovers volumes via `find_ebs_volumes_for_instance`, waits for them to detach (becomes `available`), then deletes them. `--keep-ebs` skips deletion and prints the volume ID with a reattach command.
+
 ## Versioning & Publishing
 
 Version is derived automatically from git tags via **setuptools-scm** — no hardcoded version string in the codebase.
