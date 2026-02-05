@@ -10,7 +10,9 @@ from aws_bootstrap.ssh import (
     _next_alias,
     _read_ssh_config,
     add_ssh_host,
+    cleanup_stale_ssh_hosts,
     find_ssh_alias,
+    find_stale_ssh_hosts,
     get_ssh_host_details,
     list_ssh_hosts,
     remove_ssh_host,
@@ -407,3 +409,77 @@ def test_resolve_unknown_alias_returns_none(tmp_path):
 def test_resolve_nonexistent_config_returns_none(tmp_path):
     cfg = tmp_path / "no_such_file"
     assert resolve_instance_id("aws-gpu1", config_path=cfg) is None
+
+
+# ---------------------------------------------------------------------------
+# Cleanup: find_stale_ssh_hosts / cleanup_stale_ssh_hosts
+# ---------------------------------------------------------------------------
+
+
+def test_find_stale_ssh_hosts_finds_orphans(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
+    add_ssh_host("i-222bbbb2", "2.2.2.2", "ubuntu", KEY_PATH, config_path=cfg)
+    stale = find_stale_ssh_hosts({"i-111aaaa1"}, config_path=cfg)
+    assert stale == [("i-222bbbb2", "aws-gpu2")]
+
+
+def test_find_stale_ssh_hosts_none_stale(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
+    add_ssh_host("i-222bbbb2", "2.2.2.2", "ubuntu", KEY_PATH, config_path=cfg)
+    stale = find_stale_ssh_hosts({"i-111aaaa1", "i-222bbbb2"}, config_path=cfg)
+    assert stale == []
+
+
+def test_find_stale_ssh_hosts_all_stale(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
+    add_ssh_host("i-222bbbb2", "2.2.2.2", "ubuntu", KEY_PATH, config_path=cfg)
+    stale = find_stale_ssh_hosts(set(), config_path=cfg)
+    assert len(stale) == 2
+    assert ("i-111aaaa1", "aws-gpu1") in stale
+    assert ("i-222bbbb2", "aws-gpu2") in stale
+
+
+def test_find_stale_ssh_hosts_empty_config(tmp_path):
+    cfg = _config_path(tmp_path)
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("")
+    stale = find_stale_ssh_hosts(set(), config_path=cfg)
+    assert stale == []
+
+
+def test_cleanup_stale_ssh_hosts_removes(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
+    add_ssh_host("i-222bbbb2", "2.2.2.2", "ubuntu", KEY_PATH, config_path=cfg)
+    results = cleanup_stale_ssh_hosts({"i-111aaaa1"}, config_path=cfg)
+    assert len(results) == 1
+    assert results[0].instance_id == "i-222bbbb2"
+    assert results[0].alias == "aws-gpu2"
+    assert results[0].removed is True
+    # Verify it was actually removed from the config
+    content = cfg.read_text()
+    assert "i-222bbbb2" not in content
+    assert "i-111aaaa1" in content
+
+
+def test_cleanup_stale_ssh_hosts_dry_run(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
+    add_ssh_host("i-222bbbb2", "2.2.2.2", "ubuntu", KEY_PATH, config_path=cfg)
+    results = cleanup_stale_ssh_hosts({"i-111aaaa1"}, config_path=cfg, dry_run=True)
+    assert len(results) == 1
+    assert results[0].removed is False
+    # Verify config is unchanged
+    content = cfg.read_text()
+    assert "i-222bbbb2" in content
+    assert "i-111aaaa1" in content
+
+
+def test_cleanup_stale_ssh_hosts_no_stale(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
+    results = cleanup_stale_ssh_hosts({"i-111aaaa1"}, config_path=cfg)
+    assert results == []

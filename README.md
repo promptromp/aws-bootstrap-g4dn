@@ -265,6 +265,15 @@ aws-bootstrap terminate aws-gpu1 i-def456
 
 # Skip confirmation prompt
 aws-bootstrap terminate --yes
+
+# Remove stale SSH config entries for terminated instances
+aws-bootstrap cleanup
+
+# Preview what would be removed without modifying config
+aws-bootstrap cleanup --dry-run
+
+# Skip confirmation prompt
+aws-bootstrap cleanup --yes
 ```
 
 `status --gpu` reports both the **installed CUDA toolkit** version (from `nvcc`) and the **maximum CUDA version supported by the driver** (from `nvidia-smi`), so you can see at a glance whether they match:
