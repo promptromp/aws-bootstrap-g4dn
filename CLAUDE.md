@@ -32,9 +32,9 @@ aws_bootstrap/
     __init__.py          # Package init
     cli.py               # Click CLI entry point (launch, status, terminate commands)
     config.py            # LaunchConfig dataclass with defaults
-    ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing
+    ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing, EBS volume ops
     gpu.py               # GPU architecture mapping and GpuInfo dataclass
-    ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management, GPU queries
+    ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management, GPU queries, EBS mount
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
         gpu_benchmark.py       # GPU throughput benchmark (CNN + Transformer), copied to ~/gpu_benchmark.py on instance
@@ -51,6 +51,8 @@ aws_bootstrap/
         test_gpu.py
         test_ssh_config.py
         test_ssh_gpu.py
+        test_ebs.py
+        test_ssh_ebs.py
 docs/
     nsight-remote-profiling.md # Nsight Compute, Nsight Systems, and Nsight VSCE remote profiling guide
     spot-request-lifecycle.md  # Research notes on spot request cleanup
@@ -60,9 +62,9 @@ Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`
 
 ## CLI Commands
 
-- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`; `--python-version` controls which Python `uv` installs in the remote venv; `--ssh-port` overrides the default SSH port (22) for security group ingress, connection checks, and SSH config
-- **`status`** — lists all non-terminated instances (including `shutting-down`) with type, IP, SSH alias, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`); `--instructions` (default: on) prints connection commands (SSH, Jupyter tunnel, VSCode Remote SSH, GPU benchmark) for each running instance; suppress with `--no-instructions`
-- **`terminate`** — terminates instances by ID or SSH alias (e.g. `aws-gpu1`, resolved via `~/.ssh/config`), or all aws-bootstrap instances in the region if no arguments given; removes SSH config aliases
+- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`; `--python-version` controls which Python `uv` installs in the remote venv; `--ssh-port` overrides the default SSH port (22) for security group ingress, connection checks, and SSH config; `--ebs-storage SIZE` creates and attaches a new gp3 EBS data volume (mounted at `/data`); `--ebs-volume-id ID` attaches an existing EBS volume (mutually exclusive with `--ebs-storage`)
+- **`status`** — lists all non-terminated instances (including `shutting-down`) with type, IP, SSH alias, EBS data volumes, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`); `--instructions` (default: on) prints connection commands (SSH, Jupyter tunnel, VSCode Remote SSH, GPU benchmark) for each running instance; suppress with `--no-instructions`
+- **`terminate`** — terminates instances by ID or SSH alias (e.g. `aws-gpu1`, resolved via `~/.ssh/config`), or all aws-bootstrap instances in the region if no arguments given; removes SSH config aliases; deletes associated EBS data volumes by default; `--keep-ebs` preserves volumes and prints reattach commands
 - **`list instance-types`** — lists EC2 instance types matching a family prefix (default: `g4dn`), showing vCPUs, memory, and GPU info
 - **`list amis`** — lists available AMIs matching a name pattern (default: Deep Learning Base OSS Nvidia Driver GPU AMIs), sorted newest-first
 
@@ -111,6 +113,34 @@ The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags publi
 ## GPU Benchmark
 
 `resources/gpu_benchmark.py` is uploaded to `~/gpu_benchmark.py` on the remote instance during setup. It benchmarks GPU throughput with two modes: CNN on MNIST and a GPT-style Transformer on synthetic data. It reports samples/sec, batch times, and peak GPU memory. Supports `--precision` (fp32/fp16/bf16/tf32), `--diagnose` for CUDA smoke tests, and separate `--transformer-batch-size` (default 32, T4-safe). Dependencies (`torch`, `torchvision`, `tqdm`) are already installed by the setup script.
+
+## EBS Data Volumes
+
+The `--ebs-storage` and `--ebs-volume-id` options on `launch` create or attach persistent gp3 EBS volumes mounted at `/data`. The implementation spans three modules:
+
+- **`ec2.py`** — Volume lifecycle: `create_ebs_volume`, `validate_ebs_volume`, `attach_ebs_volume`, `detach_ebs_volume`, `delete_ebs_volume`, `find_ebs_volumes_for_instance`. Constants `EBS_DEVICE_NAME` (`/dev/sdf`) and `EBS_MOUNT_POINT` (`/data`).
+- **`ssh.py`** — `mount_ebs_volume()` SSHs to the instance and runs a shell script that detects the device, optionally formats it, mounts it, and adds an fstab entry.
+- **`cli.py`** — Orchestrates the flow: create/validate → attach → wait for SSH → mount. Mount failures are non-fatal (warn and continue).
+
+### Tagging strategy
+
+Volumes are tagged for discovery by `status` and `terminate`:
+
+| Tag | Value | Purpose |
+|-----|-------|---------|
+| `created-by` | `aws-bootstrap-g4dn` | Standard tool-managed resource tag |
+| `Name` | `aws-bootstrap-data-{instance_id}` | Human-readable in AWS console |
+| `aws-bootstrap-instance` | `i-xxxxxxxxx` | Links volume to instance for `find_ebs_volumes_for_instance` |
+
+### NVMe device detection
+
+On Nitro instances (g4dn), `/dev/sdf` is remapped to `/dev/nvmeXn1`. The mount script detects the correct device by matching the volume ID serial number via `lsblk -o NAME,SERIAL -dpn`, with fallbacks to `/dev/nvme1n1`, `/dev/xvdf`, `/dev/sdf`.
+
+### Spot interruption and terminate cleanup
+
+Non-root EBS volumes attached via API have `DeleteOnTermination=False` by default. This means data volumes **survive spot interruptions** — when AWS reclaims the instance, the volume detaches and becomes `available`, preserving all data. The user can reattach it to a new instance with `--ebs-volume-id`.
+
+The `terminate` command discovers volumes via `find_ebs_volumes_for_instance`, waits for them to detach (becomes `available`), then deletes them. `--keep-ebs` skips deletion and prints the volume ID with a reattach command.
 
 ## Versioning & Publishing
 

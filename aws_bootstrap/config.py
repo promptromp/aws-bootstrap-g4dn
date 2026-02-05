@@ -24,3 +24,5 @@ class LaunchConfig:
     alias_prefix: str = "aws-gpu"
     ssh_port: int = 22
     python_version: str | None = None
+    ebs_storage: int | None = None
+    ebs_volume_id: str | None = None

@@ -516,6 +516,87 @@ def query_gpu_info(host: str, user: str, key_path: Path, timeout: int = 10, port
 
 
 # ---------------------------------------------------------------------------
+# EBS volume mount
+# ---------------------------------------------------------------------------
+
+
+def mount_ebs_volume(
+    host: str,
+    user: str,
+    key_path: Path,
+    volume_id: str,
+    mount_point: str = "/data",
+    format_volume: bool = True,
+    port: int = 22,
+) -> bool:
+    """Mount an EBS volume on the remote instance via SSH.
+
+    Detects the NVMe device by volume ID serial, formats if requested,
+    mounts at *mount_point*, and adds an fstab entry for persistence.
+
+    Returns True on success, False on failure.
+    """
+    ssh_opts = _ssh_opts(key_path)
+    port_opts = ["-p", str(port)] if port != 22 else []
+
+    # Strip the vol- prefix and hyphen for NVMe serial matching
+    vol_serial = volume_id.replace("-", "")
+
+    format_cmd = ""
+    if format_volume:
+        format_cmd = (
+            '  if ! sudo blkid "$DEVICE" > /dev/null 2>&1; then\n'
+            '    echo "Formatting $DEVICE as ext4..."\n'
+            '    sudo mkfs.ext4 "$DEVICE"\n'
+            "  fi\n"
+        )
+
+    remote_script = (
+        "set -e\n"
+        "# Detect EBS device by NVMe serial (Nitro instances)\n"
+        f'SERIAL="{vol_serial}"\n'
+        "DEVICE=$(lsblk -o NAME,SERIAL -dpn 2>/dev/null | "
+        "awk -v s=\"$SERIAL\" '$2 == s {print $1}' | head -1)\n"
+        "# Fallback to common device paths\n"
+        'if [ -z "$DEVICE" ]; then\n'
+        "  for dev in /dev/nvme1n1 /dev/xvdf /dev/sdf; do\n"
+        '    if [ -b "$dev" ]; then DEVICE="$dev"; break; fi\n'
+        "  done\n"
+        "fi\n"
+        'if [ -z "$DEVICE" ]; then\n'
+        '  echo "ERROR: Could not find EBS device" >&2\n'
+        "  exit 1\n"
+        "fi\n"
+        'echo "Found EBS device: $DEVICE"\n'
+        f"{format_cmd}"
+        f"sudo mkdir -p {mount_point}\n"
+        f'sudo mount "$DEVICE" {mount_point}\n'
+        f"sudo chown {user}:{user} {mount_point}\n"
+        "# Add fstab entry for reboot persistence\n"
+        'UUID=$(sudo blkid -s UUID -o value "$DEVICE")\n'
+        'if [ -n "$UUID" ]; then\n'
+        f'  if ! grep -q "$UUID" /etc/fstab; then\n'
+        f'    echo "UUID=$UUID {mount_point} ext4 defaults,nofail 0 2" | sudo tee -a /etc/fstab > /dev/null\n'
+        "  fi\n"
+        "fi\n"
+        f'echo "Mounted $DEVICE at {mount_point}"'
+    )
+
+    cmd = [
+        "ssh",
+        *ssh_opts,
+        *port_opts,
+        "-o",
+        "ConnectTimeout=10",
+        f"{user}@{host}",
+        remote_script,
+    ]
+
+    result = subprocess.run(cmd, capture_output=False)
+    return result.returncode == 0
+
+
+# ---------------------------------------------------------------------------
 # Internal helpers
 # ---------------------------------------------------------------------------
 

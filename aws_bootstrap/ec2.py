@@ -9,6 +9,10 @@ import click
 from .config import LaunchConfig
 
 
+EBS_DEVICE_NAME = "/dev/sdf"
+EBS_MOUNT_POINT = "/data"
+
+
 class CLIError(click.ClickException):
     """A ClickException that displays the error message in red."""
 
@@ -339,3 +343,127 @@ def wait_instance_ready(ec2_client, instance_id: str) -> dict:
     desc = ec2_client.describe_instances(InstanceIds=[instance_id])
     instance = desc["Reservations"][0]["Instances"][0]
     return instance
+
+
+# ---------------------------------------------------------------------------
+# EBS data volume operations
+# ---------------------------------------------------------------------------
+
+
+def create_ebs_volume(ec2_client, size_gb: int, availability_zone: str, tag_value: str, instance_id: str) -> str:
+    """Create a gp3 EBS volume and wait for it to become available.
+
+    Returns the volume ID.
+    """
+    response = ec2_client.create_volume(
+        AvailabilityZone=availability_zone,
+        Size=size_gb,
+        VolumeType="gp3",
+        TagSpecifications=[
+            {
+                "ResourceType": "volume",
+                "Tags": [
+                    {"Key": "created-by", "Value": tag_value},
+                    {"Key": "Name", "Value": f"aws-bootstrap-data-{instance_id}"},
+                    {"Key": "aws-bootstrap-instance", "Value": instance_id},
+                ],
+            }
+        ],
+    )
+    volume_id = response["VolumeId"]
+
+    waiter = ec2_client.get_waiter("volume_available")
+    waiter.wait(VolumeIds=[volume_id], WaiterConfig={"Delay": 5, "MaxAttempts": 24})
+    return volume_id
+
+
+def validate_ebs_volume(ec2_client, volume_id: str, availability_zone: str) -> dict:
+    """Validate that an existing EBS volume can be attached.
+
+    Checks that the volume exists, is available (not in-use), and is in the
+    correct availability zone. Returns the volume description dict.
+
+    Raises CLIError for validation failures.
+    """
+    try:
+        response = ec2_client.describe_volumes(VolumeIds=[volume_id])
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "InvalidVolume.NotFound":
+            raise CLIError(f"EBS volume not found: {volume_id}") from None
+        raise
+
+    volumes = response["Volumes"]
+    if not volumes:
+        raise CLIError(f"EBS volume not found: {volume_id}")
+
+    vol = volumes[0]
+
+    if vol["State"] != "available":
+        raise CLIError(
+            f"EBS volume {volume_id} is currently '{vol['State']}' (must be 'available').\n"
+            "  Detach it from its current instance first."
+        )
+
+    if vol["AvailabilityZone"] != availability_zone:
+        raise CLIError(
+            f"EBS volume {volume_id} is in {vol['AvailabilityZone']} "
+            f"but the instance is in {availability_zone}.\n"
+            "  EBS volumes must be in the same availability zone as the instance."
+        )
+
+    return vol
+
+
+def attach_ebs_volume(ec2_client, volume_id: str, instance_id: str, device_name: str = EBS_DEVICE_NAME) -> None:
+    """Attach an EBS volume to an instance and wait for it to be in-use."""
+    ec2_client.attach_volume(
+        VolumeId=volume_id,
+        InstanceId=instance_id,
+        Device=device_name,
+    )
+    waiter = ec2_client.get_waiter("volume_in_use")
+    waiter.wait(VolumeIds=[volume_id], WaiterConfig={"Delay": 5, "MaxAttempts": 24})
+
+
+def detach_ebs_volume(ec2_client, volume_id: str) -> None:
+    """Detach an EBS volume and wait for it to become available."""
+    ec2_client.detach_volume(VolumeId=volume_id)
+    waiter = ec2_client.get_waiter("volume_available")
+    waiter.wait(VolumeIds=[volume_id], WaiterConfig={"Delay": 5, "MaxAttempts": 24})
+
+
+def delete_ebs_volume(ec2_client, volume_id: str) -> None:
+    """Delete an EBS volume."""
+    ec2_client.delete_volume(VolumeId=volume_id)
+
+
+def find_ebs_volumes_for_instance(ec2_client, instance_id: str, tag_value: str) -> list[dict]:
+    """Find EBS data volumes associated with an instance via tags.
+
+    Returns a list of dicts with VolumeId, Size, Device, and State.
+    Excludes root volumes (only returns volumes tagged by aws-bootstrap).
+    """
+    try:
+        response = ec2_client.describe_volumes(
+            Filters=[
+                {"Name": "tag:aws-bootstrap-instance", "Values": [instance_id]},
+                {"Name": "tag:created-by", "Values": [tag_value]},
+            ]
+        )
+    except botocore.exceptions.ClientError:
+        return []
+
+    volumes = []
+    for vol in response.get("Volumes", []):
+        device = ""
+        if vol.get("Attachments"):
+            device = vol["Attachments"][0].get("Device", "")
+        volumes.append(
+            {
+                "VolumeId": vol["VolumeId"],
+                "Size": vol["Size"],
+                "Device": device,
+                "State": vol["State"],
+            }
+        )
+    return volumes

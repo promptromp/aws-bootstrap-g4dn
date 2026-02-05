@@ -25,7 +25,8 @@ ssh aws-gpu1                  # You're in, venv activated, PyTorch works
 | 📊 | **GPU benchmark included** | CNN (MNIST) + Transformer benchmarks with FP16/FP32/BF16 precision and tqdm progress |
 | 📓 | **Jupyter ready** | Lab server auto-starts as a systemd service on port 8888 — just SSH tunnel and open |
 | 🖥️ | **`status --gpu`** | Shows CUDA toolkit version, driver max, GPU architecture, spot pricing, uptime, and estimated cost |
-| 🗑️ | **Clean terminate** | Stops instances, removes SSH aliases, shows shutting-down state until fully gone |
+| 💾 | **EBS data volumes** | Attach persistent storage at `/data` — survives spot interruptions and termination, reattach to new instances |
+| 🗑️ | **Clean terminate** | Stops instances, removes SSH aliases, cleans up EBS volumes (or preserves with `--keep-ebs`) |
 
 ### 🎯 Target Workflows
 
@@ -113,16 +114,24 @@ aws-bootstrap launch --python-version 3.13
 # Use a non-default SSH port
 aws-bootstrap launch --ssh-port 2222
 
+# Attach a persistent EBS data volume (96 GB gp3, mounted at /data)
+aws-bootstrap launch --ebs-storage 96
+
+# Reattach an existing EBS volume from a previous instance
+aws-bootstrap launch --ebs-volume-id vol-0abc123def456
+
 # Use a specific AWS profile
 aws-bootstrap launch --profile my-aws-profile
 ```
 
 After launch, the CLI:
 
-1. **Adds an SSH alias** (e.g. `aws-gpu1`) to `~/.ssh/config`
-2. **Runs remote setup** — installs utilities, creates a Python venv, installs CUDA-matched PyTorch, sets up Jupyter
-3. **Runs a CUDA smoke test** — verifies `torch.cuda.is_available()` and runs a quick GPU matmul
-4. **Prints connection commands** — SSH, Jupyter tunnel, GPU benchmark, and terminate
+1. **Creates/attaches EBS volume** (if `--ebs-storage` or `--ebs-volume-id` was specified)
+2. **Adds an SSH alias** (e.g. `aws-gpu1`) to `~/.ssh/config`
+3. **Runs remote setup** — installs utilities, creates a Python venv, installs CUDA-matched PyTorch, sets up Jupyter
+4. **Mounts EBS volume** at `/data` (if applicable — formats new volumes, mounts existing ones as-is)
+5. **Runs a CUDA smoke test** — verifies `torch.cuda.is_available()` and runs a quick GPU matmul
+6. **Prints connection commands** — SSH, Jupyter tunnel, GPU benchmark, and terminate
 
 ```bash
 ssh aws-gpu1                  # venv auto-activates on login
@@ -135,7 +144,7 @@ The setup script runs automatically on the instance after SSH becomes available:
 | Step | What |
 |------|------|
 | **GPU verify** | Confirms `nvidia-smi` and `nvcc` are working |
-| **Utilities** | Installs `htop`, `tmux`, `tree`, `jq` |
+| **Utilities** | Installs `htop`, `tmux`, `tree`, `jq`, `ffmpeg` |
 | **Python venv** | Creates `~/venv` with `uv`, auto-activates in `~/.bashrc`. Use `--python-version` to pin a specific Python (e.g. `3.13`) |
 | **CUDA-aware PyTorch** | Detects CUDA toolkit version → installs PyTorch from the matching `cu{TAG}` wheel index |
 | **CUDA smoke test** | Runs `torch.cuda.is_available()` + GPU matmul to verify the stack |
@@ -242,6 +251,9 @@ aws-bootstrap status --region us-east-1
 # Terminate all aws-bootstrap instances (with confirmation prompt)
 aws-bootstrap terminate
 
+# Terminate but preserve EBS data volumes for reuse
+aws-bootstrap terminate --keep-ebs
+
 # Terminate by SSH alias (resolved via ~/.ssh/config)
 aws-bootstrap terminate aws-gpu1
 
@@ -262,6 +274,31 @@ CUDA: 12.8 (driver supports up to 13.0)
 ```
 
 SSH aliases are managed automatically — they're created on `launch`, shown in `status`, and cleaned up on `terminate`. Aliases use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and never reuse numbers from previous instances. You can use aliases anywhere you'd use an instance ID, e.g. `aws-bootstrap terminate aws-gpu1`.
+
+## EBS Data Volumes
+
+Attach persistent EBS storage to keep datasets and model checkpoints across instance lifecycles. Volumes are mounted at `/data` and persist independently of the instance.
+
+```bash
+# Create a new 96 GB gp3 volume, formatted and mounted at /data
+aws-bootstrap launch --ebs-storage 96
+
+# After terminating with --keep-ebs, reattach the same volume to a new instance
+aws-bootstrap terminate --keep-ebs
+# Output: Preserving EBS volume: vol-0abc123...
+#         Reattach with: aws-bootstrap launch --ebs-volume-id vol-0abc123...
+
+aws-bootstrap launch --ebs-volume-id vol-0abc123def456
+```
+
+Key behaviors:
+- `--ebs-storage` and `--ebs-volume-id` are mutually exclusive
+- New volumes are formatted as ext4; existing volumes are mounted as-is
+- Volumes are tagged for automatic discovery by `status` and `terminate`
+- `terminate` deletes data volumes by default; use `--keep-ebs` to preserve them
+- **Spot-safe** — data volumes survive spot interruptions. If AWS reclaims your instance, the volume detaches automatically and can be reattached to a new instance with `--ebs-volume-id`
+- EBS volumes must be in the same availability zone as the instance
+- Mount failures are non-fatal — the instance remains usable
 
 ## EC2 vCPU Quotas
 

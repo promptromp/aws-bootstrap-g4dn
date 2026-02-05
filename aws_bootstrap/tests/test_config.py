@@ -20,6 +20,12 @@ def test_defaults():
     assert config.dry_run is False
 
 
+def test_ebs_fields_default_none():
+    config = LaunchConfig()
+    assert config.ebs_storage is None
+    assert config.ebs_volume_id is None
+
+
 def test_overrides():
     config = LaunchConfig(
         instance_type="g5.xlarge",
@@ -33,3 +39,15 @@ def test_overrides():
     assert config.spot is False
     assert config.volume_size == 200
     assert config.key_path == Path("/tmp/test.pub")
+
+
+def test_ebs_storage_override():
+    config = LaunchConfig(ebs_storage=96)
+    assert config.ebs_storage == 96
+    assert config.ebs_volume_id is None
+
+
+def test_ebs_volume_id_override():
+    config = LaunchConfig(ebs_volume_id="vol-abc123")
+    assert config.ebs_volume_id == "vol-abc123"
+    assert config.ebs_storage is None

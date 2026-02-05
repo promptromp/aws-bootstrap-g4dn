@@ -49,7 +49,7 @@ fi
 echo ""
 echo "[2/6] Installing utilities..."
 sudo DEBIAN_FRONTEND=noninteractive apt-get update -qq
-sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq htop tmux tree jq
+sudo DEBIAN_FRONTEND=noninteractive apt-get install -y -qq htop tmux tree jq ffmpeg
 
 # 3. Set up Python environment with uv
 echo ""
