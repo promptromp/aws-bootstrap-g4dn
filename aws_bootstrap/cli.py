@@ -29,6 +29,8 @@ from .ec2 import (
 )
 from .ssh import (
     add_ssh_host,
+    cleanup_stale_ssh_hosts,
+    find_stale_ssh_hosts,
     get_ssh_host_details,
     import_key_pair,
     list_ssh_hosts,
@@ -600,6 +602,49 @@ def terminate(region, profile, yes, keep_ebs, instance_ids):
 
     click.echo()
     success(f"Terminated {len(changes)} instance(s).")
+
+
+@main.command()
+@click.option("--dry-run", is_flag=True, default=False, help="Show what would be removed without removing.")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
+@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+def cleanup(dry_run, yes, region, profile):
+    """Remove stale SSH config entries for terminated instances."""
+    session = boto3.Session(profile_name=profile, region_name=region)
+    ec2 = session.client("ec2")
+
+    live_instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
+    live_ids = {inst["InstanceId"] for inst in live_instances}
+
+    stale = find_stale_ssh_hosts(live_ids)
+    if not stale:
+        click.secho("No stale SSH config entries found.", fg="green")
+        return
+
+    click.secho(f"\n  Found {len(stale)} stale SSH config entry(ies):\n", bold=True, fg="cyan")
+    for iid, alias in stale:
+        click.echo("  " + click.style(alias, fg="bright_white") + f"  ({iid})")
+
+    if dry_run:
+        click.echo()
+        for iid, alias in stale:
+            info(f"Would remove {alias} ({iid})")
+        return
+
+    if not yes:
+        click.echo()
+        if not click.confirm(f"  Remove {len(stale)} stale entry(ies)?"):
+            click.secho("  Cancelled.", fg="yellow")
+            return
+
+    results = cleanup_stale_ssh_hosts(live_ids)
+    click.echo()
+    for r in results:
+        success(f"Removed {r.alias} ({r.instance_id})")
+
+    click.echo()
+    success(f"Cleaned up {len(results)} stale entry(ies).")
 
 
 # ---------------------------------------------------------------------------

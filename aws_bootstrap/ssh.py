@@ -374,6 +374,37 @@ def list_ssh_hosts(config_path: Path | None = None) -> dict[str, str]:
     return result
 
 
+def find_stale_ssh_hosts(live_instance_ids: set[str], config_path: Path | None = None) -> list[tuple[str, str]]:
+    """Identify SSH config entries whose instances no longer exist.
+
+    Returns ``[(instance_id, alias), ...]`` for entries where the instance ID
+    is **not** in *live_instance_ids*, sorted by alias.
+    """
+    hosts = list_ssh_hosts(config_path)
+    stale = [(iid, alias) for iid, alias in hosts.items() if iid not in live_instance_ids]
+    stale.sort(key=lambda t: t[1])
+    return stale
+
+
+def cleanup_stale_ssh_hosts(
+    live_instance_ids: set[str],
+    config_path: Path | None = None,
+    dry_run: bool = False,
+) -> list[CleanupResult]:
+    """Remove SSH config entries for terminated/non-existent instances.
+
+    If *dry_run* is ``True``, entries are identified but not removed.
+    Returns a list of :class:`CleanupResult` objects.
+    """
+    stale = find_stale_ssh_hosts(live_instance_ids, config_path)
+    results: list[CleanupResult] = []
+    for iid, alias in stale:
+        if not dry_run:
+            remove_ssh_host(iid, config_path)
+        results.append(CleanupResult(instance_id=iid, alias=alias, removed=not dry_run))
+    return results
+
+
 _INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 
 
@@ -400,6 +431,15 @@ def resolve_instance_id(value: str, config_path: Path | None = None) -> str | No
         if alias == value:
             return iid
     return None
+
+
+@dataclass
+class CleanupResult:
+    """Result of cleaning up a single stale SSH config entry."""
+
+    instance_id: str
+    alias: str
+    removed: bool
 
 
 @dataclass

@@ -10,7 +10,7 @@ from click.testing import CliRunner
 
 from aws_bootstrap.cli import main
 from aws_bootstrap.gpu import GpuInfo
-from aws_bootstrap.ssh import SSHHostDetails
+from aws_bootstrap.ssh import CleanupResult, SSHHostDetails
 
 
 def test_help():
@@ -1203,3 +1203,54 @@ def test_status_shows_ebs_volumes(mock_find, mock_spot_price, mock_session, mock
     assert "vol-data1" in result.output
     assert "96 GB" in result.output
     assert "/data" in result.output
+
+
+# ---------------------------------------------------------------------------
+# cleanup subcommand
+# ---------------------------------------------------------------------------
+
+
+def test_cleanup_help():
+    runner = CliRunner()
+    result = runner.invoke(main, ["cleanup", "--help"])
+    assert result.exit_code == 0
+    assert "--dry-run" in result.output
+    assert "--yes" in result.output
+    assert "--region" in result.output
+    assert "--profile" in result.output
+
+
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_no_stale(mock_find, mock_session, mock_stale):
+    runner = CliRunner()
+    result = runner.invoke(main, ["cleanup"])
+    assert result.exit_code == 0
+    assert "No stale" in result.output
+
+
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[("i-dead1234", "aws-gpu1")])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_dry_run(mock_find, mock_session, mock_stale):
+    runner = CliRunner()
+    result = runner.invoke(main, ["cleanup", "--dry-run"])
+    assert result.exit_code == 0
+    assert "Would remove" in result.output
+    assert "aws-gpu1" in result.output
+    assert "i-dead1234" in result.output
+
+
+@patch("aws_bootstrap.cli.cleanup_stale_ssh_hosts")
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[("i-dead1234", "aws-gpu1")])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_with_yes(mock_find, mock_session, mock_stale, mock_cleanup):
+    mock_cleanup.return_value = [CleanupResult(instance_id="i-dead1234", alias="aws-gpu1", removed=True)]
+    runner = CliRunner()
+    result = runner.invoke(main, ["cleanup", "--yes"])
+    assert result.exit_code == 0
+    assert "Removed aws-gpu1" in result.output
+    assert "Cleaned up 1" in result.output
+    mock_cleanup.assert_called_once()
