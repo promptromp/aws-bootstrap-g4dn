@@ -3,14 +3,14 @@
 from __future__ import annotations
 import json
 from datetime import datetime
-from enum import Enum
+from enum import StrEnum
 from pathlib import Path
 from typing import Any
 
 import click
 
 
-class OutputFormat(str, Enum):
+class OutputFormat(StrEnum):
     TEXT = "text"
     JSON = "json"
     YAML = "yaml"
