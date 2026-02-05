@@ -4,10 +4,16 @@ A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin that prov
 
 ## Installation
 
-### From the marketplace
+### From GitHub
+
+Register this repository as a plugin marketplace, then install:
 
 ```bash
-claude plugin install aws-bootstrap-skill
+# Add the marketplace (one-time setup)
+/plugin marketplace add promptromp/aws-bootstrap-g4dn
+
+# Install the plugin
+/plugin install aws-bootstrap-skill@promptromp-aws-bootstrap-g4dn
 ```
 
 ### Local install (from repo checkout)
