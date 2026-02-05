@@ -213,6 +213,30 @@ Then install the [Nsight VSCE extension](https://marketplace.visualstudio.com/it
 
 See [Nsight remote profiling guide](docs/nsight-remote-profiling.md) for more details on CUDA debugging and profiling workflows.
 
+### 📤 Structured Output
+
+All commands support `--output` / `-o` for machine-readable output — useful for scripting, piping to `jq`, or LLM tool-use:
+
+```bash
+# JSON output (pipe to jq)
+aws-bootstrap -o json status
+aws-bootstrap -o json status | jq '.instances[0].instance_id'
+
+# YAML output
+aws-bootstrap -o yaml status
+
+# Table output
+aws-bootstrap -o table status
+
+# Works with all commands
+aws-bootstrap -o json list instance-types | jq '.[].instance_type'
+aws-bootstrap -o json launch --dry-run
+aws-bootstrap -o json terminate --yes
+aws-bootstrap -o json cleanup --dry-run
+```
+
+Supported formats: `text` (default, human-readable with color), `json`, `yaml`, `table`. Commands that require confirmation (`terminate`, `cleanup`) require `--yes` in structured output modes.
+
 ### 📋 Listing Resources
 
 ```bash
