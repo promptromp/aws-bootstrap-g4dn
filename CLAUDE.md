@@ -136,9 +136,11 @@ Volumes are tagged for discovery by `status` and `terminate`:
 
 On Nitro instances (g4dn), `/dev/sdf` is remapped to `/dev/nvmeXn1`. The mount script detects the correct device by matching the volume ID serial number via `lsblk -o NAME,SERIAL -dpn`, with fallbacks to `/dev/nvme1n1`, `/dev/xvdf`, `/dev/sdf`.
 
-### Terminate cleanup
+### Spot interruption and terminate cleanup
 
-Non-root EBS volumes attached via API do **not** auto-delete on termination. The `terminate` command discovers volumes via `find_ebs_volumes_for_instance`, waits for them to detach (becomes `available`), then deletes them. `--keep-ebs` skips deletion and prints the volume ID with a reattach command.
+Non-root EBS volumes attached via API have `DeleteOnTermination=False` by default. This means data volumes **survive spot interruptions** — when AWS reclaims the instance, the volume detaches and becomes `available`, preserving all data. The user can reattach it to a new instance with `--ebs-volume-id`.
+
+The `terminate` command discovers volumes via `find_ebs_volumes_for_instance`, waits for them to detach (becomes `available`), then deletes them. `--keep-ebs` skips deletion and prints the volume ID with a reattach command.
 
 ## Versioning & Publishing
 

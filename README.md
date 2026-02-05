@@ -25,7 +25,7 @@ ssh aws-gpu1                  # You're in, venv activated, PyTorch works
 | 📊 | **GPU benchmark included** | CNN (MNIST) + Transformer benchmarks with FP16/FP32/BF16 precision and tqdm progress |
 | 📓 | **Jupyter ready** | Lab server auto-starts as a systemd service on port 8888 — just SSH tunnel and open |
 | 🖥️ | **`status --gpu`** | Shows CUDA toolkit version, driver max, GPU architecture, spot pricing, uptime, and estimated cost |
-| 💾 | **EBS data volumes** | Attach persistent storage at `/data` — survives termination with `--keep-ebs`, reattach to new instances |
+| 💾 | **EBS data volumes** | Attach persistent storage at `/data` — survives spot interruptions and termination, reattach to new instances |
 | 🗑️ | **Clean terminate** | Stops instances, removes SSH aliases, cleans up EBS volumes (or preserves with `--keep-ebs`) |
 
 ### 🎯 Target Workflows
@@ -296,6 +296,7 @@ Key behaviors:
 - New volumes are formatted as ext4; existing volumes are mounted as-is
 - Volumes are tagged for automatic discovery by `status` and `terminate`
 - `terminate` deletes data volumes by default; use `--keep-ebs` to preserve them
+- **Spot-safe** — data volumes survive spot interruptions. If AWS reclaims your instance, the volume detaches automatically and can be reattached to a new instance with `--ebs-volume-id`
 - EBS volumes must be in the same availability zone as the instance
 - Mount failures are non-fatal — the instance remains usable
 
