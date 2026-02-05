@@ -1096,13 +1096,16 @@ def quota_show(ctx, family, region, profile):
             click.echo(f"    Code: {q['quota_code']}")
             click.echo()
 
+    example_family = family or "gvt"
     click.echo(
         "  " + click.style("Tip: ", fg="bright_black") + click.style("g4dn.xlarge requires 4 vCPUs", fg="bright_black")
     )
     click.echo(
         "  "
         + click.style("To request an increase: ", fg="bright_black")
-        + click.style("aws-bootstrap quota request --type spot --desired-value 4", fg="bright_black")
+        + click.style(
+            f"aws-bootstrap quota request --family {example_family} --type spot --desired-value 4", fg="bright_black"
+        )
     )
     click.echo()
 
