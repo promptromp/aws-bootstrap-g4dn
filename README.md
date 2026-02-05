@@ -27,6 +27,7 @@ ssh aws-gpu1                  # You're in, venv activated, PyTorch works
 | 🖥️ | **`status --gpu`** | Shows CUDA toolkit version, driver max, GPU architecture, spot pricing, uptime, and estimated cost |
 | 💾 | **EBS data volumes** | Attach persistent storage at `/data` — survives spot interruptions and termination, reattach to new instances |
 | 🗑️ | **Clean terminate** | Stops instances, removes SSH aliases, cleans up EBS volumes (or preserves with `--keep-ebs`) |
+| 🤖 | **[Agent Skill](https://agentskills.io/)** | Included Claude Code plugin lets LLM agents autonomously provision, manage, and tear down GPU instances |
 
 ### 🎯 Target Workflows
 
@@ -401,6 +402,24 @@ Small increases (4-8 vCPUs) are typically auto-approved within minutes. You can 
 ```bash
 aws-bootstrap launch --instance-type t3.medium --ami-filter "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
 ```
+
+## Claude Code Plugin
+
+A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin is included in the [`aws-bootstrap-skill/`](aws-bootstrap-skill/) directory, enabling LLM coding agents to autonomously provision and manage GPU instances.
+
+### Install from marketplace
+
+```bash
+claude plugin install aws-bootstrap-skill
+```
+
+### Install locally (from repo checkout)
+
+```bash
+claude --plugin-dir ./aws-bootstrap-skill
+```
+
+See [`aws-bootstrap-skill/README.md`](aws-bootstrap-skill/README.md) for details.
 
 ## Additional Resources
 
