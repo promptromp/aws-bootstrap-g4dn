@@ -1,0 +1,12 @@
+{
+  "name": "aws-bootstrap-skill",
+  "description": "Provision and manage AWS EC2 GPU instances for ML/CUDA development via the aws-bootstrap CLI",
+  "version": "0.1.0",
+  "author": {
+    "name": "promptromp"
+  },
+  "homepage": "https://github.com/promptromp/aws-bootstrap-g4dn",
+  "repository": "https://github.com/promptromp/aws-bootstrap-g4dn",
+  "license": "MIT",
+  "keywords": ["aws", "ec2", "gpu", "cuda", "ml", "spot-instances", "g4dn"]
+}

@@ -402,6 +402,24 @@ Small increases (4-8 vCPUs) are typically auto-approved within minutes. You can 
 aws-bootstrap launch --instance-type t3.medium --ami-filter "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
 ```
 
+## Claude Code Plugin
+
+A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin is included in the [`aws-bootstrap-skill/`](aws-bootstrap-skill/) directory, enabling LLM coding agents to autonomously provision and manage GPU instances.
+
+### Install from marketplace
+
+```bash
+claude plugin install aws-bootstrap-skill
+```
+
+### Install locally (from repo checkout)
+
+```bash
+claude --plugin-dir ./aws-bootstrap-skill
+```
+
+See [`aws-bootstrap-skill/README.md`](aws-bootstrap-skill/README.md) for details.
+
 ## Additional Resources
 
 | Topic | Link |

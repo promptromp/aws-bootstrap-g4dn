@@ -1,0 +1,17 @@
+{
+  "name": "aws-bootstrap-skill",
+  "owner": {
+    "name": "promptromp"
+  },
+  "metadata": {
+    "description": "Claude Code skill for provisioning and managing AWS GPU instances via the aws-bootstrap CLI",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "aws-bootstrap-skill",
+      "source": "./aws-bootstrap-skill/",
+      "description": "Provision, monitor, and tear down AWS EC2 GPU instances for ML/CUDA development"
+    }
+  ]
+}

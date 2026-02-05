@@ -60,6 +60,17 @@ aws_bootstrap/
 docs/
     nsight-remote-profiling.md # Nsight Compute, Nsight Systems, and Nsight VSCE remote profiling guide
     spot-request-lifecycle.md  # Research notes on spot request cleanup
+aws-bootstrap-skill/             # Claude Code plugin
+    .claude-plugin/
+        plugin.json              # Plugin manifest (identity, metadata)
+    skills/
+        aws-bootstrap/
+            SKILL.md             # Main skill definition (quick reference, workflows, error handling)
+            references/
+                commands.md      # Full command reference with options and JSON output schemas
+    README.md                    # Plugin installation and usage
+.claude-plugin/
+    marketplace.json             # Marketplace discovery (points to aws-bootstrap-skill/)
 ```
 
 Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`)
