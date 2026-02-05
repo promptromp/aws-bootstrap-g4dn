@@ -79,11 +79,11 @@ def test_launch_instance_vcpu_limit_exceeded():
         launch_instance(ec2, config, "ami-test", "sg-test")
 
 
-def test_launch_instance_quota_error_includes_readme_hint():
+def test_launch_instance_quota_error_includes_quota_hint():
     ec2 = MagicMock()
     ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
     config = LaunchConfig(spot=True)
-    with pytest.raises(click.ClickException, match="README.md"):
+    with pytest.raises(click.ClickException, match="aws-bootstrap quota show"):
         launch_instance(ec2, config, "ami-test", "sg-test")
 
 

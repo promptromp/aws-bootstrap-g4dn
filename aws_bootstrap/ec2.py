@@ -197,8 +197,10 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
 _UBUNTU_AMI = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
 
 QUOTA_HINT = (
-    "See the 'EC2 vCPU Quotas' section in README.md for instructions on\n"
-    "  checking and requesting quota increases.\n\n"
+    "Check your current quotas with:\n"
+    "    aws-bootstrap quota show\n\n"
+    "  Request an increase with:\n"
+    "    aws-bootstrap quota request --type spot --desired-value 4\n\n"
     "  To test the flow without GPU quotas, try:\n"
     f'    aws-bootstrap launch --instance-type t3.medium --ami-filter "{_UBUNTU_AMI}"'
 )
