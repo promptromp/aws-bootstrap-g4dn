@@ -11,6 +11,7 @@ import yaml
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import main
+from aws_bootstrap.ec2 import CLIError
 from aws_bootstrap.gpu import GpuInfo
 from aws_bootstrap.ssh import CleanupResult, SSHHostDetails
 
@@ -1631,3 +1632,381 @@ def test_terminate_no_instances_json(mock_find, mock_session):
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data == {"terminated": []}
+
+
+# ---------------------------------------------------------------------------
+# quota subcommand
+# ---------------------------------------------------------------------------
+
+_SPOT_QUOTA = {
+    "quota_code": "L-3819A6DF",
+    "quota_name": "All G and VT Spot Instance Requests",
+    "value": 4.0,
+    "quota_type": "spot",
+    "family": "gvt",
+}
+
+_ON_DEMAND_QUOTA = {
+    "quota_code": "L-DB2E81BA",
+    "quota_name": "Running On-Demand G and VT instances",
+    "value": 0.0,
+    "quota_type": "on-demand",
+    "family": "gvt",
+}
+
+
+def test_quota_help():
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "--help"])
+    assert result.exit_code == 0
+    assert "show" in result.output
+    assert "request" in result.output
+    assert "history" in result.output
+
+
+def test_quota_show_help():
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "show", "--help"])
+    assert result.exit_code == 0
+    assert "--region" in result.output
+    assert "--profile" in result.output
+    assert "--family" in result.output
+
+
+def test_quota_request_help():
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "request", "--help"])
+    assert result.exit_code == 0
+    assert "--type" in result.output
+    assert "--desired-value" in result.output
+    assert "--yes" in result.output
+    assert "--family" in result.output
+
+
+def test_quota_history_help():
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "history", "--help"])
+    assert result.exit_code == 0
+    assert "--type" in result.output
+    assert "--status" in result.output
+    assert "--family" in result.output
+
+
+@patch("aws_bootstrap.cli.get_family_quotas")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_show_text(mock_session, mock_quotas):
+    mock_quotas.return_value = [_SPOT_QUOTA, _ON_DEMAND_QUOTA]
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "show", "--family", "gvt"])
+    assert result.exit_code == 0
+    assert "4" in result.output
+    assert "Spot" in result.output
+    assert "On-demand" in result.output
+
+
+@patch("aws_bootstrap.cli.get_family_quotas")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_show_json(mock_session, mock_quotas):
+    mock_quotas.return_value = [_SPOT_QUOTA, _ON_DEMAND_QUOTA]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "quota", "show", "--family", "gvt"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "quotas" in data
+    assert len(data["quotas"]) == 2
+    assert data["quotas"][0]["quota_code"] == "L-3819A6DF"
+    assert data["quotas"][0]["value"] == 4.0
+
+
+@patch("aws_bootstrap.cli.get_family_quotas")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_show_api_error(mock_session, mock_quotas):
+    mock_quotas.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "NoSuchResourceException", "Message": "not found"}},
+        "GetServiceQuota",
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "show", "--family", "gvt"])
+    assert result.exit_code != 0
+
+
+@patch("aws_bootstrap.cli.request_quota_increase")
+@patch("aws_bootstrap.cli.get_quota")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_request_with_yes(mock_session, mock_get, mock_request):
+    mock_get.return_value = {"quota_code": "L-3819A6DF", "quota_name": "Spot Quota", "value": 0.0}
+    mock_request.return_value = {
+        "request_id": "req-123",
+        "status": "PENDING",
+        "quota_code": "L-3819A6DF",
+        "quota_name": "Spot Quota",
+        "desired_value": 4.0,
+    }
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "request", "--type", "spot", "--desired-value", "4", "--yes"])
+    assert result.exit_code == 0
+    assert "submitted" in result.output
+    assert "req-123" in result.output
+    mock_request.assert_called_once()
+
+
+@patch("aws_bootstrap.cli.request_quota_increase")
+@patch("aws_bootstrap.cli.get_quota")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_request_with_confirm(mock_session, mock_get, mock_request):
+    mock_get.return_value = {"quota_code": "L-3819A6DF", "quota_name": "Spot Quota", "value": 0.0}
+    mock_request.return_value = {
+        "request_id": "req-123",
+        "status": "PENDING",
+        "quota_code": "L-3819A6DF",
+        "quota_name": "Spot Quota",
+        "desired_value": 4.0,
+    }
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "request", "--type", "spot", "--desired-value", "4"], input="y\n")
+    assert result.exit_code == 0
+    assert "submitted" in result.output
+    mock_request.assert_called_once()
+
+
+@patch("aws_bootstrap.cli.get_quota")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_request_cancelled(mock_session, mock_get):
+    mock_get.return_value = {"quota_code": "L-3819A6DF", "quota_name": "Spot Quota", "value": 0.0}
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "request", "--type", "spot", "--desired-value", "4"], input="n\n")
+    assert result.exit_code == 0
+    assert "Cancelled" in result.output
+
+
+@patch("aws_bootstrap.cli.request_quota_increase")
+@patch("aws_bootstrap.cli.get_quota")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_request_json(mock_session, mock_get, mock_request):
+    mock_get.return_value = {"quota_code": "L-3819A6DF", "quota_name": "Spot Quota", "value": 0.0}
+    mock_request.return_value = {
+        "request_id": "req-123",
+        "status": "PENDING",
+        "quota_code": "L-3819A6DF",
+        "quota_name": "Spot Quota",
+        "desired_value": 4.0,
+    }
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "quota", "request", "--type", "spot", "--desired-value", "4", "--yes"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["request_id"] == "req-123"
+    assert data["status"] == "PENDING"
+
+
+@patch("aws_bootstrap.cli.get_quota")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_request_json_requires_yes(mock_session, mock_get):
+    mock_get.return_value = {"quota_code": "L-3819A6DF", "quota_name": "Spot Quota", "value": 0.0}
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "quota", "request", "--type", "spot", "--desired-value", "4"])
+    assert result.exit_code != 0
+    assert "--yes is required" in result.output
+
+
+@patch("aws_bootstrap.cli.get_quota")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_request_desired_le_current(mock_session, mock_get):
+    mock_get.return_value = {"quota_code": "L-3819A6DF", "quota_name": "Spot Quota", "value": 4.0}
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "request", "--type", "spot", "--desired-value", "4", "--yes"])
+    assert result.exit_code != 0
+    assert "must be greater" in result.output
+
+
+@patch("aws_bootstrap.cli.request_quota_increase")
+@patch("aws_bootstrap.cli.get_quota")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_request_duplicate_pending(mock_session, mock_get, mock_request):
+    mock_get.return_value = {"quota_code": "L-3819A6DF", "quota_name": "Spot Quota", "value": 0.0}
+    mock_request.side_effect = CLIError("already pending")
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "request", "--type", "spot", "--desired-value", "4", "--yes"])
+    assert result.exit_code != 0
+    assert "already pending" in result.output
+
+
+@patch("aws_bootstrap.cli.get_quota_request_history")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_history_text(mock_session, mock_history):
+    mock_history.return_value = [
+        {
+            "request_id": "req-123",
+            "status": "APPROVED",
+            "quota_code": "L-3819A6DF",
+            "quota_name": "Spot Quota",
+            "desired_value": 4.0,
+            "created": "2025-06-01T00:00:00Z",
+        }
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "history", "--family", "gvt", "--type", "spot"])
+    assert result.exit_code == 0
+    assert "req-123" in result.output
+    assert "APPROVED" in result.output
+
+
+@patch("aws_bootstrap.cli.get_quota_request_history")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_history_json(mock_session, mock_history):
+    mock_history.return_value = [
+        {
+            "request_id": "req-123",
+            "status": "APPROVED",
+            "quota_code": "L-3819A6DF",
+            "quota_name": "Spot Quota",
+            "desired_value": 4.0,
+            "created": "2025-06-01T00:00:00Z",
+        }
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "quota", "history", "--family", "gvt", "--type", "spot"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "requests" in data
+    assert len(data["requests"]) == 1
+    assert data["requests"][0]["request_id"] == "req-123"
+
+
+@patch("aws_bootstrap.cli.get_quota_request_history")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_history_all_families(mock_session, mock_history):
+    """Without --type or --family, queries all families x all types."""
+    mock_history.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "history"])
+    assert result.exit_code == 0
+    # Should be called 4 times (2 families x 2 types each)
+    assert mock_history.call_count == 4
+
+
+@patch("aws_bootstrap.cli.get_quota_request_history")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_history_filter_by_status(mock_session, mock_history):
+    mock_history.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "history", "--family", "gvt", "--type", "spot", "--status", "APPROVED"])
+    assert result.exit_code == 0
+    mock_history.assert_called_once()
+    call_kwargs = mock_history.call_args[1]
+    assert call_kwargs["status_filter"] == "APPROVED"
+
+
+@patch("aws_bootstrap.cli.get_quota_request_history")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_history_empty_text(mock_session, mock_history):
+    mock_history.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "history", "--family", "gvt", "--type", "spot"])
+    assert result.exit_code == 0
+    assert "No quota increase requests found" in result.output
+
+
+@patch("aws_bootstrap.cli.get_quota_request_history")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_history_empty_json(mock_session, mock_history):
+    mock_history.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "quota", "history", "--family", "gvt", "--type", "spot"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data == {"requests": []}
+
+
+@patch("aws_bootstrap.cli.get_family_quotas")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_show_all_families(mock_session, mock_quotas):
+    """Without --family, shows all families."""
+    mock_quotas.side_effect = [
+        [_SPOT_QUOTA, _ON_DEMAND_QUOTA],
+        [
+            {"quota_code": "L-C4BD4855", "quota_name": "P5 Spot", "value": 0.0, "quota_type": "spot", "family": "p5"},
+            {
+                "quota_code": "L-417A185B",
+                "quota_name": "P On-Demand",
+                "value": 0.0,
+                "quota_type": "on-demand",
+                "family": "p5",
+            },
+        ],
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "quota", "show"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert len(data["quotas"]) == 4
+    assert mock_quotas.call_count == 2
+
+
+@patch("aws_bootstrap.cli.get_family_quotas")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_show_p5_family(mock_session, mock_quotas):
+    """--family p5 shows only P5 quotas."""
+    mock_quotas.return_value = [
+        {"quota_code": "L-C4BD4855", "quota_name": "P5 Spot", "value": 0.0, "quota_type": "spot", "family": "p5"},
+        {
+            "quota_code": "L-417A185B",
+            "quota_name": "P On-Demand",
+            "value": 0.0,
+            "quota_type": "on-demand",
+            "family": "p5",
+        },
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "quota", "show", "--family", "p5"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert len(data["quotas"]) == 2
+    assert data["quotas"][0]["quota_code"] == "L-C4BD4855"
+    mock_quotas.assert_called_once()
+
+
+@patch("aws_bootstrap.cli.request_quota_increase")
+@patch("aws_bootstrap.cli.get_quota")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_request_p5_family(mock_session, mock_get, mock_request):
+    mock_get.return_value = {"quota_code": "L-C4BD4855", "quota_name": "P5 Spot", "value": 0.0}
+    mock_request.return_value = {
+        "request_id": "req-p5",
+        "status": "PENDING",
+        "quota_code": "L-C4BD4855",
+        "quota_name": "P5 Spot",
+        "desired_value": 192.0,
+    }
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["quota", "request", "--family", "p5", "--type", "spot", "--desired-value", "192", "--yes"]
+    )
+    assert result.exit_code == 0
+    assert "req-p5" in result.output
+    # Verify the P5 spot quota code was used
+    mock_get.assert_called_once()
+    mock_request.assert_called_once()
+
+
+@patch("aws_bootstrap.cli.get_quota_request_history")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_history_family_filter(mock_session, mock_history):
+    """--family p5 queries only P5 quotas."""
+    mock_history.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "history", "--family", "p5"])
+    assert result.exit_code == 0
+    # Should be called twice (spot + on-demand for p5 only)
+    assert mock_history.call_count == 2
+
+
+@patch("aws_bootstrap.cli.get_quota_request_history")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_quota_history_family_and_type_filter(mock_session, mock_history):
+    """--family p5 --type spot queries only P5 spot."""
+    mock_history.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["quota", "history", "--family", "p5", "--type", "spot"])
+    assert result.exit_code == 0
+    assert mock_history.call_count == 1

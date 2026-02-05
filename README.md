@@ -351,33 +351,38 @@ AWS accounts have [service quotas](https://docs.aws.amazon.com/AWSEC2/latest/Use
 Check your current quotas (g4dn.xlarge requires at least 4 vCPUs):
 
 ```bash
-# Spot G/VT quota
+# Built-in: show all GPU family quotas (G/VT + P5)
+aws-bootstrap quota show
+
+# Show only G/VT family quotas
+aws-bootstrap quota show --family gvt
+
+# Show only P5 family quotas
+aws-bootstrap quota show --family p5
+
+# Or use the AWS CLI directly:
 aws service-quotas get-service-quota \
   --service-code ec2 \
   --quota-code L-3819A6DF \
-  --region us-west-2
-
-# On-Demand G/VT quota
-aws service-quotas get-service-quota \
-  --service-code ec2 \
-  --quota-code L-DB2BBE81 \
   --region us-west-2
 ```
 
 Request increases:
 
 ```bash
-# Spot — increase to 4 vCPUs
+# Built-in: request a G/VT spot quota increase (default family)
+aws-bootstrap quota request --type spot --desired-value 4
+
+# Request a P5 spot quota increase
+aws-bootstrap quota request --family p5 --type spot --desired-value 192
+
+# Check request status
+aws-bootstrap quota history
+
+# Or use the AWS CLI directly:
 aws service-quotas request-service-quota-increase \
   --service-code ec2 \
   --quota-code L-3819A6DF \
-  --desired-value 4 \
-  --region us-west-2
-
-# On-Demand — increase to 4 vCPUs
-aws service-quotas request-service-quota-increase \
-  --service-code ec2 \
-  --quota-code L-DB2BBE81 \
   --desired-value 4 \
   --region us-west-2
 ```
@@ -394,8 +399,13 @@ aws service-quotas list-service-quotas \
 ```
 
 Common quota codes:
-- `L-3819A6DF` — All G and VT **Spot** Instance Requests
-- `L-DB2BBE81` — Running **On-Demand** G and VT instances
+
+| Family | Type | Code | Description |
+|--------|------|------|-------------|
+| G/VT | Spot | `L-3819A6DF` | All G and VT Spot Instance Requests |
+| G/VT | On-Demand | `L-DB2E81BA` | Running On-Demand G and VT instances |
+| P5 | Spot | `L-C4BD4855` | All P5 Spot Instance Requests |
+| P5 | On-Demand | `L-417A185B` | Running On-Demand P instances (shared across P2-P5) |
 
 Small increases (4-8 vCPUs) are typically auto-approved within minutes. You can also request increases via the [Service Quotas console](https://console.aws.amazon.com/servicequotas/home). While waiting, you can test the full launch/poll/SSH flow with a non-GPU instance type:
 

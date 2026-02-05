@@ -289,6 +289,135 @@ aws-bootstrap list amis [OPTIONS]
 
 ---
 
+## `aws-bootstrap quota show`
+
+Show current spot and on-demand vCPU quota values for GPU instance families.
+
+```
+aws-bootstrap quota show [OPTIONS]
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--family` | `gvt\|p5` | all | Instance family to show |
+
+Supported families: `gvt` (G and VT: g4dn, g5, g6, vt1), `p5` (P5: p5.48xlarge).
+
+### JSON Output
+
+```json
+{
+  "quotas": [
+    {
+      "family": "gvt",
+      "quota_type": "spot",
+      "quota_code": "L-3819A6DF",
+      "quota_name": "All G and VT Spot Instance Requests",
+      "value": 4.0
+    },
+    {
+      "family": "gvt",
+      "quota_type": "on-demand",
+      "quota_code": "L-DB2E81BA",
+      "quota_name": "Running On-Demand G and VT instances",
+      "value": 0.0
+    },
+    {
+      "family": "p5",
+      "quota_type": "spot",
+      "quota_code": "L-C4BD4855",
+      "quota_name": "All P5 Spot Instance Requests",
+      "value": 0.0
+    },
+    {
+      "family": "p5",
+      "quota_type": "on-demand",
+      "quota_code": "L-417A185B",
+      "quota_name": "Running On-Demand P instances",
+      "value": 0.0
+    }
+  ]
+}
+```
+
+---
+
+## `aws-bootstrap quota request`
+
+Request a vCPU quota increase for a GPU instance family.
+
+```
+aws-bootstrap quota request [OPTIONS]
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--family` | `gvt\|p5` | `gvt` | Instance family |
+| `--type` | `spot\|on-demand` | required | Quota type to increase |
+| `--desired-value` | float | required | Desired quota value (vCPUs) |
+| `--yes` / `-y` | flag | false | Skip confirmation prompt (required for `--output json/yaml/table`) |
+
+### JSON Output
+
+```json
+{
+  "request_id": "abc123-def456",
+  "status": "PENDING",
+  "quota_code": "L-3819A6DF",
+  "quota_name": "All G and VT Spot Instance Requests",
+  "desired_value": 4.0,
+  "quota_type": "spot",
+  "family": "gvt"
+}
+```
+
+Field `case_id` is included when a support case is opened.
+
+---
+
+## `aws-bootstrap quota history`
+
+Show history of vCPU quota increase requests for GPU instance families.
+
+```
+aws-bootstrap quota history [OPTIONS]
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--family` | `gvt\|p5` | all | Filter by instance family |
+| `--type` | `spot\|on-demand` | both | Filter by quota type |
+| `--status` | `PENDING\|CASE_OPENED\|APPROVED\|DENIED\|CASE_CLOSED\|NOT_APPROVED` | all | Filter by request status |
+
+### JSON Output
+
+```json
+{
+  "requests": [
+    {
+      "request_id": "abc123-def456",
+      "status": "APPROVED",
+      "family": "gvt",
+      "quota_type": "spot",
+      "quota_code": "L-3819A6DF",
+      "quota_name": "All G and VT Spot Instance Requests",
+      "desired_value": 4.0,
+      "created": "2025-06-01T00:00:00+00:00"
+    }
+  ]
+}
+```
+
+Requests are sorted newest-first. Field `case_id` is included when a support case is associated.
+
+---
+
 ## Notes
 
 - **SSH aliases** use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and are managed in `~/.ssh/config`

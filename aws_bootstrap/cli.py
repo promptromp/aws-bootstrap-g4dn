@@ -29,6 +29,14 @@ from .ec2 import (
     wait_instance_ready,
 )
 from .output import OutputFormat, emit, is_text
+from .quota import (
+    QUOTA_FAMILIES,
+    QUOTA_FAMILY_LABELS,
+    get_family_quotas,
+    get_quota,
+    get_quota_request_history,
+    request_quota_increase,
+)
 from .ssh import (
     add_ssh_host,
     cleanup_stale_ssh_hosts,
@@ -1023,5 +1031,240 @@ def list_amis_cmd(ctx, ami_filter, region, profile):
     for ami in amis:
         click.echo("  " + click.style(ami["ImageId"], fg="bright_white") + "  " + ami["CreationDate"][:10])
         click.echo(f"    {ami['Name']}")
+
+    click.echo()
+
+
+# ---------------------------------------------------------------------------
+# quota command group
+# ---------------------------------------------------------------------------
+
+
+@main.group()
+def quota():
+    """Manage EC2 GPU vCPU service quotas."""
+
+
+@quota.command(name="show")
+@click.option(
+    "--family",
+    default=None,
+    type=click.Choice(list(QUOTA_FAMILIES.keys()), case_sensitive=False),
+    help="Instance family to show (default: all).",
+)
+@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.pass_context
+def quota_show(ctx, family, region, profile):
+    """Show current spot and on-demand vCPU quota values."""
+    session = boto3.Session(profile_name=profile, region_name=region)
+    sq = session.client("service-quotas")
+
+    families = [family] if family else list(QUOTA_FAMILIES.keys())
+    all_quotas: list[dict] = []
+    for fam in families:
+        all_quotas.extend(get_family_quotas(sq, fam))
+
+    if not is_text(ctx):
+        emit(
+            {"quotas": all_quotas},
+            headers={
+                "family": "Family",
+                "quota_type": "Type",
+                "quota_code": "Quota Code",
+                "quota_name": "Name",
+                "value": "Value (vCPUs)",
+            },
+            ctx=ctx,
+        )
+        return
+
+    click.secho("\n  EC2 GPU vCPU Quotas:\n", bold=True, fg="cyan")
+    for fam in families:
+        fam_quotas = [q for q in all_quotas if q["family"] == fam]
+        if len(families) > 1:
+            click.secho(f"  {QUOTA_FAMILY_LABELS[fam]}:", bold=True)
+        for q in fam_quotas:
+            label = q["quota_type"].capitalize()
+            click.echo(
+                "  "
+                + click.style(f"{label:<12}", fg="bright_white")
+                + click.style(f"{q['value']:.0f}", fg="green", bold=True)
+                + " vCPUs"
+            )
+            click.echo(f"    {q['quota_name']}")
+            click.echo(f"    Code: {q['quota_code']}")
+            click.echo()
+
+    click.echo(
+        "  " + click.style("Tip: ", fg="bright_black") + click.style("g4dn.xlarge requires 4 vCPUs", fg="bright_black")
+    )
+    click.echo()
+
+
+@quota.command(name="request")
+@click.option(
+    "--family",
+    default="gvt",
+    show_default=True,
+    type=click.Choice(list(QUOTA_FAMILIES.keys()), case_sensitive=False),
+    help="Instance family.",
+)
+@click.option(
+    "--type",
+    "quota_type",
+    required=True,
+    type=click.Choice(["spot", "on-demand"], case_sensitive=False),
+    help="Quota type to increase.",
+)
+@click.option("--desired-value", required=True, type=float, help="Desired quota value (vCPUs).")
+@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
+@click.pass_context
+def quota_request(ctx, family, quota_type, desired_value, region, profile, yes):
+    """Request a vCPU quota increase."""
+    # In structured output modes, require --yes
+    if not is_text(ctx) and not yes:
+        raise CLIError("--yes is required when using structured output (--output json/yaml/table).")
+
+    session = boto3.Session(profile_name=profile, region_name=region)
+    sq = session.client("service-quotas")
+
+    quota_code = QUOTA_FAMILIES[family][quota_type]
+
+    # Show current value
+    current = get_quota(sq, quota_code)
+
+    if desired_value <= current["value"]:
+        raise CLIError(
+            f"Desired value ({desired_value:.0f}) must be greater than current value ({current['value']:.0f})."
+        )
+
+    if is_text(ctx):
+        click.echo()
+        val("Quota", current["quota_name"])
+        val("Family", QUOTA_FAMILY_LABELS[family])
+        val("Current value", f"{current['value']:.0f} vCPUs")
+        val("Requested value", f"{desired_value:.0f} vCPUs")
+        click.echo()
+
+    if not yes and not click.confirm(f"  Request increase from {current['value']:.0f} to {desired_value:.0f} vCPUs?"):
+        click.secho("  Cancelled.", fg="yellow")
+        return
+
+    result = request_quota_increase(sq, quota_code, desired_value)
+    result["quota_type"] = quota_type
+    result["family"] = family
+
+    if not is_text(ctx):
+        emit(result, ctx=ctx)
+        return
+
+    click.echo()
+    success("Quota increase request submitted.")
+    val("Request ID", result["request_id"])
+    val("Status", result["status"])
+    if result.get("case_id"):
+        val("Support case", result["case_id"])
+    click.echo()
+    info("Track status with: aws-bootstrap quota history")
+    click.echo()
+
+
+@quota.command(name="history")
+@click.option(
+    "--family",
+    default=None,
+    type=click.Choice(list(QUOTA_FAMILIES.keys()), case_sensitive=False),
+    help="Filter by instance family (default: all).",
+)
+@click.option(
+    "--type",
+    "quota_type",
+    default=None,
+    type=click.Choice(["spot", "on-demand"], case_sensitive=False),
+    help="Filter by quota type (spot or on-demand).",
+)
+@click.option(
+    "--status",
+    "status_filter",
+    default=None,
+    type=click.Choice(
+        ["PENDING", "CASE_OPENED", "APPROVED", "DENIED", "CASE_CLOSED", "NOT_APPROVED"],
+        case_sensitive=False,
+    ),
+    help="Filter by request status.",
+)
+@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.pass_context
+def quota_history(ctx, family, quota_type, status_filter, region, profile):
+    """Show history of vCPU quota increase requests."""
+    session = boto3.Session(profile_name=profile, region_name=region)
+    sq = session.client("service-quotas")
+
+    # Normalize status filter to uppercase for the API
+    resolved_status = status_filter.upper() if status_filter else None
+
+    # Determine which families and types to query
+    families = [family] if family else list(QUOTA_FAMILIES.keys())
+
+    all_requests: list[dict] = []
+    for fam in families:
+        codes = QUOTA_FAMILIES[fam]
+        for qt, qc in codes.items():
+            if quota_type and qt != quota_type:
+                continue
+            requests = get_quota_request_history(sq, qc, status_filter=resolved_status)
+            for r in requests:
+                r["quota_type"] = qt
+                r["family"] = fam
+            all_requests.extend(requests)
+
+    # Sort merged results newest-first
+    all_requests.sort(key=lambda r: r["created"], reverse=True)
+
+    if not is_text(ctx):
+        emit(
+            {"requests": all_requests},
+            headers={
+                "request_id": "Request ID",
+                "family": "Family",
+                "quota_type": "Type",
+                "status": "Status",
+                "desired_value": "Requested vCPUs",
+                "created": "Created",
+            },
+            ctx=ctx,
+        )
+        return
+
+    if not all_requests:
+        click.secho("No quota increase requests found.", fg="yellow")
+        return
+
+    click.secho(f"\n  {len(all_requests)} quota increase request(s):\n", bold=True, fg="cyan")
+
+    for r in all_requests:
+        status_color = {
+            "APPROVED": "green",
+            "PENDING": "yellow",
+            "CASE_OPENED": "yellow",
+            "DENIED": "red",
+            "NOT_APPROVED": "red",
+            "CASE_CLOSED": "bright_black",
+        }.get(r["status"], "white")
+
+        click.echo(
+            "  " + click.style(r["request_id"], fg="bright_white") + "  " + click.style(r["status"], fg=status_color)
+        )
+        val("    Family", r["family"])
+        val("    Type", r["quota_type"])
+        val("    Requested", f"{r['desired_value']:.0f} vCPUs")
+        val("    Created", str(r["created"]))
+        if r.get("case_id"):
+            val("    Support case", r["case_id"])
+        click.echo()
 
     click.echo()

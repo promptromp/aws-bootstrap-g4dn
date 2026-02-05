@@ -37,6 +37,7 @@ aws_bootstrap/
     ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing, EBS volume ops
     gpu.py               # GPU architecture mapping and GpuInfo dataclass
     output.py            # Output formatting: OutputFormat enum, emit(), echo/secho wrappers for structured output
+    quota.py             # Service Quotas API: get/request GPU vCPU quotas (G/VT + P5 families)
     ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management, GPU queries, EBS mount
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
@@ -57,6 +58,7 @@ aws_bootstrap/
         test_ssh_gpu.py
         test_ebs.py
         test_ssh_ebs.py
+        test_quota.py
 docs/
     nsight-remote-profiling.md # Nsight Compute, Nsight Systems, and Nsight VSCE remote profiling guide
     spot-request-lifecycle.md  # Research notes on spot request cleanup
@@ -85,6 +87,9 @@ Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`
 - **`cleanup`** — removes stale `~/.ssh/config` entries for terminated/non-existent instances; compares managed SSH config blocks against live EC2 instances; `--include-ebs` also finds and deletes orphan EBS data volumes (volumes in `available` state whose linked instance no longer exists); `--dry-run` previews removals without modifying config; `--yes` skips the confirmation prompt
 - **`list instance-types`** — lists EC2 instance types matching a family prefix (default: `g4dn`), showing vCPUs, memory, and GPU info
 - **`list amis`** — lists available AMIs matching a name pattern (default: Deep Learning Base OSS Nvidia Driver GPU AMIs), sorted newest-first
+- **`quota show`** — displays current spot and on-demand vCPU quota values via AWS Service Quotas API; `--family` filters by instance family (gvt, p5; default: all)
+- **`quota request`** — requests a quota increase; `--type` (spot/on-demand) and `--desired-value` are required; `--family` selects instance family (default: gvt); confirms in text mode, requires `--yes` in structured modes
+- **`quota history`** — shows history of quota increase requests; optional `--family`, `--type`, and `--status` filters
 
 ## Coding Conventions
 
