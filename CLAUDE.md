@@ -172,6 +172,18 @@ Non-root EBS volumes attached via API have `DeleteOnTermination=False` by defaul
 
 The `terminate` command discovers volumes via `find_ebs_volumes_for_instance`, waits for them to detach (becomes `available`), then deletes them. `--keep-ebs` skips deletion and prints the volume ID with a reattach command.
 
+## Agent Skill (Claude Code Plugin)
+
+The `aws-bootstrap-skill/` directory contains a [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin following the [Agent Skills](https://agentskills.io/) standard. It enables LLM coding agents to autonomously provision, manage, and tear down AWS GPU instances via the `aws-bootstrap` CLI.
+
+- **`.claude-plugin/marketplace.json`** (repo root) — marketplace discovery metadata, points to `aws-bootstrap-skill/`
+- **`aws-bootstrap-skill/.claude-plugin/plugin.json`** — plugin manifest (identity, metadata, keywords)
+- **`aws-bootstrap-skill/skills/aws-bootstrap/SKILL.md`** — main skill definition (~200 lines): prerequisites, quick reference, structured output guidance, common workflows, remote instance environment (~/venv, /data), error handling
+- **`aws-bootstrap-skill/skills/aws-bootstrap/references/commands.md`** — full command reference (~280 lines): all options with defaults and JSON output schemas for every command
+- **`aws-bootstrap-skill/README.md`** — plugin installation and usage instructions
+
+The skill uses progressive disclosure: SKILL.md is loaded as the quick reference, `references/commands.md` is loaded on demand for detailed option docs. The skill instructs agents to use `--output json` for machine-readable output and documents the pre-installed remote environment (`~/venv` with CUDA-matched PyTorch, `/data` EBS mount for datasets).
+
 ## Versioning & Publishing
 
 Version is derived automatically from git tags via **setuptools-scm** — no hardcoded version string in the codebase.

@@ -27,6 +27,7 @@ ssh aws-gpu1                  # You're in, venv activated, PyTorch works
 | 🖥️ | **`status --gpu`** | Shows CUDA toolkit version, driver max, GPU architecture, spot pricing, uptime, and estimated cost |
 | 💾 | **EBS data volumes** | Attach persistent storage at `/data` — survives spot interruptions and termination, reattach to new instances |
 | 🗑️ | **Clean terminate** | Stops instances, removes SSH aliases, cleans up EBS volumes (or preserves with `--keep-ebs`) |
+| 🤖 | **[Agent Skill](https://agentskills.io/)** | Included Claude Code plugin lets LLM agents autonomously provision, manage, and tear down GPU instances |
 
 ### 🎯 Target Workflows
 
