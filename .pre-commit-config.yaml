@@ -28,7 +28,7 @@ repos:
   rev: v1.19.0
   hooks:
     - id: mypy
-      additional_dependencies: [types-pyyaml>=6.0.12]
+      additional_dependencies: [types-pyyaml>=6.0.12, types-tabulate>=0.9]
 - repo: local
   hooks:
   - id: pytest

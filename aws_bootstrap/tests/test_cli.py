@@ -1,11 +1,13 @@
 """Tests for CLI entry point and help output."""
 
 from __future__ import annotations
+import json
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import botocore.exceptions
+import yaml
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import main
@@ -1254,3 +1256,281 @@ def test_cleanup_with_yes(mock_find, mock_session, mock_stale, mock_cleanup):
     assert "Removed aws-gpu1" in result.output
     assert "Cleaned up 1" in result.output
     mock_cleanup.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# --output structured format tests
+# ---------------------------------------------------------------------------
+
+
+def test_help_shows_output_option():
+    runner = CliRunner()
+    result = runner.invoke(main, ["--help"])
+    assert result.exit_code == 0
+    assert "--output" in result.output
+    assert "-o" in result.output
+
+
+@patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[])
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_output_json(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "aws-bootstrap-g4dn.xlarge",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+            "Lifecycle": "spot",
+            "AvailabilityZone": "us-west-2a",
+        }
+    ]
+    mock_spot_price.return_value = 0.1578
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "status"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "instances" in data
+    assert len(data["instances"]) == 1
+    inst = data["instances"][0]
+    assert inst["instance_id"] == "i-abc123"
+    assert inst["state"] == "running"
+    assert inst["instance_type"] == "g4dn.xlarge"
+    assert inst["public_ip"] == "1.2.3.4"
+    assert inst["lifecycle"] == "spot"
+    assert inst["spot_price_per_hour"] == 0.1578
+    assert "uptime_seconds" in inst
+    assert "estimated_cost" in inst
+    # No ANSI or progress text in structured output
+    assert "\x1b[" not in result.output
+    assert "Found" not in result.output
+
+
+@patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[])
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_output_yaml(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "aws-bootstrap-g4dn.xlarge",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+            "Lifecycle": "spot",
+            "AvailabilityZone": "us-west-2a",
+        }
+    ]
+    mock_spot_price.return_value = 0.15
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "yaml", "status"])
+    assert result.exit_code == 0
+    data = yaml.safe_load(result.output)
+    assert "instances" in data
+    assert data["instances"][0]["instance_id"] == "i-abc123"
+
+
+@patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[])
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_output_table(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "aws-bootstrap-g4dn.xlarge",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+            "Lifecycle": "spot",
+            "AvailabilityZone": "us-west-2a",
+        }
+    ]
+    mock_spot_price.return_value = 0.15
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "table", "status"])
+    assert result.exit_code == 0
+    assert "Instance ID" in result.output
+    assert "i-abc123" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_no_instances_json(mock_find, mock_session):
+    mock_find.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "status"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data == {"instances": []}
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_output_json_dry_run(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "launch", "--key-path", str(key_path), "--dry-run"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["dry_run"] is True
+    assert data["instance_type"] == "g4dn.xlarge"
+    assert data["ami_id"] == "ami-123"
+    assert data["pricing"] == "spot"
+    assert data["region"] == "us-west-2"
+
+
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.terminate_tagged_instances")
+def test_terminate_output_json(mock_terminate, mock_find, mock_session, mock_remove_ssh):
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "test",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+        }
+    ]
+    mock_terminate.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "PreviousState": {"Name": "running"},
+            "CurrentState": {"Name": "shutting-down"},
+        }
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "terminate", "--yes"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "terminated" in data
+    assert len(data["terminated"]) == 1
+    assert data["terminated"][0]["instance_id"] == "i-abc123"
+    assert data["terminated"][0]["previous_state"] == "running"
+    assert data["terminated"][0]["current_state"] == "shutting-down"
+    assert data["terminated"][0]["ssh_alias_removed"] == "aws-gpu1"
+
+
+@patch("aws_bootstrap.cli.cleanup_stale_ssh_hosts")
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[("i-dead1234", "aws-gpu1")])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_output_json(mock_find, mock_session, mock_stale, mock_cleanup):
+    mock_cleanup.return_value = [CleanupResult(instance_id="i-dead1234", alias="aws-gpu1", removed=True)]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "cleanup", "--yes"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "cleaned" in data
+    assert len(data["cleaned"]) == 1
+    assert data["cleaned"][0]["instance_id"] == "i-dead1234"
+    assert data["cleaned"][0]["alias"] == "aws-gpu1"
+    assert data["cleaned"][0]["removed"] is True
+
+
+@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[("i-dead1234", "aws-gpu1")])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
+def test_cleanup_dry_run_json(mock_find, mock_session, mock_stale):
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "cleanup", "--dry-run"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["dry_run"] is True
+    assert "stale" in data
+    assert data["stale"][0]["alias"] == "aws-gpu1"
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.list_instance_types")
+def test_list_instance_types_json(mock_list, mock_session):
+    mock_list.return_value = [
+        {
+            "InstanceType": "g4dn.xlarge",
+            "VCpuCount": 4,
+            "MemoryMiB": 16384,
+            "GpuSummary": "1x T4 (16384 MiB)",
+        },
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "list", "instance-types"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert isinstance(data, list)
+    assert data[0]["instance_type"] == "g4dn.xlarge"
+    assert data[0]["vcpus"] == 4
+    assert data[0]["memory_mib"] == 16384
+    assert data[0]["gpu"] == "1x T4 (16384 MiB)"
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.list_amis")
+def test_list_amis_json(mock_list, mock_session):
+    mock_list.return_value = [
+        {
+            "ImageId": "ami-abc123",
+            "Name": "Deep Learning AMI v42",
+            "CreationDate": "2025-06-01T00:00:00Z",
+            "Architecture": "x86_64",
+        },
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "list", "amis"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert isinstance(data, list)
+    assert data[0]["image_id"] == "ami-abc123"
+    assert data[0]["name"] == "Deep Learning AMI v42"
+    assert data[0]["creation_date"] == "2025-06-01"
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_terminate_json_requires_yes(mock_find, mock_session):
+    """Structured output without --yes should error."""
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "test",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+        }
+    ]
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "terminate"])
+    assert result.exit_code != 0
+    assert "--yes is required" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_terminate_no_instances_json(mock_find, mock_session):
+    mock_find.return_value = []
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "terminate", "--yes"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data == {"terminated": []}

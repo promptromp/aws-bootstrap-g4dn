@@ -27,6 +27,7 @@ from .ec2 import (
     validate_ebs_volume,
     wait_instance_ready,
 )
+from .output import OutputFormat, emit, is_text
 from .ssh import (
     add_ssh_host,
     cleanup_stale_ssh_hosts,
@@ -48,22 +49,32 @@ SETUP_SCRIPT = Path(__file__).parent / "resources" / "remote_setup.sh"
 
 
 def step(number: int, total: int, msg: str) -> None:
+    if not is_text():
+        return
     click.secho(f"\n[{number}/{total}] {msg}", bold=True, fg="cyan")
 
 
 def info(msg: str) -> None:
+    if not is_text():
+        return
     click.echo(f"  {msg}")
 
 
 def val(label: str, value: str) -> None:
+    if not is_text():
+        return
     click.echo(f"  {label}: " + click.style(str(value), fg="bright_white"))
 
 
 def success(msg: str) -> None:
+    if not is_text():
+        return
     click.secho(f"  {msg}", fg="green")
 
 
 def warn(msg: str) -> None:
+    if not is_text():
+        return
     click.secho(f"  WARNING: {msg}", fg="yellow", err=True)
 
 
@@ -101,8 +112,19 @@ class _AWSGroup(click.Group):
 
 @click.group(cls=_AWSGroup)
 @click.version_option(package_name="aws-bootstrap-g4dn")
-def main():
+@click.option(
+    "--output",
+    "-o",
+    type=click.Choice(["text", "json", "yaml", "table"], case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format.",
+)
+@click.pass_context
+def main(ctx, output):
     """Bootstrap AWS EC2 GPU instances for hybrid local-remote development."""
+    ctx.ensure_object(dict)
+    ctx.obj["output_format"] = OutputFormat(output)
 
 
 @main.command()
@@ -141,7 +163,9 @@ def main():
     type=str,
     help="Attach an existing EBS volume by ID (e.g. vol-0abc123). Mounted at /data.",
 )
+@click.pass_context
 def launch(
+    ctx,
     instance_type,
     ami_filter,
     spot,
@@ -210,26 +234,48 @@ def launch(
     pricing = "spot" if config.spot else "on-demand"
 
     if config.dry_run:
-        click.echo()
-        click.secho("--- Dry Run Summary ---", bold=True, fg="yellow")
-        val("Instance type", config.instance_type)
-        val("AMI", f"{ami['ImageId']} ({ami['Name']})")
-        val("Pricing", pricing)
-        val("Key pair", config.key_name)
-        val("Security group", sg_id)
-        val("Volume", f"{config.volume_size} GB gp3")
-        val("Region", config.region)
-        val("Remote setup", "yes" if config.run_setup else "no")
-        if config.ssh_port != 22:
-            val("SSH port", str(config.ssh_port))
-        if config.python_version:
-            val("Python version", config.python_version)
-        if config.ebs_storage:
-            val("EBS data volume", f"{config.ebs_storage} GB gp3 (new, mounted at {EBS_MOUNT_POINT})")
-        if config.ebs_volume_id:
-            val("EBS data volume", f"{config.ebs_volume_id} (existing, mounted at {EBS_MOUNT_POINT})")
-        click.echo()
-        click.secho("No resources launched (dry-run mode).", fg="yellow")
+        if is_text(ctx):
+            click.echo()
+            click.secho("--- Dry Run Summary ---", bold=True, fg="yellow")
+            val("Instance type", config.instance_type)
+            val("AMI", f"{ami['ImageId']} ({ami['Name']})")
+            val("Pricing", pricing)
+            val("Key pair", config.key_name)
+            val("Security group", sg_id)
+            val("Volume", f"{config.volume_size} GB gp3")
+            val("Region", config.region)
+            val("Remote setup", "yes" if config.run_setup else "no")
+            if config.ssh_port != 22:
+                val("SSH port", str(config.ssh_port))
+            if config.python_version:
+                val("Python version", config.python_version)
+            if config.ebs_storage:
+                val("EBS data volume", f"{config.ebs_storage} GB gp3 (new, mounted at {EBS_MOUNT_POINT})")
+            if config.ebs_volume_id:
+                val("EBS data volume", f"{config.ebs_volume_id} (existing, mounted at {EBS_MOUNT_POINT})")
+            click.echo()
+            click.secho("No resources launched (dry-run mode).", fg="yellow")
+        else:
+            result: dict = {
+                "dry_run": True,
+                "instance_type": config.instance_type,
+                "ami_id": ami["ImageId"],
+                "ami_name": ami["Name"],
+                "pricing": pricing,
+                "key_name": config.key_name,
+                "security_group": sg_id,
+                "volume_size_gb": config.volume_size,
+                "region": config.region,
+            }
+            if config.ssh_port != 22:
+                result["ssh_port"] = config.ssh_port
+            if config.python_version:
+                result["python_version"] = config.python_version
+            if config.ebs_storage:
+                result["ebs_storage_gb"] = config.ebs_storage
+            if config.ebs_volume_id:
+                result["ebs_volume_id"] = config.ebs_volume_id
+            emit(result, ctx=ctx)
         return
 
     # Step 4: Launch instance
@@ -330,7 +376,30 @@ def launch(
     )
     success(f"Added SSH config alias: {alias}")
 
-    # Print connection info
+    # Structured output for non-text modes
+    if not is_text(ctx):
+        result_data: dict = {
+            "instance_id": instance_id,
+            "public_ip": public_ip,
+            "instance_type": config.instance_type,
+            "availability_zone": az,
+            "ami_id": ami["ImageId"],
+            "pricing": pricing,
+            "region": config.region,
+            "ssh_alias": alias,
+        }
+        if ebs_volume_attached:
+            ebs_info: dict = {
+                "volume_id": ebs_volume_attached,
+                "mount_point": EBS_MOUNT_POINT,
+            }
+            if config.ebs_storage:
+                ebs_info["size_gb"] = config.ebs_storage
+            result_data["ebs_volume"] = ebs_info
+        emit(result_data, ctx=ctx)
+        return
+
+    # Print connection info (text mode)
     click.echo()
     click.secho("=" * 60, fg="green")
     click.secho("  Instance ready!", bold=True, fg="green")
@@ -391,44 +460,66 @@ def launch(
     show_default=True,
     help="Show connection commands (SSH, Jupyter, VSCode) for each running instance.",
 )
-def status(region, profile, gpu, instructions):
+@click.pass_context
+def status(ctx, region, profile, gpu, instructions):
     """Show running instances created by aws-bootstrap."""
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
 
     instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
     if not instances:
-        click.secho("No active aws-bootstrap instances found.", fg="yellow")
+        if is_text(ctx):
+            click.secho("No active aws-bootstrap instances found.", fg="yellow")
+        else:
+            emit({"instances": []}, ctx=ctx)
         return
 
     ssh_hosts = list_ssh_hosts()
 
-    click.secho(f"\n  Found {len(instances)} instance(s):\n", bold=True, fg="cyan")
-    if gpu:
-        click.echo("  " + click.style("Querying GPU info via SSH...", dim=True))
-        click.echo()
+    if is_text(ctx):
+        click.secho(f"\n  Found {len(instances)} instance(s):\n", bold=True, fg="cyan")
+        if gpu:
+            click.echo("  " + click.style("Querying GPU info via SSH...", dim=True))
+            click.echo()
+
+    structured_instances = []
 
     for inst in instances:
         state = inst["State"]
-        state_color = {
-            "running": "green",
-            "pending": "yellow",
-            "stopping": "yellow",
-            "stopped": "red",
-            "shutting-down": "red",
-        }.get(state, "white")
         alias = ssh_hosts.get(inst["InstanceId"])
-        alias_str = f" ({alias})" if alias else ""
-        click.echo(
-            "  "
-            + click.style(inst["InstanceId"], fg="bright_white")
-            + click.style(alias_str, fg="cyan")
-            + "  "
-            + click.style(state, fg=state_color)
-        )
-        val("    Type", inst["InstanceType"])
-        if inst["PublicIp"]:
-            val("    IP", inst["PublicIp"])
+
+        # Text mode: inline display
+        if is_text(ctx):
+            state_color = {
+                "running": "green",
+                "pending": "yellow",
+                "stopping": "yellow",
+                "stopped": "red",
+                "shutting-down": "red",
+            }.get(state, "white")
+            alias_str = f" ({alias})" if alias else ""
+            click.echo(
+                "  "
+                + click.style(inst["InstanceId"], fg="bright_white")
+                + click.style(alias_str, fg="cyan")
+                + "  "
+                + click.style(state, fg=state_color)
+            )
+            val("    Type", inst["InstanceType"])
+            if inst["PublicIp"]:
+                val("    IP", inst["PublicIp"])
+
+        # Build structured record
+        inst_data: dict = {
+            "instance_id": inst["InstanceId"],
+            "state": state,
+            "instance_type": inst["InstanceType"],
+            "public_ip": inst["PublicIp"] or None,
+            "ssh_alias": alias,
+            "lifecycle": inst["Lifecycle"],
+            "availability_zone": inst["AvailabilityZone"],
+            "launch_time": inst["LaunchTime"],
+        }
 
         # Look up SSH config details once (used by --gpu and --with-instructions)
         details = None
@@ -446,51 +537,81 @@ def status(region, profile, gpu, instructions):
                     Path("~/.ssh/id_ed25519").expanduser(),
                 )
             if gpu_info:
-                val("    GPU", f"{gpu_info.gpu_name} ({gpu_info.architecture})")
-                if gpu_info.cuda_toolkit_version:
-                    cuda_str = gpu_info.cuda_toolkit_version
-                    if gpu_info.cuda_driver_version != gpu_info.cuda_toolkit_version:
-                        cuda_str += f" (driver supports up to {gpu_info.cuda_driver_version})"
-                else:
-                    cuda_str = f"{gpu_info.cuda_driver_version} (driver max, toolkit unknown)"
-                val("    CUDA", cuda_str)
-                val("    Driver", gpu_info.driver_version)
+                if is_text(ctx):
+                    val("    GPU", f"{gpu_info.gpu_name} ({gpu_info.architecture})")
+                    if gpu_info.cuda_toolkit_version:
+                        cuda_str = gpu_info.cuda_toolkit_version
+                        if gpu_info.cuda_driver_version != gpu_info.cuda_toolkit_version:
+                            cuda_str += f" (driver supports up to {gpu_info.cuda_driver_version})"
+                    else:
+                        cuda_str = f"{gpu_info.cuda_driver_version} (driver max, toolkit unknown)"
+                    val("    CUDA", cuda_str)
+                    val("    Driver", gpu_info.driver_version)
+                inst_data["gpu"] = {
+                    "name": gpu_info.gpu_name,
+                    "architecture": gpu_info.architecture,
+                    "cuda_toolkit": gpu_info.cuda_toolkit_version,
+                    "cuda_driver_max": gpu_info.cuda_driver_version,
+                    "driver": gpu_info.driver_version,
+                }
             else:
-                click.echo("    GPU: " + click.style("unavailable", dim=True))
+                if is_text(ctx):
+                    click.echo("    GPU: " + click.style("unavailable", dim=True))
 
         # EBS data volumes
         ebs_volumes = find_ebs_volumes_for_instance(ec2, inst["InstanceId"], "aws-bootstrap-g4dn")
-        for vol in ebs_volumes:
-            vol_state = f", {vol['State']}" if vol["State"] != "in-use" else ""
-            val("    EBS", f"{vol['VolumeId']} ({vol['Size']} GB, {EBS_MOUNT_POINT}{vol_state})")
+        if ebs_volumes:
+            if is_text(ctx):
+                for vol in ebs_volumes:
+                    vol_state = f", {vol['State']}" if vol["State"] != "in-use" else ""
+                    val("    EBS", f"{vol['VolumeId']} ({vol['Size']} GB, {EBS_MOUNT_POINT}{vol_state})")
+            inst_data["ebs_volumes"] = [
+                {
+                    "volume_id": vol["VolumeId"],
+                    "size_gb": vol["Size"],
+                    "mount_point": EBS_MOUNT_POINT,
+                    "state": vol["State"],
+                }
+                for vol in ebs_volumes
+            ]
 
         lifecycle = inst["Lifecycle"]
         is_spot = lifecycle == "spot"
+        spot_price = None
 
         if is_spot:
             spot_price = get_spot_price(ec2, inst["InstanceType"], inst["AvailabilityZone"])
+            if is_text(ctx):
+                if spot_price is not None:
+                    val("    Pricing", f"spot (${spot_price:.4f}/hr)")
+                else:
+                    val("    Pricing", "spot")
             if spot_price is not None:
-                val("    Pricing", f"spot (${spot_price:.4f}/hr)")
-            else:
-                val("    Pricing", "spot")
+                inst_data["spot_price_per_hour"] = spot_price
         else:
-            val("    Pricing", "on-demand")
+            if is_text(ctx):
+                val("    Pricing", "on-demand")
 
         if state == "running" and is_spot:
             uptime = datetime.now(UTC) - inst["LaunchTime"]
             total_seconds = int(uptime.total_seconds())
-            hours, remainder = divmod(total_seconds, 3600)
-            minutes = remainder // 60
-            val("    Uptime", f"{hours}h {minutes:02d}m")
+            inst_data["uptime_seconds"] = total_seconds
+            if is_text(ctx):
+                hours, remainder = divmod(total_seconds, 3600)
+                minutes = remainder // 60
+                val("    Uptime", f"{hours}h {minutes:02d}m")
             if spot_price is not None:
                 uptime_hours = uptime.total_seconds() / 3600
                 est_cost = uptime_hours * spot_price
-                val("    Est. cost", f"~${est_cost:.4f}")
+                inst_data["estimated_cost"] = round(est_cost, 4)
+                if is_text(ctx):
+                    val("    Est. cost", f"~${est_cost:.4f}")
 
-        val("    Launched", str(inst["LaunchTime"]))
+        if is_text(ctx):
+            val("    Launched", str(inst["LaunchTime"]))
 
         # Connection instructions (opt-in, only for running instances with a public IP and alias)
-        if instructions and state == "running" and inst["PublicIp"] and alias:
+        if is_text(ctx) and instructions and state == "running" and inst["PublicIp"] and alias:
             user = details.user if details else "ubuntu"
             port = details.port if details else 22
             port_flag = f" -p {port}" if port != 22 else ""
@@ -511,6 +632,24 @@ def status(region, profile, gpu, instructions):
             click.secho("    GPU Benchmark:", fg="cyan")
             click.secho(f"      ssh {alias} 'python ~/gpu_benchmark.py'", bold=True)
 
+        structured_instances.append(inst_data)
+
+    if not is_text(ctx):
+        emit(
+            {"instances": structured_instances},
+            headers={
+                "instance_id": "Instance ID",
+                "state": "State",
+                "instance_type": "Type",
+                "public_ip": "IP",
+                "ssh_alias": "Alias",
+                "lifecycle": "Pricing",
+                "uptime_seconds": "Uptime (s)",
+            },
+            ctx=ctx,
+        )
+        return
+
     click.echo()
     first_id = instances[0]["InstanceId"]
     first_ref = ssh_hosts.get(first_id, first_id)
@@ -524,7 +663,8 @@ def status(region, profile, gpu, instructions):
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--keep-ebs", is_flag=True, default=False, help="Preserve EBS data volumes instead of deleting them.")
 @click.argument("instance_ids", nargs=-1, metavar="[INSTANCE_ID_OR_ALIAS]...")
-def terminate(region, profile, yes, keep_ebs, instance_ids):
+@click.pass_context
+def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
     """Terminate instances created by aws-bootstrap.
 
     Pass specific instance IDs or SSH aliases (e.g. aws-gpu1) to terminate,
@@ -532,6 +672,10 @@ def terminate(region, profile, yes, keep_ebs, instance_ids):
     """
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
+
+    # In structured output modes, require --yes (prompts would corrupt output)
+    if not is_text(ctx) and not yes:
+        raise CLIError("--yes is required when using structured output (--output json/yaml/table).")
 
     if instance_ids:
         targets = []
@@ -548,13 +692,17 @@ def terminate(region, profile, yes, keep_ebs, instance_ids):
     else:
         instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
         if not instances:
-            click.secho("No active aws-bootstrap instances found.", fg="yellow")
+            if is_text(ctx):
+                click.secho("No active aws-bootstrap instances found.", fg="yellow")
+            else:
+                emit({"terminated": []}, ctx=ctx)
             return
         targets = [inst["InstanceId"] for inst in instances]
-        click.secho(f"\n  Found {len(targets)} instance(s) to terminate:\n", bold=True, fg="cyan")
-        for inst in instances:
-            iid = click.style(inst["InstanceId"], fg="bright_white")
-            click.echo(f"  {iid}  {inst['State']}  {inst['InstanceType']}")
+        if is_text(ctx):
+            click.secho(f"\n  Found {len(targets)} instance(s) to terminate:\n", bold=True, fg="cyan")
+            for inst in instances:
+                iid = click.style(inst["InstanceId"], fg="bright_white")
+                click.echo(f"  {iid}  {inst['State']}  {inst['InstanceType']}")
 
     if not yes:
         click.echo()
@@ -570,35 +718,58 @@ def terminate(region, profile, yes, keep_ebs, instance_ids):
             ebs_by_instance[target] = volumes
 
     changes = terminate_tagged_instances(ec2, targets)
-    click.echo()
+
+    terminated_results = []
+
+    if is_text(ctx):
+        click.echo()
     for change in changes:
         prev = change["PreviousState"]["Name"]
         curr = change["CurrentState"]["Name"]
-        click.echo(
-            "  " + click.style(change["InstanceId"], fg="bright_white") + f"  {prev} -> " + click.style(curr, fg="red")
-        )
-        removed_alias = remove_ssh_host(change["InstanceId"])
+        iid = change["InstanceId"]
+        if is_text(ctx):
+            click.echo("  " + click.style(iid, fg="bright_white") + f"  {prev} -> " + click.style(curr, fg="red"))
+        removed_alias = remove_ssh_host(iid)
         if removed_alias:
             info(f"Removed SSH config alias: {removed_alias}")
+
+        change_data: dict = {
+            "instance_id": iid,
+            "previous_state": prev,
+            "current_state": curr,
+        }
+        if removed_alias:
+            change_data["ssh_alias_removed"] = removed_alias
+        terminated_results.append(change_data)
 
     # Handle EBS volume cleanup
     for _iid, volumes in ebs_by_instance.items():
         for vol in volumes:
             vid = vol["VolumeId"]
             if keep_ebs:
-                click.echo()
+                if is_text(ctx):
+                    click.echo()
                 info(f"Preserving EBS volume: {vid} ({vol['Size']} GB)")
                 info(f"Reattach with: aws-bootstrap launch --ebs-volume-id {vid}")
             else:
-                click.echo()
+                if is_text(ctx):
+                    click.echo()
                 info(f"Waiting for EBS volume {vid} to detach...")
                 try:
                     waiter = ec2.get_waiter("volume_available")
                     waiter.wait(VolumeIds=[vid], WaiterConfig={"Delay": 10, "MaxAttempts": 30})
                     delete_ebs_volume(ec2, vid)
                     success(f"Deleted EBS volume: {vid}")
+                    # Record deleted volume in the corresponding terminated result
+                    for tr in terminated_results:
+                        if tr["instance_id"] == _iid:
+                            tr.setdefault("ebs_volumes_deleted", []).append(vid)
                 except Exception as e:
                     warn(f"Failed to delete EBS volume {vid}: {e}")
+
+    if not is_text(ctx):
+        emit({"terminated": terminated_results}, ctx=ctx)
+        return
 
     click.echo()
     success(f"Terminated {len(changes)} instance(s).")
@@ -609,27 +780,46 @@ def terminate(region, profile, yes, keep_ebs, instance_ids):
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
 @click.option("--profile", default=None, help="AWS profile override.")
-def cleanup(dry_run, yes, region, profile):
+@click.pass_context
+def cleanup(ctx, dry_run, yes, region, profile):
     """Remove stale SSH config entries for terminated instances."""
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
+
+    # In structured output modes, require --yes for non-dry-run (prompts would corrupt output)
+    if not is_text(ctx) and not yes and not dry_run:
+        raise CLIError("--yes is required when using structured output (--output json/yaml/table).")
 
     live_instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
     live_ids = {inst["InstanceId"] for inst in live_instances}
 
     stale = find_stale_ssh_hosts(live_ids)
     if not stale:
-        click.secho("No stale SSH config entries found.", fg="green")
+        if is_text(ctx):
+            click.secho("No stale SSH config entries found.", fg="green")
+        else:
+            result_key = "stale" if dry_run else "cleaned"
+            emit({result_key: []}, ctx=ctx)
         return
 
-    click.secho(f"\n  Found {len(stale)} stale SSH config entry(ies):\n", bold=True, fg="cyan")
-    for iid, alias in stale:
-        click.echo("  " + click.style(alias, fg="bright_white") + f"  ({iid})")
+    if is_text(ctx):
+        click.secho(f"\n  Found {len(stale)} stale SSH config entry(ies):\n", bold=True, fg="cyan")
+        for iid, alias in stale:
+            click.echo("  " + click.style(alias, fg="bright_white") + f"  ({iid})")
 
     if dry_run:
-        click.echo()
-        for iid, alias in stale:
-            info(f"Would remove {alias} ({iid})")
+        if is_text(ctx):
+            click.echo()
+            for iid, alias in stale:
+                info(f"Would remove {alias} ({iid})")
+        else:
+            emit(
+                {
+                    "stale": [{"instance_id": iid, "alias": alias} for iid, alias in stale],
+                    "dry_run": True,
+                },
+                ctx=ctx,
+            )
         return
 
     if not yes:
@@ -639,6 +829,16 @@ def cleanup(dry_run, yes, region, profile):
             return
 
     results = cleanup_stale_ssh_hosts(live_ids)
+
+    if not is_text(ctx):
+        emit(
+            {
+                "cleaned": [{"instance_id": r.instance_id, "alias": r.alias, "removed": r.removed} for r in results],
+            },
+            ctx=ctx,
+        )
+        return
+
     click.echo()
     for r in results:
         success(f"Removed {r.alias} ({r.instance_id})")
@@ -663,14 +863,40 @@ def list_cmd():
 @click.option("--prefix", default="g4dn", show_default=True, help="Instance type family prefix to filter on.")
 @click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
 @click.option("--profile", default=None, help="AWS profile override.")
-def list_instance_types_cmd(prefix, region, profile):
+@click.pass_context
+def list_instance_types_cmd(ctx, prefix, region, profile):
     """List EC2 instance types matching a family prefix (e.g. g4dn, p3, g5)."""
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
 
     types = list_instance_types(ec2, prefix)
     if not types:
-        click.secho(f"No instance types found matching '{prefix}.*'", fg="yellow")
+        if is_text(ctx):
+            click.secho(f"No instance types found matching '{prefix}.*'", fg="yellow")
+        else:
+            emit([], ctx=ctx)
+        return
+
+    if not is_text(ctx):
+        structured = [
+            {
+                "instance_type": t["InstanceType"],
+                "vcpus": t["VCpuCount"],
+                "memory_mib": t["MemoryMiB"],
+                "gpu": t["GpuSummary"] or None,
+            }
+            for t in types
+        ]
+        emit(
+            structured,
+            headers={
+                "instance_type": "Instance Type",
+                "vcpus": "vCPUs",
+                "memory_mib": "Memory (MiB)",
+                "gpu": "GPU",
+            },
+            ctx=ctx,
+        )
         return
 
     click.secho(f"\n  {len(types)} instance type(s) matching '{prefix}.*':\n", bold=True, fg="cyan")
@@ -682,8 +908,8 @@ def list_instance_types_cmd(prefix, region, profile):
     click.echo("  " + "-" * 72)
 
     for t in types:
-        gpu = t["GpuSummary"] or "-"
-        click.echo(f"  {t['InstanceType']:<24}{t['VCpuCount']:>6}{t['MemoryMiB']:>14}  {gpu}")
+        gpu_str = t["GpuSummary"] or "-"
+        click.echo(f"  {t['InstanceType']:<24}{t['VCpuCount']:>6}{t['MemoryMiB']:>14}  {gpu_str}")
 
     click.echo()
 
@@ -692,14 +918,40 @@ def list_instance_types_cmd(prefix, region, profile):
 @click.option("--filter", "ami_filter", default=DEFAULT_AMI_PREFIX, show_default=True, help="AMI name pattern.")
 @click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
 @click.option("--profile", default=None, help="AWS profile override.")
-def list_amis_cmd(ami_filter, region, profile):
+@click.pass_context
+def list_amis_cmd(ctx, ami_filter, region, profile):
     """List available AMIs matching a name pattern."""
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
 
     amis = list_amis(ec2, ami_filter)
     if not amis:
-        click.secho(f"No AMIs found matching '{ami_filter}'", fg="yellow")
+        if is_text(ctx):
+            click.secho(f"No AMIs found matching '{ami_filter}'", fg="yellow")
+        else:
+            emit([], ctx=ctx)
+        return
+
+    if not is_text(ctx):
+        structured = [
+            {
+                "image_id": ami["ImageId"],
+                "name": ami["Name"],
+                "creation_date": ami["CreationDate"][:10],
+                "architecture": ami["Architecture"],
+            }
+            for ami in amis
+        ]
+        emit(
+            structured,
+            headers={
+                "image_id": "Image ID",
+                "name": "Name",
+                "creation_date": "Created",
+                "architecture": "Arch",
+            },
+            ctx=ctx,
+        )
         return
 
     click.secho(f"\n  {len(amis)} AMI(s) matching '{ami_filter}' (newest first):\n", bold=True, fg="cyan")
