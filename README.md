@@ -407,10 +407,14 @@ aws-bootstrap launch --instance-type t3.medium --ami-filter "ubuntu/images/hvm-s
 
 A [Claude Code](https://docs.anthropic.com/en/docs/claude-code) plugin is included in the [`aws-bootstrap-skill/`](aws-bootstrap-skill/) directory, enabling LLM coding agents to autonomously provision and manage GPU instances.
 
-### Install from marketplace
+### Install from GitHub
 
 ```bash
-claude plugin install aws-bootstrap-skill
+# Add the marketplace (registers this repo as a plugin source)
+/plugin marketplace add promptromp/aws-bootstrap-g4dn
+
+# Install the plugin
+/plugin install aws-bootstrap-skill@promptromp-aws-bootstrap-g4dn
 ```
 
 ### Install locally (from repo checkout)
