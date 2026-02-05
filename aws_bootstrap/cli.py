@@ -969,6 +969,7 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
         gpu_str = t["GpuSummary"] or "-"
         click.echo(f"  {t['InstanceType']:<24}{t['VCpuCount']:>6}{t['MemoryMiB']:>14}  {gpu_str}")
 
+    click.echo()
     click.echo(
         "  "
         + click.style("Tip: ", fg="bright_black")
