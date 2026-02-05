@@ -149,7 +149,49 @@ aws-bootstrap terminate --keep-ebs
 aws-bootstrap launch --ebs-volume-id vol-0abc123def456
 ```
 
-EBS volumes are mounted at `/data`, survive spot interruptions, and persist independently of instances.
+EBS volumes are mounted at `/data`, survive spot interruptions, and persist independently of instances. Use `/data` for large datasets, model checkpoints, and training outputs — it persists across instance lifecycles while the root volume does not. For example:
+
+```bash
+# Store training data on persistent volume
+ssh aws-gpu1 'mkdir -p /data/datasets /data/checkpoints /data/outputs'
+
+# Download a dataset to persistent storage
+ssh aws-gpu1 'cd /data/datasets && wget https://example.com/dataset.tar.gz'
+```
+
+## Remote Instance Environment
+
+After launch and remote setup, each instance comes pre-configured with:
+
+### Python Virtual Environment (`~/venv`)
+
+- Located at `~/venv`, **auto-activated on SSH login** (via `~/.bashrc`)
+- **PyTorch** is pre-installed with the correct CUDA wheel matching the host's CUDA toolkit version (e.g. `cu124`, `cu128`) — `torch.cuda.is_available()` works out of the box
+- **torchvision** is also pre-installed with matching CUDA support
+- Additional numerical/ML libraries from `requirements.txt`: `numpy`, `tqdm`, and other common dependencies
+- Use `--python-version` on launch to pin a specific Python version (e.g. `3.13`)
+- To install additional packages: `ssh aws-gpu1 'pip install transformers datasets'`
+
+### GPU and CUDA
+
+- NVIDIA drivers and CUDA toolkit are pre-installed via the Deep Learning AMI
+- `nvidia-smi` and `nvcc` are available on PATH
+- A GPU benchmark is pre-installed at `~/gpu_benchmark.py` (CNN + Transformer workloads)
+- A Jupyter notebook for interactive GPU verification is at `~/gpu_smoke_test.ipynb`
+
+### Jupyter
+
+- JupyterLab runs as a systemd service on port 8888
+- Access via SSH tunnel: `ssh -NL 8888:localhost:8888 aws-gpu1`, then open `http://localhost:8888`
+
+### EBS Data Volume (`/data`)
+
+If launched with `--ebs-storage` or `--ebs-volume-id`, a persistent gp3 EBS volume is mounted at `/data`. Use this for:
+- **Large datasets** — download and store training data here so it persists across spot interruptions
+- **Model checkpoints** — save checkpoints to `/data/checkpoints` to avoid losing training progress
+- **Training outputs** — write logs, metrics, and results to `/data/outputs`
+
+The `/data` volume is **not lost on spot interruption** — when AWS reclaims the instance, the volume detaches automatically and can be reattached to a new instance with `--ebs-volume-id`.
 
 ## Error Handling
 
