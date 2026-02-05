@@ -384,7 +384,7 @@ aws-bootstrap quota request [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--family` | `gvt\|p5` | `gvt` | Instance family |
+| `--family` | `gvt\|p5\|p\|dl` | `gvt` | Instance family |
 | `--type` | `spot\|on-demand` | required | Quota type to increase |
 | `--desired-value` | float | required | Desired quota value (vCPUs) |
 | `--yes` / `-y` | flag | false | Skip confirmation prompt (required for `--output json/yaml/table`) |
@@ -419,7 +419,7 @@ aws-bootstrap quota history [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--family` | `gvt\|p5` | all | Filter by instance family |
+| `--family` | `gvt\|p5\|p\|dl` | all | Filter by instance family |
 | `--type` | `spot\|on-demand` | both | Filter by quota type |
 | `--status` | `PENDING\|CASE_OPENED\|APPROVED\|DENIED\|CASE_CLOSED\|NOT_APPROVED` | all | Filter by request status |
 

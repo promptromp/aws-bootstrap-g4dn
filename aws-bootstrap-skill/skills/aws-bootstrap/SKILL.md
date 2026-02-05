@@ -30,7 +30,7 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 | `aws-bootstrap cleanup` | Remove stale SSH config + orphan EBS | `--include-ebs`, `--dry-run` |
 | `aws-bootstrap list instance-types` | Browse GPU instance types | `--prefix` (default: g4dn) |
 | `aws-bootstrap list amis` | Browse Deep Learning AMIs | `--filter` |
-| `aws-bootstrap quota show` | Show GPU vCPU quotas (G/VT + P5) | `--family` |
+| `aws-bootstrap quota show` | Show GPU vCPU quotas (all families) | `--family` |
 | `aws-bootstrap quota request` | Request a quota increase | `--family`, `--type`, `--desired-value`, `--yes` |
 | `aws-bootstrap quota history` | Show quota increase request history | `--family`, `--type`, `--status` |
 
@@ -199,7 +199,7 @@ The `/data` volume is **not lost on spot interruption** — when AWS reclaims th
 ## Error Handling
 
 - **Spot capacity errors**: The CLI auto-falls back to on-demand pricing
-- **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`): Check with `aws-bootstrap quota show` and request increases with `aws-bootstrap quota request --type spot --desired-value 4`. For P5 instances, use `--family p5`
+- **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`): Check with `aws-bootstrap quota show` and request increases with `aws-bootstrap quota request --family gvt --type spot --desired-value 4`. Other families: `--family p5`, `--family p` (P4/P3/P2), `--family dl`
 - **SSH timeouts**: Instance may still be initializing -- check `aws-bootstrap status`
 - **No public IP**: Check VPC settings or assign an Elastic IP
 - **EBS mount failures**: Non-fatal -- instance remains usable, may need manual mount

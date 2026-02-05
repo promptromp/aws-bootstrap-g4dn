@@ -351,7 +351,7 @@ AWS accounts have [service quotas](https://docs.aws.amazon.com/AWSEC2/latest/Use
 Check your current quotas (g4dn.xlarge requires at least 4 vCPUs):
 
 ```bash
-# Built-in: show all GPU family quotas (G/VT + P5)
+# Built-in: show all GPU family quotas
 aws-bootstrap quota show
 
 # Show only G/VT family quotas
