@@ -173,9 +173,21 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
                     retry_code = retry_e.response["Error"]["Code"]
                     if retry_code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
                         _raise_quota_error(retry_code, config)
+                    if retry_code == "InsufficientInstanceCapacity":
+                        raise CLIError(
+                            f"Insufficient capacity for {config.instance_type} (on-demand) in {config.region}.\n\n"
+                            "  Neither spot nor on-demand capacity is currently available.\n"
+                            "  Try a different region, availability zone, or instance type."
+                        ) from None
                     raise
             else:
                 raise CLIError("Launch cancelled.") from None
+        elif code == "InsufficientInstanceCapacity":
+            raise CLIError(
+                f"Insufficient capacity for {config.instance_type} in {config.region}.\n\n"
+                "  The requested instance type is not currently available.\n"
+                "  Try a different region, availability zone, or instance type."
+            ) from None
         else:
             raise
 

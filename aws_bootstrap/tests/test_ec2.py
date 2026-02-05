@@ -3,7 +3,7 @@
 from __future__ import annotations
 import io
 from datetime import UTC, datetime
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import botocore.exceptions
 import click
@@ -84,6 +84,28 @@ def test_launch_instance_quota_error_includes_readme_hint():
     ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
     config = LaunchConfig(spot=True)
     with pytest.raises(click.ClickException, match="README.md"):
+        launch_instance(ec2, config, "ami-test", "sg-test")
+
+
+def test_launch_instance_insufficient_capacity_on_demand():
+    """On-demand launch with InsufficientInstanceCapacity gives a friendly error."""
+    ec2 = MagicMock()
+    ec2.run_instances.side_effect = _make_client_error("InsufficientInstanceCapacity")
+    config = LaunchConfig(spot=False, instance_type="p5.4xlarge")
+    with pytest.raises(click.ClickException, match="Insufficient capacity for p5.4xlarge"):
+        launch_instance(ec2, config, "ami-test", "sg-test")
+
+
+@patch("aws_bootstrap.ec2.is_text", return_value=False)
+def test_launch_instance_insufficient_capacity_on_demand_retry(_mock_is_text):
+    """Spot fails, on-demand retry also gets InsufficientInstanceCapacity."""
+    ec2 = MagicMock()
+    ec2.run_instances.side_effect = [
+        _make_client_error("InsufficientInstanceCapacity", "No spot capacity"),
+        _make_client_error("InsufficientInstanceCapacity", "No on-demand capacity"),
+    ]
+    config = LaunchConfig(spot=True, instance_type="p5.4xlarge")
+    with pytest.raises(click.ClickException, match="Neither spot nor on-demand"):
         launch_instance(ec2, config, "ami-test", "sg-test")
 
 
