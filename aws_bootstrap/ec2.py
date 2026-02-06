@@ -196,27 +196,53 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
 
 _UBUNTU_AMI = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
 
-QUOTA_HINT = (
-    "Check your current quotas with:\n"
-    "    aws-bootstrap quota show\n\n"
-    "  Request an increase with:\n"
-    "    aws-bootstrap quota request --type spot --desired-value 4\n\n"
-    "  To test the flow without GPU quotas, try:\n"
-    f'    aws-bootstrap launch --instance-type t3.medium --ami-filter "{_UBUNTU_AMI}"'
-)
+# Prefix patterns for mapping instance types to GPU quota families.
+# Checked in order — "p5" must come before "p" so p5/p5e don't match the general P family.
+_FAMILY_PREFIXES: list[tuple[tuple[str, ...], str]] = [
+    (("g", "vt"), "gvt"),
+    (("p5",), "p5"),
+    (("p",), "p"),
+    (("dl",), "dl"),
+]
+
+
+def instance_type_to_family(instance_type: str) -> str | None:
+    """Map an EC2 instance type (e.g. 'g4dn.xlarge') to its GPU quota family.
+
+    Returns None for non-GPU instance types (e.g. 't3.medium').
+    """
+    prefix = instance_type.split(".", maxsplit=1)[0]
+    for prefixes, family in _FAMILY_PREFIXES:
+        if prefix.startswith(prefixes):
+            return family
+    return None
+
+
+def _quota_hint(quota_type: str, family: str) -> str:
+    return (
+        "Check your current quotas with:\n"
+        f"    aws-bootstrap quota show --family {family}\n\n"
+        "  Request an increase with:\n"
+        f"    aws-bootstrap quota request --family {family} --type {quota_type} --desired-value 4\n\n"
+        "  To test the flow without GPU quotas, try:\n"
+        f'    aws-bootstrap launch --instance-type t3.medium --ami-filter "{_UBUNTU_AMI}"'
+    )
 
 
 def _raise_quota_error(code: str, config: LaunchConfig) -> None:
     if code == "MaxSpotInstanceCountExceeded":
-        pricing = "spot"
+        quota_type = "spot"
         label = "Spot instance"
     else:
-        pricing = "spot" if config.spot else "on-demand"
+        # VcpuLimitExceeded is always an on-demand quota error
+        quota_type = "on-demand"
         label = "On-demand vCPU"
+    family = instance_type_to_family(config.instance_type) or "gvt"
+    hint = _quota_hint(quota_type, family)
     msg = (
         f"{label} quota exceeded for {config.instance_type} in {config.region}.\n\n"
-        f"  Your account's {pricing} vCPU limit for this instance family is too low.\n"
-        f"  {QUOTA_HINT}"
+        f"  Your account's {quota_type} vCPU limit for this instance family is too low.\n"
+        f"  {hint}"
     )
     raise CLIError(msg)
 
