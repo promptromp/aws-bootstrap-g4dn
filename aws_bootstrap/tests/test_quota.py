@@ -7,7 +7,7 @@ from unittest.mock import MagicMock
 import botocore.exceptions
 import pytest
 
-from aws_bootstrap.ec2 import CLIError
+from aws_bootstrap.ec2 import CLIError, instance_type_to_family
 from aws_bootstrap.quota import (
     QUOTA_CODE_ON_DEMAND,
     QUOTA_CODE_SPOT,
@@ -312,3 +312,33 @@ def test_p_and_p5_share_on_demand_code():
     """P4/P3/P2 and P5 families share the same on-demand quota code."""
     assert QUOTA_FAMILIES["p"]["on-demand"] == QUOTA_FAMILIES["p5"]["on-demand"]
     assert QUOTA_FAMILIES["p"]["spot"] != QUOTA_FAMILIES["p5"]["spot"]
+
+
+# ---------------------------------------------------------------------------
+# instance_type_to_family
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "instance_type,expected",
+    [
+        ("g4dn.xlarge", "gvt"),
+        ("g5.2xlarge", "gvt"),
+        ("g6e.xlarge", "gvt"),
+        ("g3s.xlarge", "gvt"),
+        ("vt1.3xlarge", "gvt"),
+        ("p5.48xlarge", "p5"),
+        ("p5e.48xlarge", "p5"),
+        ("p4d.24xlarge", "p"),
+        ("p4de.24xlarge", "p"),
+        ("p3.2xlarge", "p"),
+        ("p2.xlarge", "p"),
+        ("dl1.24xlarge", "dl"),
+        ("dl2q.24xlarge", "dl"),
+        ("t3.medium", None),
+        ("m5.large", None),
+        ("c6i.xlarge", None),
+    ],
+)
+def test_instance_type_to_family(instance_type: str, expected: str | None):
+    assert instance_type_to_family(instance_type) == expected

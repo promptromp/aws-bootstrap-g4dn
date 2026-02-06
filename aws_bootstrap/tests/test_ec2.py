@@ -87,6 +87,46 @@ def test_launch_instance_quota_error_includes_quota_hint():
         launch_instance(ec2, config, "ami-test", "sg-test")
 
 
+def test_launch_instance_spot_quota_hint_has_type_spot():
+    """Spot quota error hint suggests --type spot."""
+    ec2 = MagicMock()
+    ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
+    config = LaunchConfig(spot=True, instance_type="g4dn.xlarge")
+    with pytest.raises(click.ClickException, match="--type spot"):
+        launch_instance(ec2, config, "ami-test", "sg-test")
+
+
+def test_launch_instance_on_demand_quota_hint_has_type_on_demand():
+    """On-demand quota error hint suggests --type on-demand."""
+    ec2 = MagicMock()
+    ec2.run_instances.side_effect = _make_client_error("VcpuLimitExceeded")
+    config = LaunchConfig(spot=False, instance_type="g4dn.xlarge")
+    with pytest.raises(click.ClickException, match="--type on-demand"):
+        launch_instance(ec2, config, "ami-test", "sg-test")
+
+
+def test_launch_instance_quota_hint_includes_family():
+    """Quota error hint includes --family matching the instance type."""
+    ec2 = MagicMock()
+    ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
+    config = LaunchConfig(spot=True, instance_type="p5.48xlarge")
+    with pytest.raises(click.ClickException, match="--family p5"):
+        launch_instance(ec2, config, "ami-test", "sg-test")
+
+
+@patch("aws_bootstrap.ec2.is_text", return_value=False)
+def test_launch_instance_on_demand_retry_quota_hint_type(_mock_is_text):
+    """On-demand retry quota error hints --type on-demand, not spot."""
+    ec2 = MagicMock()
+    ec2.run_instances.side_effect = [
+        _make_client_error("InsufficientInstanceCapacity", "No spot capacity"),
+        _make_client_error("VcpuLimitExceeded"),
+    ]
+    config = LaunchConfig(spot=True, instance_type="g4dn.xlarge")
+    with pytest.raises(click.ClickException, match="--type on-demand"):
+        launch_instance(ec2, config, "ami-test", "sg-test")
+
+
 def test_launch_instance_insufficient_capacity_on_demand():
     """On-demand launch with InsufficientInstanceCapacity gives a friendly error."""
     ec2 = MagicMock()
