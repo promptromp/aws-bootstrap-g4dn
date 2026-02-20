@@ -253,33 +253,6 @@ def test_get_family_quotas_gvt():
     assert types == {"spot", "on-demand"}
 
 
-def test_get_family_quotas_p5():
-    sq = MagicMock()
-    p5_spot = QUOTA_FAMILIES["p5"]["spot"]
-    p5_on_demand = QUOTA_FAMILIES["p5"]["on-demand"]
-
-    def fake_get(ServiceCode, QuotaCode):
-        names = {
-            p5_spot: "All P5 Spot Instance Requests",
-            p5_on_demand: "Running On-Demand P instances",
-        }
-        return {
-            "Quota": {
-                "QuotaCode": QuotaCode,
-                "QuotaName": names[QuotaCode],
-                "Value": 0.0,
-            }
-        }
-
-    sq.get_service_quota.side_effect = fake_get
-    results = get_family_quotas(sq, "p5")
-    assert len(results) == 2
-    assert all(r["family"] == "p5" for r in results)
-    codes = {r["quota_code"] for r in results}
-    assert p5_spot in codes
-    assert p5_on_demand in codes
-
-
 def test_get_all_gvt_quotas_delegates_to_get_family_quotas():
     """get_all_gvt_quotas is a convenience wrapper for get_family_quotas('gvt')."""
     sq = MagicMock()
@@ -301,17 +274,11 @@ def test_get_all_gvt_quotas_delegates_to_get_family_quotas():
 
 def test_quota_families_has_expected_keys():
     """QUOTA_FAMILIES should have all GPU families with spot and on-demand each."""
-    for key in ("gvt", "p5", "p", "dl"):
+    for key in ("gvt", "p", "dl"):
         assert key in QUOTA_FAMILIES
     for family in QUOTA_FAMILIES.values():
         assert "spot" in family
         assert "on-demand" in family
-
-
-def test_p_and_p5_share_on_demand_code():
-    """P4/P3/P2 and P5 families share the same on-demand quota code."""
-    assert QUOTA_FAMILIES["p"]["on-demand"] == QUOTA_FAMILIES["p5"]["on-demand"]
-    assert QUOTA_FAMILIES["p"]["spot"] != QUOTA_FAMILIES["p5"]["spot"]
 
 
 # ---------------------------------------------------------------------------
@@ -327,8 +294,10 @@ def test_p_and_p5_share_on_demand_code():
         ("g6e.xlarge", "gvt"),
         ("g3s.xlarge", "gvt"),
         ("vt1.3xlarge", "gvt"),
-        ("p5.48xlarge", "p5"),
-        ("p5e.48xlarge", "p5"),
+        ("p5.48xlarge", "p"),
+        ("p5e.48xlarge", "p"),
+        ("p5en.48xlarge", "p"),
+        ("p6.48xlarge", "p"),
         ("p4d.24xlarge", "p"),
         ("p4de.24xlarge", "p"),
         ("p3.2xlarge", "p"),

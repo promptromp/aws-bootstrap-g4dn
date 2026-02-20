@@ -301,9 +301,9 @@ aws-bootstrap quota show [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--family` | `gvt\|p5\|p\|dl` | all | Instance family to show |
+| `--family` | `gvt\|p\|dl` | all | Instance family to show |
 
-Supported families: `gvt` (g3, g4dn, g5, g6, g6e, vt1), `p5` (p5, p5e), `p` (p4d, p4de, p3, p2), `dl` (dl1, dl2q).
+Supported families: `gvt` (g3, g4dn, g5, g5g, g6, g6e, vt1), `p` (p2, p3, p4d, p4de, p5, p5e, p5en, p6), `dl` (dl1, dl2q).
 
 ### JSON Output
 
@@ -325,24 +325,10 @@ Supported families: `gvt` (g3, g4dn, g5, g6, g6e, vt1), `p5` (p5, p5e), `p` (p4d
       "value": 0.0
     },
     {
-      "family": "p5",
-      "quota_type": "spot",
-      "quota_code": "L-C4BD4855",
-      "quota_name": "All P5 Spot Instance Requests",
-      "value": 0.0
-    },
-    {
-      "family": "p5",
-      "quota_type": "on-demand",
-      "quota_code": "L-417A185B",
-      "quota_name": "Running On-Demand P instances",
-      "value": 0.0
-    },
-    {
       "family": "p",
       "quota_type": "spot",
       "quota_code": "L-7212CCBC",
-      "quota_name": "All P4, P3 and P2 Spot Instance Requests",
+      "quota_name": "All P Spot Instance Requests",
       "value": 0.0
     },
     {
@@ -384,7 +370,7 @@ aws-bootstrap quota request [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--family` | `gvt\|p5\|p\|dl` | `gvt` | Instance family |
+| `--family` | `gvt\|p\|dl` | `gvt` | Instance family |
 | `--type` | `spot\|on-demand` | required | Quota type to increase |
 | `--desired-value` | float | required | Desired quota value (vCPUs) |
 | `--yes` / `-y` | flag | false | Skip confirmation prompt (required for `--output json/yaml/table`) |
@@ -419,7 +405,7 @@ aws-bootstrap quota history [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--family` | `gvt\|p5\|p\|dl` | all | Filter by instance family |
+| `--family` | `gvt\|p\|dl` | all | Filter by instance family |
 | `--type` | `spot\|on-demand` | both | Filter by quota type |
 | `--status` | `PENDING\|CASE_OPENED\|APPROVED\|DENIED\|CASE_CLOSED\|NOT_APPROVED` | all | Filter by request status |
 

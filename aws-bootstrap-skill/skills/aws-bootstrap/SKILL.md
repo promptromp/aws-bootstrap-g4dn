@@ -2,9 +2,9 @@
 name: aws-bootstrap
 description: >
   Use when the user wants to provision AWS GPU instances, check GPU instance status,
-  terminate instances, manage EBS data volumes, or clean up cloud resources. Wraps the
-  aws-bootstrap CLI for EC2 GPU instance lifecycle management (launch, status, terminate,
-  cleanup, list).
+  terminate instances, manage EBS data volumes, clean up cloud resources, check GPU vCPU
+  quotas, or request quota increases. Wraps the aws-bootstrap CLI for EC2 GPU instance
+  lifecycle management (launch, status, terminate, cleanup, list, quota).
 ---
 
 # aws-bootstrap -- AWS GPU Instance Management
@@ -199,7 +199,7 @@ The `/data` volume is **not lost on spot interruption** — when AWS reclaims th
 ## Error Handling
 
 - **Spot capacity errors**: The CLI auto-falls back to on-demand pricing
-- **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`): Check with `aws-bootstrap quota show` and request increases with `aws-bootstrap quota request --family gvt --type spot --desired-value 4`. Other families: `--family p5`, `--family p` (P4/P3/P2), `--family dl`
+- **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`): Check with `aws-bootstrap quota show` and request increases with `aws-bootstrap quota request --family gvt --type spot --desired-value 4`. Other families: `--family p` (P2-P6), `--family dl`
 - **SSH timeouts**: Instance may still be initializing -- check `aws-bootstrap status`
 - **No public IP**: Check VPC settings or assign an Elastic IP
 - **EBS mount failures**: Non-fatal -- instance remains usable, may need manual mount

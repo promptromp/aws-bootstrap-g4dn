@@ -197,10 +197,8 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
 _UBUNTU_AMI = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
 
 # Prefix patterns for mapping instance types to GPU quota families.
-# Checked in order — "p5" must come before "p" so p5/p5e don't match the general P family.
 _FAMILY_PREFIXES: list[tuple[tuple[str, ...], str]] = [
     (("g", "vt"), "gvt"),
-    (("p5",), "p5"),
     (("p",), "p"),
     (("dl",), "dl"),
 ]
