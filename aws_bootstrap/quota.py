@@ -19,13 +19,9 @@ QUOTA_FAMILIES: dict[str, dict[str, str]] = {
         "spot": QUOTA_CODE_SPOT,
         "on-demand": QUOTA_CODE_ON_DEMAND,
     },
-    "p5": {
-        "spot": "L-C4BD4855",
-        "on-demand": "L-417A185B",  # "Running On-Demand P instances" (shared across all P)
-    },
     "p": {
         "spot": "L-7212CCBC",
-        "on-demand": "L-417A185B",  # same on-demand quota as P5
+        "on-demand": "L-417A185B",
     },
     "dl": {
         "spot": "L-85EED4F7",
@@ -35,8 +31,7 @@ QUOTA_FAMILIES: dict[str, dict[str, str]] = {
 
 QUOTA_FAMILY_LABELS: dict[str, str] = {
     "gvt": "G and VT (g3, g4dn, g5, g5g, g6, g6e, vt1)",
-    "p5": "P5 (p5, p5e)",
-    "p": "P4, P3, P2 (p4d, p4de, p3, p2)",
+    "p": "P (p2, p3, p4d, p4de, p5, p5e, p5en, p6)",
     "dl": "DL (dl1, dl2q)",
 }
 

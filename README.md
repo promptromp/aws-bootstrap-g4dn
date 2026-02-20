@@ -357,10 +357,7 @@ aws-bootstrap quota show
 # Show only G/VT family quotas
 aws-bootstrap quota show --family gvt
 
-# Show only P5 family quotas
-aws-bootstrap quota show --family p5
-
-# Show P4/P3/P2 family quotas
+# Show P family quotas (P2 through P6)
 aws-bootstrap quota show --family p
 
 # Or use the AWS CLI directly:
@@ -376,8 +373,8 @@ Request increases:
 # Built-in: request a G/VT spot quota increase (default family)
 aws-bootstrap quota request --type spot --desired-value 4
 
-# Request a P5 spot quota increase
-aws-bootstrap quota request --family p5 --type spot --desired-value 192
+# Request a P family spot quota increase
+aws-bootstrap quota request --family p --type spot --desired-value 192
 
 # Check request status
 aws-bootstrap quota history
@@ -407,9 +404,8 @@ Common quota codes:
 |--------|------|------|-------------|
 | G/VT | Spot | `L-3819A6DF` | All G and VT Spot Instance Requests |
 | G/VT | On-Demand | `L-DB2E81BA` | Running On-Demand G and VT instances |
-| P5 | Spot | `L-C4BD4855` | All P5 Spot Instance Requests |
-| P4/P3/P2 | Spot | `L-7212CCBC` | All P4, P3 and P2 Spot Instance Requests |
-| P (all) | On-Demand | `L-417A185B` | Running On-Demand P instances (shared across P2-P5) |
+| P | Spot | `L-7212CCBC` | All P Spot Instance Requests |
+| P | On-Demand | `L-417A185B` | Running On-Demand P instances |
 | DL | Spot | `L-85EED4F7` | All DL Spot Instance Requests |
 | DL | On-Demand | `L-6E869C2A` | Running On-Demand DL instances |
 

@@ -110,7 +110,7 @@ def test_launch_instance_quota_hint_includes_family():
     ec2 = MagicMock()
     ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
     config = LaunchConfig(spot=True, instance_type="p5.48xlarge")
-    with pytest.raises(click.ClickException, match="--family p5"):
+    with pytest.raises(click.ClickException, match="--family p"):
         launch_instance(ec2, config, "ami-test", "sg-test")
 
 
