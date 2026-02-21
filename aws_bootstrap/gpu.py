@@ -12,6 +12,10 @@ _GPU_ARCHITECTURES: dict[str, str] = {
     "8.7": "Ampere",
     "8.9": "Ada Lovelace",
     "9.0": "Hopper",
+    "10.0": "Blackwell",
+    "10.1": "Blackwell",
+    "12.0": "Blackwell",
+    "12.1": "Blackwell",
 }
 
 

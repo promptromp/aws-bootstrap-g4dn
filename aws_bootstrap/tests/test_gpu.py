@@ -90,9 +90,9 @@ def test_gpu_architecture_mapping():
 def test_query_gpu_info_unknown_architecture(mock_run):
     """Unknown compute capability produces a fallback architecture string."""
     mock_run.return_value = subprocess.CompletedProcess(
-        args=[], returncode=0, stdout="550.00.00, Future GPU, 10.0\n13.0\n13.0\n", stderr=""
+        args=[], returncode=0, stdout="550.00.00, Future GPU, 99.0\n13.0\n13.0\n", stderr=""
     )
 
     info = query_gpu_info("1.2.3.4", "ubuntu", Path("/home/user/.ssh/id_ed25519"))
     assert info is not None
-    assert info.architecture == "Unknown (10.0)"
+    assert info.architecture == "Unknown (99.0)"

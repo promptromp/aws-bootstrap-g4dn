@@ -172,6 +172,18 @@ def run_remote_setup(
         secho(f"  SCP failed: {saxpy_result.stderr}", fg="red", err=True)
         return False
 
+    # SCP the Triton vector add example
+    triton_path = script_path.parent / "triton_vector_add.py"
+    echo("  Uploading triton_vector_add.py...")
+    triton_result = subprocess.run(
+        ["scp", *ssh_opts, *scp_port_opts, str(triton_path), f"{user}@{host}:/tmp/triton_vector_add.py"],
+        capture_output=True,
+        text=True,
+    )
+    if triton_result.returncode != 0:
+        secho(f"  SCP failed: {triton_result.stderr}", fg="red", err=True)
+        return False
+
     # SCP the VSCode launch.json
     launch_json_path = script_path.parent / "launch.json"
     echo("  Uploading launch.json...")
