@@ -1,10 +1,34 @@
 {
-    // CUDA debug configurations for VSCode
+    // Debug/run configurations for VSCode
     // Deployed to: ~/workspace/.vscode/launch.json
     //
-    // Usage: Open any .cu file, press F5 to build and debug
+    // Usage: Open a .cu or .py file, press F5 to build/run and debug
     "version": "0.2.0",
     "configurations": [
+        // ── Python ──────────────────────────────────────────────
+        {
+            "name": "Python: Debug Active File",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "args": [],
+            "cwd": "${fileDirname}",
+            "python": "${userHome}/venv/bin/python",
+            "console": "integratedTerminal",
+            "justMyCode": true
+        },
+        {
+            "name": "Python: Debug Active File (all code)",
+            "type": "debugpy",
+            "request": "launch",
+            "program": "${file}",
+            "args": [],
+            "cwd": "${fileDirname}",
+            "python": "${userHome}/venv/bin/python",
+            "console": "integratedTerminal",
+            "justMyCode": false
+        },
+        // ── CUDA ────────────────────────────────────────────────
         {
             "name": "CUDA: Build and Debug Active File",
             "type": "cuda-gdb",
@@ -27,16 +51,5 @@
             "stopAtEntry": true,
             "preLaunchTask": "nvcc: build active file (debug)"
         },
-        {
-            "name": "CUDA: Run Active File (no debug)",
-            "type": "cuda-gdb",
-            "request": "launch",
-            "program": "${fileDirname}/${fileBasenameNoExtension}",
-            "args": [],
-            "cwd": "${fileDirname}",
-            "miDebuggerPath": "__CUDA_GDB_PATH__",
-            "stopAtEntry": false,
-            "preLaunchTask": "nvcc: build active file (release)"
-        }
     ]
 }

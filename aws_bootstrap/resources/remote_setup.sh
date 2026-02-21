@@ -260,6 +260,10 @@ fi
 cp /tmp/saxpy.cu ~/workspace/saxpy.cu
 echo "  Deployed saxpy.cu"
 
+# Copy Triton vector add example into workspace
+cp /tmp/triton_vector_add.py ~/workspace/triton_vector_add.py
+echo "  Deployed triton_vector_add.py"
+
 # Deploy launch.json with cuda-gdb path
 sed "s|__CUDA_GDB_PATH__|${CUDA_GDB_PATH}|g" /tmp/launch.json > ~/workspace/.vscode/launch.json
 echo "  Deployed launch.json"

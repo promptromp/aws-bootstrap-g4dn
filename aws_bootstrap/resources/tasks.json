@@ -1,5 +1,5 @@
 {
-    // CUDA build tasks for VSCode
+    // Build/run tasks for VSCode
     // Deployed to: ~/workspace/.vscode/tasks.json
     "version": "2.0.0",
     "tasks": [
@@ -43,6 +43,18 @@
             "problemMatcher": ["$nvcc"],
             "group": "build",
             "detail": "Compile active .cu file optimized (no debug)"
+        },
+        {
+            "label": "nvcc: build and run active file",
+            "dependsOn": "nvcc: build active file (release)",
+            "type": "shell",
+            "command": "${fileDirname}/${fileBasenameNoExtension}",
+            "options": {
+                "cwd": "${fileDirname}"
+            },
+            "problemMatcher": [],
+            "group": "build",
+            "detail": "Compile and run active .cu file (release mode)"
         }
     ]
 }
