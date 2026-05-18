@@ -1,0 +1,5 @@
+# activate venv (assuming default location as set by `uv venv`)
+. .venv/bin/activate
+
+# optional: set default AWS profile to use
+# export AWS_PROFILE="my-profile"
