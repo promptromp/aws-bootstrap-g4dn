@@ -24,8 +24,11 @@ Target workflows: Jupyter server-client, VSCode Remote SSH, and NVIDIA Nsight re
 ```bash
 uv venv .venv
 uv sync
+cp .envrc.example .envrc  # sample direnv config (venv activation + optional AWS_PROFILE)
 direnv allow  # or manually: source .venv/bin/activate
 ```
+
+`.envrc.example` is the tracked template; the copied `.envrc` is git-ignored.
 
 ## Project Structure
 
