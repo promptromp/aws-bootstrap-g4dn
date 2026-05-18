@@ -73,6 +73,18 @@ uv sync
 
 All methods install the `aws-bootstrap` CLI.
 
+#### Optional: auto-activate the venv with direnv
+
+A sample [direnv](https://direnv.net/) config is provided at [`.envrc.example`](.envrc.example). It activates the project venv (and optionally sets `AWS_PROFILE`) automatically when you `cd` into the repo:
+
+```bash
+cp .envrc.example .envrc
+# edit .envrc to uncomment/set AWS_PROFILE if desired
+direnv allow
+```
+
+`.envrc` is git-ignored, so your local copy stays out of version control.
+
 ## SSH Key Setup
 
 The CLI expects an Ed25519 SSH public key at `~/.ssh/id_ed25519.pub` by default. If you don't have one, generate it:
