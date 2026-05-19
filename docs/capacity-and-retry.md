@@ -17,7 +17,9 @@ zone** at that moment. Key properties:
   often succeeds.
 - **It is not a quota problem.** Quota errors (`VcpuLimitExceeded`,
   `MaxSpotInstanceCountExceeded`) are a different failure — your account limit,
-  not AWS capacity. Those never resolve by waiting and **fail fast**.
+  not AWS capacity. Those are **never retried by `--wait`** (waiting can't
+  raise a quota); in multi-region mode the launcher skips to the next region
+  instead — see "Region-fatal errors" below.
 
 ## Strategies
 

@@ -355,7 +355,9 @@ def launch_with_retry(
     offers the on-demand fallback (across all regions).
 
     ``prepare_region`` builds region-scoped prerequisites (client, AMI, SG); it
-    is invoked at most once per region and cached.
+    is invoked at most once per region and cached. ``on_attempt(region, market,
+    attempt)``'s ``attempt`` is the 0-based ``--wait`` backoff-cycle index; it
+    stays ``0`` outside the wait loop (no-wait pass and on-demand fallback).
     """
     regions = config.regions
     primary_spot = config.spot

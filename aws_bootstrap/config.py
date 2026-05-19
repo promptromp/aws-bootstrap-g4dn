@@ -44,6 +44,8 @@ class LaunchConfig:
         """Primary region (first in the ordered list).
 
         Kept for single-region callers and display fallback; the launch
-        retry loop iterates ``regions`` explicitly.
+        retry loop iterates ``regions`` explicitly. Falls back to
+        ``DEFAULT_REGION`` if ``regions`` is empty so callers get a sane
+        value instead of an opaque ``IndexError``.
         """
-        return self.regions[0]
+        return self.regions[0] if self.regions else DEFAULT_REGION
