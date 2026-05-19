@@ -269,24 +269,53 @@ def test_launch_with_retry_on_demand_quota_aggregated_after_spot_capacity():
     assert "aws-bootstrap quota show --family gvt --region us-west-2" in msg
 
 
+def test_launch_with_retry_wait_only_retries_capacity_regions():
+    """With --wait, quota-blocked regions are dropped; only capacity-limited
+    regions are re-swept, and on_wait reports retried vs skipped accurately
+    (regression: heartbeat used to list every region as if still swept)."""
+    contexts = {
+        "us-east-1": _region_ctx("us-east-1", _make_client_error("MaxSpotInstanceCountExceeded")),
+        "us-west-1": _region_ctx("us-west-1", _make_client_error("MaxSpotInstanceCountExceeded")),
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
+    }
+    config = LaunchConfig(regions=("us-east-1", "us-west-1", "us-west-2"), spot=True, wait=True, wait_timeout=100)
+    ticks = iter([0.0, 0.0, 150.0])
+    waits: list[tuple] = []
+    with pytest.raises(click.ClickException, match="within 100s"):
+        launch_with_retry(
+            config,
+            lambda r: contexts[r],
+            on_wait=lambda c, s, e, retrying, skipped: waits.append((tuple(retrying), tuple(skipped))),
+            sleeper=lambda _s: None,
+            clock=lambda: next(ticks),
+            rng=__import__("random").Random(0),
+        )
+    assert waits == [(("us-west-2",), ("us-east-1", "us-west-1"))]
+    # Quota-fatal regions attempted once only (not re-swept each cycle).
+    contexts["us-east-1"].ec2_client.run_instances.assert_called_once()
+    contexts["us-west-1"].ec2_client.run_instances.assert_called_once()
+    assert contexts["us-west-2"].ec2_client.run_instances.call_count >= 2
+
+
 def test_launch_with_retry_wait_times_out_hard_fail():
     ctx = _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity"))
     config = LaunchConfig(regions=("us-west-2",), spot=True, wait=True, wait_timeout=100)
     ticks = iter([0.0, 0.0, 150.0])  # start, check#1 (<100 -> one wait), check#2 (>=100 -> timeout)
     slept: list[float] = []
-    waits: list[int] = []
+    waits: list[tuple] = []
 
     with pytest.raises(click.ClickException, match="within 100s"):
         launch_with_retry(
             config,
             lambda r: ctx,
-            on_wait=lambda cycle, s, e: waits.append(cycle),
+            on_wait=lambda cycle, s, e, retrying, skipped: waits.append((cycle, tuple(retrying), tuple(skipped))),
             sleeper=slept.append,
             clock=lambda: next(ticks),
             rng=__import__("random").Random(0),
         )
     assert slept, "expected at least one backoff sleep before timeout"
-    assert waits == [1]
+    # One wait cycle; only the capacity-limited region is retried, none skipped.
+    assert waits == [(1, ("us-west-2",), ())]
 
 
 def test_launch_with_retry_no_wait_on_demand_fallback_across_regions():
