@@ -474,10 +474,11 @@ def _quota_hint(quota_type: str, family: str, region: str | None = None) -> str:
     # actually failed, otherwise the user inspects the wrong region's limits.
     region_flag = f" --region {region}" if region else ""
     return (
-        "Check your current quotas with:\n"
+        "Check your current quota — and copy the ready-to-run increase command — with:\n"
         f"    aws-bootstrap quota show --family {family}{region_flag}\n\n"
-        "  Request an increase with:\n"
-        f"    aws-bootstrap quota request --family {family} --type {quota_type} --desired-value 4{region_flag}\n\n"
+        f"  (it prints `aws-bootstrap quota request --family {family} --type {quota_type} "
+        f"--desired-value <N>{region_flag}` with an N above your current quota; a fixed\n"
+        "  value such as 4 is rejected by AWS if you already have a higher quota)\n\n"
         "  To test the flow without GPU quotas, try:\n"
         f'    aws-bootstrap launch --instance-type t3.medium --ami-filter "{_UBUNTU_AMI}"{region_flag}'
     )

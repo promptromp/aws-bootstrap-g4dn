@@ -352,7 +352,7 @@ def test_launch_with_retry_quota_hint_pins_failed_region():
     msg = exc.value.format_message()
     assert "us-east-1: on-demand quota exceeded" in msg
     assert "aws-bootstrap quota show --family gvt --region us-east-1" in msg
-    assert "--type on-demand --desired-value 4 --region us-east-1" in msg
+    assert "--type on-demand --desired-value <N> --region us-east-1" in msg
 
 
 def test_quota_hint_without_region_omits_flag():
