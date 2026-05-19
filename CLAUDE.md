@@ -67,7 +67,7 @@ aws_bootstrap/
         test_quota.py
 docs/
     nsight-remote-profiling.md # Nsight Compute, Nsight Systems, and Nsight VSCE remote profiling guide
-    spot-request-lifecycle.md  # Research notes on spot request cleanup
+    capacity-and-retry.md      # Multi-region & --wait retry model, backoff design, recommended region lists
 aws-bootstrap-skill/             # Claude Code plugin
     .claude-plugin/
         plugin.json              # Plugin manifest (identity, metadata)
