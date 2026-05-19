@@ -448,6 +448,6 @@ Requests are sorted newest-first. Field `case_id` is included when a support cas
 
 - **SSH aliases** use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and are managed in `~/.ssh/config`
 - **EBS volumes** are tagged with `created-by=aws-bootstrap-g4dn` for automatic discovery
-- **Spot pricing** auto-falls back to on-demand on `InsufficientInstanceCapacity` or `SpotMaxPriceTooLow` errors
+- **Spot capacity**: on a fully-exhausted spot sweep (`InsufficientInstanceCapacity` in every `--region`) **without `--wait`**, the launcher offers the on-demand fallback (auto-confirmed in structured modes). With `--wait` it retries with backoff and hard-fails on timeout (never auto-buys on-demand). Quota errors and `SpotMaxPriceTooLow` are **not** auto-fallback triggers — in multi-region mode they warn and skip to the next region, hard-failing only when every region is blocked.
 - **Remote setup** installs CUDA-matched PyTorch, Jupyter, GPU benchmark, and VSCode CUDA debug configs
 - The default AMI filter targets Ubuntu 24.04 Deep Learning AMIs with the OSS NVIDIA driver

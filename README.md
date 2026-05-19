@@ -419,20 +419,24 @@ aws service-quotas get-service-quota \
 Request increases:
 
 ```bash
-# Built-in: request a G/VT spot quota increase (default family)
-aws-bootstrap quota request --type spot --desired-value 4
+# `aws-bootstrap quota show` prints a ready-to-run `quota request` command
+# with a --desired-value above your current quota and pinned to --region.
+# The desired value must EXCEED the current quota (AWS rejects <= current),
+# so pick a value accordingly (8 shown as an example):
+aws-bootstrap quota show --family gvt --region us-west-2
+aws-bootstrap quota request --type spot --desired-value 8 --region us-west-2
 
 # Request a P family spot quota increase
-aws-bootstrap quota request --family p --type spot --desired-value 192
+aws-bootstrap quota request --family p --type spot --desired-value 192 --region us-west-2
 
 # Check request status
-aws-bootstrap quota history
+aws-bootstrap quota history --region us-west-2
 
 # Or use the AWS CLI directly:
 aws service-quotas request-service-quota-increase \
   --service-code ec2 \
   --quota-code L-3819A6DF \
-  --desired-value 4 \
+  --desired-value 8 \
   --region us-west-2
 ```
 
