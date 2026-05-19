@@ -721,6 +721,36 @@ def query_gpu_info(
         return None
 
 
+def query_cuda_version(
+    host: str, user: str, key_path: Path, timeout: int = 10, port: int = SSH_PORT_DEFAULT
+) -> str | None:
+    """Read the CUDA version remote_setup.sh recorded (~/.aws-bootstrap-cuda).
+
+    Returns a version string like ``13.2``, or None if absent/unknown (e.g.
+    ``--no-setup``, no CUDA detected, or the file isn't there yet).
+    """
+    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
+    cmd = [
+        "ssh",
+        *_ssh_opts(key_path),
+        *port_opts,
+        "-o",
+        f"ConnectTimeout={timeout}",
+        "-o",
+        "BatchMode=yes",
+        f"{user}@{host}",
+        "cat ~/.aws-bootstrap-cuda 2>/dev/null",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value if re.fullmatch(r"\d+\.\d+", value) else None
+
+
 # ---------------------------------------------------------------------------
 # EBS volume mount
 # ---------------------------------------------------------------------------

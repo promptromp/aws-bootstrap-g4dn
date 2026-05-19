@@ -70,6 +70,7 @@ aws-bootstrap launch [OPTIONS]
   "region": "us-west-2",
   "regions_tried": ["us-west-2", "us-east-1"],
   "ssh_alias": "aws-gpu1",
+  "cuda_version": "13.2",
   "ebs_volume": {
     "volume_id": "vol-0abc123",
     "mount_point": "/data",
@@ -78,7 +79,7 @@ aws-bootstrap launch [OPTIONS]
 }
 ```
 
-The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id` is used. `region` is the region the instance actually launched in; `regions_tried` lists all regions attempted in order.
+The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id` is used. `cuda_version` is present only when remote setup ran and a CUDA version was detected (omitted with `--no-setup` or on non-CUDA/smoke-test instances). `region` is the region the instance actually launched in; `regions_tried` lists all regions attempted in order.
 
 **Dry run:**
 ```json
