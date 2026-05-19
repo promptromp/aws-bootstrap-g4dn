@@ -51,7 +51,8 @@ command sleeps and retries until `--wait-timeout`.
   `⏳ wait cycle N: no <pricing> capacity in <regions-being-retried> — next sweep in <s>s`.
   Only capacity-limited regions are re-swept; quota/price-blocked regions are
   dropped (waiting can't fix them) and reported separately as
-  `(not retried — quota/price blocked: <regions>; fix quota then re-run …)`.
+  `(not retried — quota/price blocked: <regions>; fix quota then re-run …)`,
+  followed by an `(elapsed <s>s of <budget>s budget)` progress line.
 - **On timeout:** the command **hard-fails** with a clear error. It does *not*
   silently fall back to on-demand — choose `--on-demand` explicitly if you want
   guaranteed (paid) capacity.
