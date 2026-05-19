@@ -19,7 +19,7 @@ from aws_bootstrap.ssh import CleanupResult, SSHHostDetails
 def _region_launch(instance, *, region="us-west-2", pricing="spot", ami=None):
     """Build a RegionLaunch as launch_with_retry would return it."""
     ami = ami or {"ImageId": "ami-123", "Name": "TestAMI"}
-    ctx = RegionContext(region=region, ec2_client=MagicMock(), ami=ami, sg_id="sg-123")
+    ctx = RegionContext(region=region, ec2_client=MagicMock(), ami=ami, sg_id="sg-123", key_name="aws-bootstrap-key")
     return RegionLaunch(region=region, context=ctx, instance=instance, pricing=pricing)
 
 
@@ -51,11 +51,34 @@ def test_launch_help():
     assert "--key-path" in result.output
 
 
-def test_launch_missing_key():
+def test_launch_missing_key_ungeneratable_path_errors_clearly():
+    # Missing key now triggers auto-generation; an ungeneratable path
+    # (cannot create /nonexistent) must fail with a clear message.
     runner = CliRunner()
     result = runner.invoke(main, ["launch", "--key-path", "/nonexistent/key.pub"])
     assert result.exit_code != 0
-    assert "SSH public key not found" in result.output
+    assert "could not be generated" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami", return_value={"ImageId": "ami-1", "Name": "DL AMI"})
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-1")
+@patch("aws_bootstrap.cli.generate_ssh_keypair")
+def test_launch_missing_key_autogenerates(mock_gen, mock_sg, mock_imp, mock_ami, mock_session, tmp_path):
+    mock_session.return_value.region_name = None
+    key = tmp_path / "id_ed25519.pub"
+
+    def _fake_gen(pub_path):
+        Path(pub_path).write_text("ssh-ed25519 AAAAGEN generated\n")
+
+    mock_gen.side_effect = _fake_gen
+    runner = CliRunner()
+    # --dry-run stops before any AWS launch; we only assert key auto-generation.
+    result = runner.invoke(main, ["launch", "--key-path", str(key), "--dry-run", "--region", "us-west-2"])
+    assert result.exit_code == 0
+    mock_gen.assert_called_once()
+    assert "generating a new ed25519 key pair" in result.output
 
 
 def test_status_help():

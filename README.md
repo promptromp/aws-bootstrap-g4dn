@@ -93,13 +93,19 @@ The CLI expects an Ed25519 SSH public key at `~/.ssh/id_ed25519.pub` by default.
 ssh-keygen -t ed25519
 ```
 
-Accept the default path (`~/.ssh/id_ed25519`) and optionally set a passphrase. The key pair will be imported into AWS automatically on first launch.
+Accept the default path (`~/.ssh/id_ed25519`) and optionally set a passphrase. The key pair is imported into AWS automatically on first launch.
 
 To use a different key, pass `--key-path`:
 
 ```bash
 aws-bootstrap launch --key-path ~/.ssh/my_other_key.pub
 ```
+
+**Robust key handling** (so you never end up with an instance you can't reach):
+
+- **Missing local key** — if `--key-path` doesn't exist, `launch` auto-generates an Ed25519 key pair there (instead of aborting).
+- **Name collision with a different key** — if an AWS key pair already exists with the target `--key-name` but its public key differs from your local key (e.g. created from another machine), the existing AWS key pair is **left untouched** and your local key is imported under a deterministic derived name `aws-bootstrap-key-<fp8>`, which the instance is launched with. You always hold the matching private key.
+- **Unreachable instance** — if SSH still fails with an authentication/host-key error, `launch` **stops immediately** and prints the real `ssh` error (no more silent 5-minute "SSH not ready" loop masking a `Permission denied (publickey)`).
 
 ## Usage
 

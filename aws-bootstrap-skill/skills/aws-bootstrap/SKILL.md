@@ -203,6 +203,8 @@ The `/data` volume is **not lost on spot interruption** — when AWS reclaims th
 
 - **Spot capacity errors** (`InsufficientInstanceCapacity`): prefer multiple `--region` values (tried in order) and/or `--wait --wait-timeout` over manual retry loops — the CLI handles bounded backoff internally. Without `--wait`, an exhausted spot pass auto-falls back to on-demand in structured modes. `--wait` hard-fails on timeout (it does not auto-buy on-demand).
 - **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`) and `SpotMaxPriceTooLow`: never retried by `--wait`, but in multi-region mode the launcher warns (with a region-pinned hint) and tries the next `--region`; it fails hard only when every region is blocked. Quotas are per-region — the suggested `aws-bootstrap quota show` / `quota request` commands are auto-pinned to `--region <failed-region>`. Run them as-is; other families: `--family p` (P2-P6), `--family dl`.
+- **SSH key handling**: a missing local `--key-path` is auto-generated (ed25519); if an AWS key pair with the target `--key-name` exists but is a *different* key, the existing one is left untouched and the local key is imported under a derived name `<key-name>-<fp8>` so the instance is always reachable.
+- **SSH auth failure**: `launch` fails fast (no long retry loop) and surfaces the real `ssh` error (e.g. `Permission denied (publickey)`) instead of a generic "SSH not ready" — indicates a key mismatch; relaunch with the correct `--key-name`/`--key-path`.
 - **SSH timeouts**: Instance may still be initializing -- check `aws-bootstrap status`
 - **No public IP**: Check VPC settings or assign an Elastic IP
 - **EBS mount failures**: Non-fatal -- instance remains usable, may need manual mount
