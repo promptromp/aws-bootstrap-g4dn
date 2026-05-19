@@ -165,7 +165,36 @@ def test_quota_show_request_hint_pins_resolved_region(mock_quotas, mock_session)
     ]
     result = CliRunner().invoke(main, ["quota", "show", "--family", "gvt", "--region", "us-west-1"])
     assert result.exit_code == 0
-    assert "aws-bootstrap quota request --family gvt --type spot --desired-value 4 --region us-west-1" in result.output
+    # current spot quota is 0 -> suggested desired-value is max(8, 0+4) = 8,
+    # and the command is pinned to the queried region.
+    assert "aws-bootstrap quota request --family gvt --type spot --desired-value 8 --region us-west-1" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_family_quotas")
+def test_quota_show_suggests_value_above_current(mock_quotas, mock_session):
+    """Suggested --desired-value must exceed the current quota (AWS rejects <=)."""
+    mock_session.return_value.region_name = None
+    mock_quotas.return_value = [
+        {
+            "quota_code": "L-3819A6DF",
+            "quota_name": "All G and VT Spot",
+            "value": 32.0,
+            "quota_type": "spot",
+            "family": "gvt",
+        },
+        {
+            "quota_code": "L-DB2E81BA",
+            "quota_name": "Running On-Demand G and VT",
+            "value": 8.0,
+            "quota_type": "on-demand",
+            "family": "gvt",
+        },
+    ]
+    result = CliRunner().invoke(main, ["quota", "show", "--family", "gvt", "--region", "us-east-1"])
+    assert result.exit_code == 0
+    # current spot = 32 -> suggested = max(8, 32+4) = 36 (> current).
+    assert "--type spot --desired-value 36 --region us-east-1" in result.output
 
 
 @patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)

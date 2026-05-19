@@ -1147,7 +1147,7 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
     types = list_instance_types(ec2, prefix)
     if not types:
         if is_text(ctx):
-            click.secho(f"No instance types found matching '{prefix}.*'", fg="yellow")
+            click.secho(f"No instance types found matching '{prefix}.*' in {region}", fg="yellow")
         else:
             emit([], ctx=ctx)
         return
@@ -1214,7 +1214,7 @@ def list_amis_cmd(ctx, ami_filter, region, profile):
     amis = list_amis(ec2, ami_filter)
     if not amis:
         if is_text(ctx):
-            click.secho(f"No AMIs found matching '{ami_filter}'", fg="yellow")
+            click.secho(f"No AMIs found matching '{ami_filter}' in {region}", fg="yellow")
         else:
             emit([], ctx=ctx)
         return
@@ -1318,13 +1318,24 @@ def quota_show(ctx, family, region, profile):
             click.echo()
 
     example_family = family or "gvt"
+    # AWS rejects a desired value that is not strictly greater than the current
+    # quota, so base the suggestion on the family's current spot value rather
+    # than a fixed 4 (which fails outright when the quota is already >= 4).
+    current_spot = next(
+        (q["value"] for q in all_quotas if q["family"] == example_family and q["quota_type"] == "spot"),
+        0.0,
+    )
+    suggested = max(8, int(current_spot) + 4)
     click.echo(
         "  " + click.style("Tip: ", fg="bright_black") + click.style("g4dn.xlarge requires 4 vCPUs", fg="bright_black")
     )
     click.echo(
         "  "
         + click.style("To request an increase: ", fg="bright_black")
-        + _cmd(f"aws-bootstrap quota request --family {example_family} --type spot --desired-value 4 --region {region}")
+        + _cmd(
+            f"aws-bootstrap quota request --family {example_family} --type spot "
+            f"--desired-value {suggested} --region {region}"
+        )
     )
     click.echo()
 
