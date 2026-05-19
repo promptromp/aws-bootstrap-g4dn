@@ -98,6 +98,43 @@ def warn(msg: str) -> None:
     click.secho(f"  WARNING: {msg}", fg="yellow", err=True)
 
 
+# --- Multi-region launch color scheme ---------------------------------------
+# Region-scoped output is hard to scan during retries/quota fallthrough.
+# Consistent hues let the eye group by region and spot actionable commands.
+
+
+def _rtag(region: str) -> str:
+    """Region marker, same hue everywhere so attempts group visually."""
+    return click.style(f"[{region}]", fg="bright_blue", bold=True)
+
+
+def _region_rule(region: str) -> None:
+    """Separator printed before a region's attempt block (multi-region, text only)."""
+    if not is_text():
+        return
+    bar = "┄" * max(4, 44 - len(region))
+    click.secho(f"\n┄┄ {region} {bar}", fg="bright_blue", bold=True)
+
+
+def _emit_region_fatal(region: str, kind: str, message: str, more_regions: bool) -> None:
+    """Render a quota/price skip: bold-yellow verdict, copy-paste commands in
+    bright-cyan so they stand out of the warning block."""
+    if not is_text():
+        return
+    label = "spot quota exceeded" if kind == "quota" else "spot price too low"
+    click.secho(f"\n  ✗ {region}: {label} — skipping", fg="yellow", bold=True, err=True)
+    for line in message.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith("aws-bootstrap"):
+            click.secho(f"      {s}", fg="bright_cyan", bold=True, err=True)
+        else:
+            click.secho(f"    {s}", fg="yellow", err=True)
+    if more_regions:
+        click.secho("  → trying the next region", fg="yellow", dim=True, err=True)
+
+
 def _session_region(profile: str | None) -> str | None:
     """Region configured via AWS_DEFAULT_REGION or the active profile (no override)."""
     region = boto3.Session(profile_name=profile).region_name
@@ -316,10 +353,14 @@ def launch(
         multi-region mode.
         """
         ec2r = boto3.Session(profile_name=config.profile, region_name=region).client("ec2")
+        if multi_region:
+            _region_rule(region)
         try:
-            info(f"[{region}] Looking up AMI...")
+            if is_text():
+                click.echo(f"  {_rtag(region)} " + click.style("looking up AMI…", dim=True))
             ami_r = get_latest_ami(ec2r, config.ami_filter)
-            info(f"[{region}] AMI: {ami_r['ImageId']} ({ami_r['Name']})")
+            if is_text():
+                click.echo(f"  {_rtag(region)} " + click.style(f"AMI {ami_r['ImageId']}", dim=True))
             import_key_pair(ec2r, config.key_name, config.key_path)
             sg_id_r = ensure_security_group(ec2r, config.security_group, config.tag_value, ssh_port=config.ssh_port)
         except CLIError as e:
@@ -387,25 +428,23 @@ def launch(
     step(1, total_steps, caption)
 
     def on_attempt(region: str, market: str, attempt: int) -> None:
-        info(f"[{region}] Requesting {market} {config.instance_type}...")
+        if is_text():
+            verb = click.style(f"requesting {market}", fg="cyan", bold=True)
+            click.echo(f"  {_rtag(region)} {verb} {config.instance_type}…")
 
     def on_wait(cycle: int, sleep_s: float, elapsed: float) -> None:
         if is_text():
+            nxt = click.style(f"{sleep_s:.0f}s", fg="yellow", bold=True)
             click.secho(
-                f"  [wait] cycle {cycle}: no {pricing} capacity in any of {regions_label} — "
-                f"next sweep in {sleep_s:.0f}s (elapsed {elapsed:.0f}s)",
+                f"\n  ⏳ wait cycle {cycle}: no {pricing} capacity in {regions_label} — next sweep in {nxt}",
                 fg="yellow",
             )
+            click.secho(f"     (elapsed {elapsed:.0f}s of {config.wait_timeout}s budget)", fg="yellow", dim=True)
 
     def on_region_fatal(region: str, kind: str, message: str) -> None:
         # Quota / spot-price problem in this region: warn with the full
-        # remediation hint, then the launcher moves on to the next region.
-        if is_text():
-            label = "quota" if kind == "quota" else "spot price"
-            click.secho(f"\n  WARNING: {region} skipped ({label}):", fg="yellow", err=True)
-            click.secho(f"  {message}", fg="yellow", err=True)
-            if len(config.regions) > 1:
-                click.secho("  Trying the next region...", fg="yellow", err=True)
+        # remediation hint (commands highlighted), then move on.
+        _emit_region_fatal(region, kind, message, more_regions=len(config.regions) > 1)
 
     launched = launch_with_retry(
         config,
