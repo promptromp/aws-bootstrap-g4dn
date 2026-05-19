@@ -871,7 +871,10 @@ def test_launch_help_shows_region_and_wait():
     assert result.exit_code == 0
     assert "--wait" in result.output
     assert "--wait-timeout" in result.output
-    assert "Repeat to try multiple regions" in result.output
+    # Help text is line-wrapped by Click; normalize whitespace before matching.
+    flat = " ".join(result.output.split())
+    assert "attempted one at a time in the given order" in flat
+    assert "NOT one instance per region" in flat
 
 
 @patch("aws_bootstrap.cli.boto3.Session")

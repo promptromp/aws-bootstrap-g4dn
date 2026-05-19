@@ -53,12 +53,55 @@ command sleeps and retries until `--wait-timeout`.
 - **`--wait-timeout` format:** `90s`, `30m`, `1h`, or a bare integer (seconds).
   Default `30m`.
 
+### How `--wait` and multiple `--region` combine
+
+This is the most important thing to understand. **A region sweep is the inner
+loop; backoff is the outer loop:**
+
+```
+repeat until --wait-timeout:                 # outer loop — backoff between sweeps
+    for region in --region order:            # inner loop — NO delay between regions
+        try spot in region
+        capacity?  -> launch here, done
+        no capacity -> immediately try next region
+    every region missed -> sleep (backoff), then sweep again from the top
+```
+
+Consequences:
+
+- `--wait --region A --region B` does **not** mean "wait on A, then try B."
+  It means: try A then B back-to-back (no sleep between them); if **both** are
+  dry, back off, then try A then B **again** — repeating until the timeout.
+- **Backoff is per full sweep, not per region.** The sleep means "all my
+  regions are dry right now." The interval escalates per sweep
+  (`30s, 60s, 120s, …` capped at 300s), independent of how many regions you
+  listed.
+- **Region order still wins every tie.** In each sweep the first region with
+  capacity gets the instance, so list your most-preferred region first.
+- **`--wait-timeout` is total wall-clock** across all sweeps (sleeps + the
+  brief sweep attempts), not per region or per sweep. The last sleep is
+  clamped so it never overshoots the deadline.
+- Adding more regions widens each sweep (more chances per cycle) but does
+  **not** change the backoff schedule or the total timeout.
+
+Example — `--region us-east-1 --region us-west-2 --wait --wait-timeout 1h`:
+sweep both regions instantly; if both dry, sleep ~30s; sweep both again;
+sleep ~60s; … capped at ~300s between sweeps; the moment either region has
+spot capacity, launch there; if 1h elapses with no capacity in either,
+hard-fail.
+
 ### Fail-fast errors (never retried)
 
 | Error | Why no retry |
 |-------|--------------|
 | `VcpuLimitExceeded` / `MaxSpotInstanceCountExceeded` | Account quota — see `aws-bootstrap quota` |
 | `SpotMaxPriceTooLow` | Bid below market; waiting won't change it — use `--on-demand` |
+
+A quota error stops the run immediately (it does not continue to later
+`--region` values). Quotas are **per region**, so the suggested
+`aws-bootstrap quota show` / `quota request` commands in the error are
+automatically pinned to `--region <the region that failed>` — run them
+verbatim; don't let them resolve to your default region.
 
 ### On-demand fallback (without `--wait`)
 

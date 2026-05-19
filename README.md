@@ -167,11 +167,13 @@ Spot `InsufficientInstanceCapacity` is scoped to a **region and availability zon
   aws-bootstrap launch --region us-west-2 --region us-east-1 --region eu-west-1
   ```
 
-- **`--wait`** — on insufficient spot capacity, keep retrying with **capped, jittered exponential backoff** until `--wait-timeout` (default `30m`; accepts `90s`, `30m`, `1h`, or bare seconds). Each cycle tries spot in every `--region` in order; if all are exhausted it sleeps and retries. On timeout it **hard-fails** (it does not silently fall back to on-demand):
+- **`--wait`** — on insufficient spot capacity, keep retrying with **capped, jittered exponential backoff** until `--wait-timeout` (default `30m`; accepts `90s`, `30m`, `1h`, or bare seconds). On timeout it **hard-fails** (it does not silently fall back to on-demand):
 
   ```bash
   aws-bootstrap launch --region us-west-2 --region us-east-1 --wait --wait-timeout 1h
   ```
+
+**How `--wait` + multiple `--region` combine:** a **region sweep is the inner loop, backoff is the outer loop**. Each cycle tries spot in every `--region` in order *with no delay between regions*; only when **all** regions miss does it sleep (backoff) and sweep again. So `--wait --region A --region B` means "try A then B instantly; if both dry, back off and retry A then B" — repeating until timeout — *not* "wait on A, then try B." Backoff escalates per sweep (not per region), region order wins every tie, and `--wait-timeout` is total wall-clock. See [docs/capacity-and-retry.md](docs/capacity-and-retry.md#how---wait-and-multiple---region-combine) for the full model.
 
 Quota errors (`VcpuLimitExceeded`, `MaxSpotInstanceCountExceeded`) and `SpotMaxPriceTooLow` **fail fast** — retrying never helps. Without `--wait`, a single exhausted spot pass still offers the interactive on-demand fallback (across all regions).
 

@@ -191,8 +191,9 @@ def main(ctx, output):
     multiple=True,
     metavar="REGION",
     help=(
-        "AWS region. Repeat to try multiple regions in order on capacity "
-        "shortfall (e.g. --region us-west-2 --region us-east-1). "
+        "AWS region. Repeatable: regions are attempted one at a time in the "
+        "given order and the first with capacity is used (NOT one instance per "
+        "region) — e.g. --region us-west-2 --region us-east-1. "
         "Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2."
     ),
 )
@@ -200,7 +201,11 @@ def main(ctx, output):
     "--wait",
     is_flag=True,
     default=False,
-    help="On insufficient spot capacity, keep retrying (bounded exponential backoff) until --wait-timeout.",
+    help=(
+        "On insufficient spot capacity, keep retrying: re-sweep all --region "
+        "values (bounded exponential backoff between sweeps) until --wait-timeout, "
+        "then fail."
+    ),
 )
 @click.option(
     "--wait-timeout",
@@ -285,7 +290,10 @@ def launch(
     if not config.key_path.exists():
         raise CLIError(f"SSH public key not found: {config.key_path}")
 
-    regions_label = ", ".join(config.regions)
+    multi_region = len(config.regions) > 1
+    # "us-west-2" for one region; "us-west-2 → us-east-1 → eu-west-1" for many,
+    # to make the in-order, one-at-a-time attempt sequence unambiguous.
+    regions_label = " → ".join(config.regions) if multi_region else config.regions[0]
     pricing = "spot" if config.spot else "on-demand"
 
     has_ebs = config.ebs_storage is not None or config.ebs_volume_id is not None
@@ -353,7 +361,13 @@ def launch(
         return
 
     # Step 1: Launch instance (prepare region prerequisites + run, spot-first across regions)
-    step(1, total_steps, f"Launching {config.instance_type} ({pricing}) in {regions_label}...")
+    if multi_region:
+        caption = (
+            f"Launching {config.instance_type} ({pricing}) — trying regions in order, one at a time: {regions_label}..."
+        )
+    else:
+        caption = f"Launching {config.instance_type} ({pricing}) in {regions_label}..."
+    step(1, total_steps, caption)
 
     def on_attempt(region: str, market: str, attempt: int) -> None:
         info(f"[{region}] Requesting {market} {config.instance_type}...")
@@ -361,8 +375,8 @@ def launch(
     def on_wait(cycle: int, sleep_s: float, elapsed: float) -> None:
         if is_text():
             click.secho(
-                f"  [wait] cycle {cycle}: no capacity in {regions_label} — "
-                f"next attempt in {sleep_s:.0f}s (elapsed {elapsed:.0f}s)",
+                f"  [wait] cycle {cycle}: no {pricing} capacity in any of {regions_label} — "
+                f"next sweep in {sleep_s:.0f}s (elapsed {elapsed:.0f}s)",
                 fg="yellow",
             )
 

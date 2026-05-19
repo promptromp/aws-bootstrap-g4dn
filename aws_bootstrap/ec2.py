@@ -370,14 +370,17 @@ def instance_type_to_family(instance_type: str) -> str | None:
     return None
 
 
-def _quota_hint(quota_type: str, family: str) -> str:
+def _quota_hint(quota_type: str, family: str, region: str | None = None) -> str:
+    # Quotas are per-region — pin the suggested commands to the region that
+    # actually failed, otherwise the user inspects the wrong region's limits.
+    region_flag = f" --region {region}" if region else ""
     return (
         "Check your current quotas with:\n"
-        f"    aws-bootstrap quota show --family {family}\n\n"
+        f"    aws-bootstrap quota show --family {family}{region_flag}\n\n"
         "  Request an increase with:\n"
-        f"    aws-bootstrap quota request --family {family} --type {quota_type} --desired-value 4\n\n"
+        f"    aws-bootstrap quota request --family {family} --type {quota_type} --desired-value 4{region_flag}\n\n"
         "  To test the flow without GPU quotas, try:\n"
-        f'    aws-bootstrap launch --instance-type t3.medium --ami-filter "{_UBUNTU_AMI}"'
+        f'    aws-bootstrap launch --instance-type t3.medium --ami-filter "{_UBUNTU_AMI}"{region_flag}'
     )
 
 
@@ -390,9 +393,10 @@ def _raise_quota_error(code: str, config: LaunchConfig, region: str | None = Non
         quota_type = "on-demand"
         label = "On-demand vCPU"
     family = instance_type_to_family(config.instance_type) or "gvt"
-    hint = _quota_hint(quota_type, family)
+    failed_region = region or config.region
+    hint = _quota_hint(quota_type, family, failed_region)
     msg = (
-        f"{label} quota exceeded for {config.instance_type} in {region or config.region}.\n\n"
+        f"{label} quota exceeded for {config.instance_type} in {failed_region}.\n\n"
         f"  Your account's {quota_type} vCPU limit for this instance family is too low.\n"
         f"  {hint}"
     )

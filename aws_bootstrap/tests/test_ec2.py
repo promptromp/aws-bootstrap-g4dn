@@ -272,6 +272,31 @@ def test_launch_with_retry_prepares_each_region_once():
     assert len(prep_calls) == 2  # each region prepared exactly once
 
 
+def test_launch_with_retry_quota_hint_pins_failed_region():
+    """Quota error suggestions include --region for the region that failed."""
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
+        "us-east-1": _region_ctx("us-east-1", _make_client_error("MaxSpotInstanceCountExceeded")),
+    }
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True, instance_type="g4dn.xlarge")
+    with pytest.raises(click.ClickException) as exc:
+        launch_with_retry(config, lambda r: contexts[r])
+    msg = exc.value.format_message()
+    assert "in us-east-1" in msg
+    assert "aws-bootstrap quota show --family gvt --region us-east-1" in msg
+    assert "--type spot --desired-value 4 --region us-east-1" in msg
+
+
+def test_quota_hint_without_region_omits_flag():
+    ec2 = MagicMock()
+    ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
+    config = LaunchConfig(spot=True, instance_type="g4dn.xlarge", regions=("us-west-2",))
+    with pytest.raises(click.ClickException) as exc:
+        launch_instance(ec2, config, "ami-test", "sg-test")
+    # Single-region back-compat path still pins the region (config.region).
+    assert "--region us-west-2" in exc.value.format_message()
+
+
 def test_launch_with_retry_capacity_error_carries_region_and_market():
     err = CapacityError("eu-west-1", "spot", "no capacity")
     assert err.region == "eu-west-1"

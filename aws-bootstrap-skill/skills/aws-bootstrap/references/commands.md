@@ -54,6 +54,8 @@ aws-bootstrap launch [OPTIONS]
 
 `--ebs-storage` and `--ebs-volume-id` are mutually exclusive.
 
+**`--wait` + multiple `--region`:** a region sweep is the inner loop, backoff is the outer loop. Each cycle tries spot in every `--region` in order with no delay between regions; only when *all* regions miss does it sleep (capped+jittered exponential backoff, escalating per sweep) and sweep again, until `--wait-timeout` total wall-clock, then hard-fail. So `--wait --region A --region B` = "try A then B instantly; if both dry, back off and retry both" — not "wait on A then try B." Region order wins every tie. Without `--wait`, exactly one sweep then on-demand fallback.
+
 ### JSON Output
 
 **Normal launch:**
