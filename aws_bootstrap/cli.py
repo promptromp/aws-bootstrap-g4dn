@@ -59,6 +59,7 @@ from .ssh import (
     list_ssh_hosts,
     mount_ebs_volume,
     private_key_path,
+    query_cuda_version,
     query_gpu_info,
     remove_ssh_host,
     resolve_instance_id,
@@ -548,6 +549,7 @@ def launch(
         )
         return
 
+    cuda_version: str | None = None
     if config.run_setup:
         if not SETUP_SCRIPT.exists():
             warn(f"Setup script not found at {SETUP_SCRIPT}, skipping.")
@@ -557,6 +559,7 @@ def launch(
                 public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT, config.python_version, port=config.ssh_port
             ):
                 success("Remote setup completed successfully.")
+                cuda_version = query_cuda_version(public_ip, config.ssh_user, config.key_path, port=config.ssh_port)
             else:
                 warn("Remote setup failed. Instance is still running.")
 
@@ -600,6 +603,8 @@ def launch(
             "regions_tried": list(config.regions),
             "ssh_alias": alias,
         }
+        if cuda_version:
+            result_data["cuda_version"] = cuda_version
         if ebs_volume_attached:
             ebs_info: dict = {
                 "volume_id": ebs_volume_attached,
@@ -622,6 +627,8 @@ def launch(
     val("Instance", config.instance_type)
     val("Region", active_region)
     val("Pricing", pricing)
+    if cuda_version:
+        val("CUDA Version", cuda_version)
     val("SSH alias", alias)
     if ebs_volume_attached:
         if config.ebs_storage:
@@ -652,7 +659,7 @@ def launch(
 
     click.echo()
     click.secho("  GPU Benchmark:", fg="cyan")
-    click.echo("    " + _cmd(f"ssh {alias} 'python ~/gpu_benchmark.py'"))
+    click.echo("    " + _cmd(f"ssh {alias} '~/venv/bin/python ~/gpu_benchmark.py'"))
     info("Runs CNN (MNIST) and Transformer benchmarks with tqdm progress")
 
     click.echo()
@@ -848,7 +855,7 @@ def status(ctx, region, profile, gpu, instructions):
             click.echo("      " + _cmd(f"code --folder-uri vscode-remote://ssh-remote+{alias}/home/{user}/workspace"))
 
             click.secho("    GPU Benchmark:", fg="cyan")
-            click.echo("      " + _cmd(f"ssh {alias} 'python ~/gpu_benchmark.py'"))
+            click.echo("      " + _cmd(f"ssh {alias} '~/venv/bin/python ~/gpu_benchmark.py'"))
 
         structured_instances.append(inst_data)
 

@@ -118,7 +118,7 @@ ssh -NL 8888:localhost:8888 aws-gpu1
 code --folder-uri vscode-remote://ssh-remote+aws-gpu1/home/ubuntu/workspace
 
 # Run GPU benchmark
-ssh aws-gpu1 'python ~/gpu_benchmark.py'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py'
 ```
 
 ### Terminate and Clean Up
