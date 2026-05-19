@@ -173,6 +173,19 @@ def test_generate_ssh_keypair_invokes_ssh_keygen(tmp_path):
     assert (tmp_path / "sub").is_dir()  # parent created
 
 
+def test_generate_ssh_keypair_rederives_pub_when_private_exists(tmp_path):
+    priv = tmp_path / "id_ed25519"
+    priv.write_text("PRIVATE")
+    pub = tmp_path / "id_ed25519.pub"
+    with patch("aws_bootstrap.ssh.subprocess.run") as mock_run:
+        mock_run.return_value = MagicMock(stdout="ssh-ed25519 AAAADERIVED comment\n")
+        generate_ssh_keypair(pub)
+    args = mock_run.call_args[0][0]
+    # -y derives the public key from the existing private key (no overwrite).
+    assert args == ["ssh-keygen", "-y", "-f", str(priv)]
+    assert pub.read_text() == "ssh-ed25519 AAAADERIVED comment\n"
+
+
 def test_generate_ssh_keypair_propagates_failure(tmp_path):
     with (
         patch(

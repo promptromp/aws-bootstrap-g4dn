@@ -340,8 +340,16 @@ def launch(
         config.profile = profile
 
     # Validate key path — auto-generate an ed25519 key pair if absent so we
-    # never abort a launch (or, worse, leave the user without a usable key).
+    # never abort a real launch (or leave the user without a usable key).
+    # In --dry-run we MUST NOT touch the filesystem (and the notice would be
+    # invisible under --output json), so report intent and stop instead.
     if not config.key_path.exists():
+        if config.dry_run:
+            raise CLIError(
+                f"SSH public key not found at {config.key_path}.\n"
+                "  It would be auto-generated on a real launch — re-run without --dry-run,\n"
+                f"  or create one first: ssh-keygen -t ed25519 -f {private_key_path(config.key_path)}"
+            )
         info(f"SSH public key not found at {config.key_path} — generating a new ed25519 key pair…")
         try:
             generate_ssh_keypair(config.key_path)

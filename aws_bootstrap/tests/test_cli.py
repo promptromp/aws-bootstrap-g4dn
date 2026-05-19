@@ -60,12 +60,27 @@ def test_launch_missing_key_ungeneratable_path_errors_clearly():
     assert "could not be generated" in result.output
 
 
-@patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.get_latest_ami", return_value={"ImageId": "ami-1", "Name": "DL AMI"})
-@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
-@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-1")
 @patch("aws_bootstrap.cli.generate_ssh_keypair")
-def test_launch_missing_key_autogenerates(mock_gen, mock_sg, mock_imp, mock_ami, mock_session, tmp_path):
+def test_launch_missing_key_dry_run_does_not_generate(mock_gen, tmp_path):
+    # --dry-run must NOT touch the filesystem (and the notice would be
+    # invisible under --output json) — report intent and stop instead.
+    key = tmp_path / "id_ed25519.pub"
+    result = CliRunner().invoke(main, ["launch", "--key-path", str(key), "--dry-run", "--region", "us-west-2"])
+    assert result.exit_code != 0
+    mock_gen.assert_not_called()
+    assert not key.exists()
+    assert "re-run without --dry-run" in result.output
+
+
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_with_retry")
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.generate_ssh_keypair")
+def test_launch_missing_key_autogenerates_on_real_launch(
+    mock_gen, mock_session, mock_launch, mock_wait, mock_ssh, mock_add_ssh, tmp_path
+):
     mock_session.return_value.region_name = None
     key = tmp_path / "id_ed25519.pub"
 
@@ -73,9 +88,9 @@ def test_launch_missing_key_autogenerates(mock_gen, mock_sg, mock_imp, mock_ami,
         Path(pub_path).write_text("ssh-ed25519 AAAAGEN generated\n")
 
     mock_gen.side_effect = _fake_gen
-    runner = CliRunner()
-    # --dry-run stops before any AWS launch; we only assert key auto-generation.
-    result = runner.invoke(main, ["launch", "--key-path", str(key), "--dry-run", "--region", "us-west-2"])
+    mock_launch.return_value = _region_launch({"InstanceId": "i-xyz"}, region="us-west-2")
+    mock_wait.return_value = {"PublicIpAddress": "1.2.3.4", "Placement": {"AvailabilityZone": "us-west-2a"}}
+    result = CliRunner().invoke(main, ["launch", "--key-path", str(key), "--no-setup", "--region", "us-west-2"])
     assert result.exit_code == 0
     mock_gen.assert_called_once()
     assert "generating a new ed25519 key pair" in result.output

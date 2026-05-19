@@ -53,10 +53,22 @@ def _aws_key_pub_blob(ec2_client, key_name: str) -> str | None:
 
 
 def generate_ssh_keypair(pub_path: Path) -> None:
-    """Generate an ed25519 key pair at the given public-key path (and its
-    private counterpart). Raises OSError / CalledProcessError on failure."""
+    """Ensure an SSH key pair exists at ``pub_path`` (and its private
+    counterpart). If the private key already exists (only the ``.pub`` is
+    missing), re-derive the public key from it rather than overwriting the
+    private key. Raises OSError / CalledProcessError on failure."""
     priv = private_key_path(pub_path)
     priv.parent.mkdir(parents=True, exist_ok=True)
+    if priv.exists():
+        # Private key present, public key missing: regenerate the .pub only.
+        result = subprocess.run(
+            ["ssh-keygen", "-y", "-f", str(priv)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        pub_path.write_text(result.stdout)
+        return
     subprocess.run(
         ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(priv)],
         check=True,
