@@ -118,6 +118,13 @@ aws-bootstrap launch
 # Launch on-demand in a specific region with a custom instance type
 aws-bootstrap launch --on-demand --instance-type g5.xlarge --region us-east-1
 
+# Try multiple regions in order until one has spot capacity
+aws-bootstrap launch --region us-west-2 --region us-east-1 --region eu-west-1
+
+# Keep retrying (bounded exponential backoff) until spot capacity frees up
+aws-bootstrap launch --wait --wait-timeout 30m
+aws-bootstrap launch --region us-west-2 --region us-east-1 --wait --wait-timeout 1h
+
 # Launch without running the remote setup script
 aws-bootstrap launch --no-setup
 
@@ -149,6 +156,28 @@ After launch, the CLI:
 ```bash
 ssh aws-gpu1                  # venv auto-activates on login
 ```
+
+### 🌍 Finding Capacity (regions & `--wait`)
+
+Spot `InsufficientInstanceCapacity` is scoped to a **region and availability zone** — a type that's unavailable in `us-west-2` right now may be plentiful in `us-east-1`, and capacity for a given AZ frees up continuously as other instances terminate. Two options help you get a GPU without babysitting the prompt:
+
+- **Multiple regions** — pass `--region` more than once. Each launch attempt tries the regions **in the order given**, spot-first, and uses the first one with capacity:
+
+  ```bash
+  aws-bootstrap launch --region us-west-2 --region us-east-1 --region eu-west-1
+  ```
+
+- **`--wait`** — on insufficient spot capacity, keep retrying with **capped, jittered exponential backoff** until `--wait-timeout` (default `30m`; accepts `90s`, `30m`, `1h`, or bare seconds). Each cycle tries spot in every `--region` in order; if all are exhausted it sleeps and retries. On timeout it **hard-fails** (it does not silently fall back to on-demand):
+
+  ```bash
+  aws-bootstrap launch --region us-west-2 --region us-east-1 --wait --wait-timeout 1h
+  ```
+
+Quota errors (`VcpuLimitExceeded`, `MaxSpotInstanceCountExceeded`) and `SpotMaxPriceTooLow` **fail fast** — retrying never helps. Without `--wait`, a single exhausted spot pass still offers the interactive on-demand fallback (across all regions).
+
+**Region default precedence** (a behavior change — previously hardcoded to `us-west-2`): explicit `--region` flags → `AWS_DEFAULT_REGION` / active profile region → `us-west-2`. This applies to every command, so a profile configured for `us-east-1` now operates in `us-east-1` by default. The active region is shown in command output.
+
+See [docs/capacity-and-retry.md](docs/capacity-and-retry.md) for the backoff design and recommended region lists per instance family.
 
 ### 🔧 What Remote Setup Does
 

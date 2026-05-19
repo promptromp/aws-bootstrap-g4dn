@@ -8,10 +8,11 @@ import boto3
 import botocore.exceptions
 import click
 
-from .config import LaunchConfig
+from .config import DEFAULT_WAIT_TIMEOUT, LaunchConfig
 from .ec2 import (
     EBS_MOUNT_POINT,
     CLIError,
+    RegionContext,
     attach_ebs_volume,
     create_ebs_volume,
     delete_ebs_volume,
@@ -21,7 +22,7 @@ from .ec2 import (
     find_tagged_instances,
     get_latest_ami,
     get_spot_price,
-    launch_instance,
+    launch_with_retry,
     list_amis,
     list_instance_types,
     terminate_tagged_instances,
@@ -37,6 +38,7 @@ from .quota import (
     get_quota_request_history,
     request_quota_increase,
 )
+from .retry import parse_duration, resolve_regions
 from .ssh import (
     add_ssh_host,
     cleanup_stale_ssh_hosts,
@@ -85,6 +87,41 @@ def warn(msg: str) -> None:
     if not is_text():
         return
     click.secho(f"  WARNING: {msg}", fg="yellow", err=True)
+
+
+def _session_region(profile: str | None) -> str | None:
+    """Region configured via AWS_DEFAULT_REGION or the active profile (no override)."""
+    region = boto3.Session(profile_name=profile).region_name
+    # boto3 returns a str or None; guard against non-str (e.g. mocked sessions).
+    return region if isinstance(region, str) else None
+
+
+def resolve_region_list(regions: tuple[str, ...], profile: str | None) -> tuple[str, ...]:
+    """Ordered region list: explicit --region > profile/env region > default."""
+    return resolve_regions(regions, _session_region(profile))
+
+
+def resolve_single_region(region: str | None, profile: str | None) -> str:
+    """Single region for non-launch commands, honoring the same precedence."""
+    explicit = (region,) if region else ()
+    return resolve_region_list(explicit, profile)[0]
+
+
+class _Duration(click.ParamType):
+    """Click type accepting durations like '30m', '90s', '1h', or bare seconds."""
+
+    name = "duration"
+
+    def convert(self, value, param, ctx):  # type: ignore[no-untyped-def]
+        if isinstance(value, int):
+            return value
+        try:
+            return parse_duration(str(value))
+        except ValueError as e:
+            self.fail(str(e), param, ctx)
+
+
+DURATION = _Duration()
 
 
 class _AWSGroup(click.Group):
@@ -148,7 +185,30 @@ def main(ctx, output):
     help="Path to local SSH public key.",
 )
 @click.option("--key-name", default="aws-bootstrap-key", show_default=True, help="AWS key pair name.")
-@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option(
+    "--region",
+    "regions",
+    multiple=True,
+    metavar="REGION",
+    help=(
+        "AWS region. Repeat to try multiple regions in order on capacity "
+        "shortfall (e.g. --region us-west-2 --region us-east-1). "
+        "Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2."
+    ),
+)
+@click.option(
+    "--wait",
+    is_flag=True,
+    default=False,
+    help="On insufficient spot capacity, keep retrying (bounded exponential backoff) until --wait-timeout.",
+)
+@click.option(
+    "--wait-timeout",
+    type=DURATION,
+    default=DEFAULT_WAIT_TIMEOUT,
+    show_default="30m",
+    help="Max time to keep retrying when --wait is set (e.g. 30m, 90s, 1h).",
+)
 @click.option("--security-group", default="aws-bootstrap-ssh", show_default=True, help="Security group name.")
 @click.option("--volume-size", default=100, show_default=True, type=int, help="Root EBS volume size in GB (gp3).")
 @click.option("--no-setup", is_flag=True, default=False, help="Skip running the remote setup script.")
@@ -180,7 +240,9 @@ def launch(
     spot,
     key_path,
     key_name,
-    region,
+    regions,
+    wait,
+    wait_timeout,
     security_group,
     volume_size,
     no_setup,
@@ -195,12 +257,14 @@ def launch(
     if ebs_storage is not None and ebs_volume_id is not None:
         raise CLIError("--ebs-storage and --ebs-volume-id are mutually exclusive.")
 
+    resolved_regions = resolve_region_list(regions, profile)
+
     config = LaunchConfig(
         instance_type=instance_type,
         spot=spot,
         key_path=Path(key_path).expanduser(),
         key_name=key_name,
-        region=region,
+        regions=resolved_regions,
         security_group=security_group,
         volume_size=volume_size,
         run_setup=not no_setup,
@@ -209,6 +273,8 @@ def launch(
         python_version=python_version,
         ebs_storage=ebs_storage,
         ebs_volume_id=ebs_volume_id,
+        wait=wait,
+        wait_timeout=wait_timeout,
     )
     if ami_filter:
         config.ami_filter = ami_filter
@@ -219,30 +285,25 @@ def launch(
     if not config.key_path.exists():
         raise CLIError(f"SSH public key not found: {config.key_path}")
 
-    # Build boto3 session
-    session = boto3.Session(profile_name=config.profile, region_name=config.region)
-    ec2 = session.client("ec2")
-
-    has_ebs = config.ebs_storage is not None or config.ebs_volume_id is not None
-    total_steps = 7 if has_ebs else 6
-
-    # Step 1: AMI lookup
-    step(1, total_steps, "Looking up AMI...")
-    ami = get_latest_ami(ec2, config.ami_filter)
-    info(f"Found: {ami['Name']}")
-    val("AMI ID", ami["ImageId"])
-
-    # Step 2: SSH key pair
-    step(2, total_steps, "Importing SSH key pair...")
-    import_key_pair(ec2, config.key_name, config.key_path)
-
-    # Step 3: Security group
-    step(3, total_steps, "Ensuring security group...")
-    sg_id = ensure_security_group(ec2, config.security_group, config.tag_value, ssh_port=config.ssh_port)
-
+    regions_label = ", ".join(config.regions)
     pricing = "spot" if config.spot else "on-demand"
 
+    has_ebs = config.ebs_storage is not None or config.ebs_volume_id is not None
+    total_steps = 4 if has_ebs else 3
+
+    def prepare_region(region: str) -> RegionContext:
+        """Build region-scoped prerequisites: client, AMI, key pair, security group."""
+        ec2r = boto3.Session(profile_name=config.profile, region_name=region).client("ec2")
+        info(f"[{region}] Looking up AMI...")
+        ami_r = get_latest_ami(ec2r, config.ami_filter)
+        info(f"[{region}] AMI: {ami_r['ImageId']} ({ami_r['Name']})")
+        import_key_pair(ec2r, config.key_name, config.key_path)
+        sg_id_r = ensure_security_group(ec2r, config.security_group, config.tag_value, ssh_port=config.ssh_port)
+        return RegionContext(region=region, ec2_client=ec2r, ami=ami_r, sg_id=sg_id_r)
+
     if config.dry_run:
+        ctx0 = prepare_region(config.regions[0])
+        ami = ctx0.ami
         if is_text(ctx):
             click.echo()
             click.secho("--- Dry Run Summary ---", bold=True, fg="yellow")
@@ -250,9 +311,11 @@ def launch(
             val("AMI", f"{ami['ImageId']} ({ami['Name']})")
             val("Pricing", pricing)
             val("Key pair", config.key_name)
-            val("Security group", sg_id)
+            val("Security group", ctx0.sg_id)
             val("Volume", f"{config.volume_size} GB gp3")
-            val("Region", config.region)
+            val("Region(s)", regions_label)
+            if config.wait:
+                val("Wait", f"yes (timeout {config.wait_timeout}s)")
             val("Remote setup", "yes" if config.run_setup else "no")
             if config.ssh_port != 22:
                 val("SSH port", str(config.ssh_port))
@@ -272,9 +335,11 @@ def launch(
                 "ami_name": ami["Name"],
                 "pricing": pricing,
                 "key_name": config.key_name,
-                "security_group": sg_id,
+                "security_group": ctx0.sg_id,
                 "volume_size_gb": config.volume_size,
-                "region": config.region,
+                "regions": list(config.regions),
+                "wait": config.wait,
+                "wait_timeout_seconds": config.wait_timeout,
             }
             if config.ssh_port != 22:
                 result["ssh_port"] = config.ssh_port
@@ -287,14 +352,33 @@ def launch(
             emit(result, ctx=ctx)
         return
 
-    # Step 4: Launch instance
-    step(4, total_steps, f"Launching {config.instance_type} instance ({pricing})...")
-    instance = launch_instance(ec2, config, ami["ImageId"], sg_id)
+    # Step 1: Launch instance (prepare region prerequisites + run, spot-first across regions)
+    step(1, total_steps, f"Launching {config.instance_type} ({pricing}) in {regions_label}...")
+
+    def on_attempt(region: str, market: str, attempt: int) -> None:
+        info(f"[{region}] Requesting {market} {config.instance_type}...")
+
+    def on_wait(cycle: int, sleep_s: float, elapsed: float) -> None:
+        if is_text():
+            click.secho(
+                f"  [wait] cycle {cycle}: no capacity in {regions_label} — "
+                f"next attempt in {sleep_s:.0f}s (elapsed {elapsed:.0f}s)",
+                fg="yellow",
+            )
+
+    launched = launch_with_retry(config, prepare_region, on_attempt=on_attempt, on_wait=on_wait)
+    ec2 = launched.context.ec2_client
+    ami = launched.context.ami
+    active_region = launched.region
+    pricing = launched.pricing
+    instance = launched.instance
     instance_id = instance["InstanceId"]
     val("Instance ID", instance_id)
+    val("Region", active_region)
+    val("Pricing", pricing)
 
-    # Step 5: Wait for ready
-    step(5, total_steps, "Waiting for instance to be ready...")
+    # Step 2: Wait for ready
+    step(2, total_steps, "Waiting for instance to be ready...")
     instance = wait_instance_ready(ec2, instance_id)
     public_ip = instance.get("PublicIpAddress")
     if not public_ip:
@@ -309,7 +393,7 @@ def launch(
     ebs_volume_attached = None
     ebs_format = False
     if has_ebs:
-        step(6, total_steps, "Setting up EBS data volume...")
+        step(3, total_steps, "Setting up EBS data volume...")
         if config.ebs_storage:
             info(f"Creating {config.ebs_storage} GB gp3 volume in {az}...")
             ebs_volume_attached = create_ebs_volume(ec2, config.ebs_storage, az, config.tag_value, instance_id)
@@ -334,7 +418,7 @@ def launch(
         success("EBS volume attached.")
 
     # SSH and remote setup step
-    ssh_step = 7 if has_ebs else 6
+    ssh_step = 4 if has_ebs else 3
     step(ssh_step, total_steps, "Waiting for SSH access...")
     private_key = private_key_path(config.key_path)
     if not wait_for_ssh(public_ip, config.ssh_user, config.key_path, port=config.ssh_port):
@@ -394,7 +478,8 @@ def launch(
             "availability_zone": az,
             "ami_id": ami["ImageId"],
             "pricing": pricing,
-            "region": config.region,
+            "region": active_region,
+            "regions_tried": list(config.regions),
             "ssh_alias": alias,
         }
         if ebs_volume_attached:
@@ -417,6 +502,7 @@ def launch(
     val("Instance ID", instance_id)
     val("Public IP", public_ip)
     val("Instance", config.instance_type)
+    val("Region", active_region)
     val("Pricing", pricing)
     val("SSH alias", alias)
     if ebs_volume_attached:
@@ -454,12 +540,17 @@ def launch(
 
     click.echo()
     click.secho("  Terminate:", fg="cyan")
-    click.secho(f"    aws-bootstrap terminate {alias} --region {config.region}", bold=True)
+    click.secho(f"    aws-bootstrap terminate {alias} --region {active_region}", bold=True)
     click.echo()
 
 
 @main.command()
-@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option(
+    "--region",
+    default=None,
+    metavar="REGION",
+    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.option("--gpu", is_flag=True, default=False, help="Query GPU info (CUDA, driver) via SSH.")
 @click.option(
@@ -472,8 +563,12 @@ def launch(
 @click.pass_context
 def status(ctx, region, profile, gpu, instructions):
     """Show running instances created by aws-bootstrap."""
+    region = resolve_single_region(region, profile)
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
+
+    if is_text(ctx):
+        val("Region", region)
 
     instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
     if not instances:
@@ -667,7 +762,12 @@ def status(ctx, region, profile, gpu, instructions):
 
 
 @main.command()
-@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option(
+    "--region",
+    default=None,
+    metavar="REGION",
+    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--keep-ebs", is_flag=True, default=False, help="Preserve EBS data volumes instead of deleting them.")
@@ -679,12 +779,16 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
     Pass specific instance IDs or SSH aliases (e.g. aws-gpu1) to terminate,
     or omit to terminate all aws-bootstrap instances in the region.
     """
+    region = resolve_single_region(region, profile)
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
 
     # In structured output modes, require --yes (prompts would corrupt output)
     if not is_text(ctx) and not yes:
         raise CLIError("--yes is required when using structured output (--output json/yaml/table).")
+
+    if is_text(ctx):
+        val("Region", region)
 
     if instance_ids:
         targets = []
@@ -788,17 +892,26 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
 @click.option("--dry-run", is_flag=True, default=False, help="Show what would be removed without removing.")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--include-ebs", is_flag=True, default=False, help="Also find and delete orphan EBS data volumes.")
-@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option(
+    "--region",
+    default=None,
+    metavar="REGION",
+    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def cleanup(ctx, dry_run, yes, include_ebs, region, profile):
     """Remove stale SSH config entries for terminated instances."""
+    region = resolve_single_region(region, profile)
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
 
     # In structured output modes, require --yes for non-dry-run (prompts would corrupt output)
     if not is_text(ctx) and not yes and not dry_run:
         raise CLIError("--yes is required when using structured output (--output json/yaml/table).")
+
+    if is_text(ctx):
+        val("Region", region)
 
     live_instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
     live_ids = {inst["InstanceId"] for inst in live_instances}
@@ -927,11 +1040,17 @@ def list_cmd():
 
 @list_cmd.command(name="instance-types")
 @click.option("--prefix", default="g4dn", show_default=True, help="Instance type family prefix to filter on.")
-@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option(
+    "--region",
+    default=None,
+    metavar="REGION",
+    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def list_instance_types_cmd(ctx, prefix, region, profile):
     """List EC2 instance types matching a family prefix (e.g. g4dn, p3, g5)."""
+    region = resolve_single_region(region, profile)
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
 
@@ -988,11 +1107,17 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
 
 @list_cmd.command(name="amis")
 @click.option("--filter", "ami_filter", default=DEFAULT_AMI_PREFIX, show_default=True, help="AMI name pattern.")
-@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option(
+    "--region",
+    default=None,
+    metavar="REGION",
+    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def list_amis_cmd(ctx, ami_filter, region, profile):
     """List available AMIs matching a name pattern."""
+    region = resolve_single_region(region, profile)
     session = boto3.Session(profile_name=profile, region_name=region)
     ec2 = session.client("ec2")
 
@@ -1052,11 +1177,17 @@ def quota():
     type=click.Choice(list(QUOTA_FAMILIES.keys()), case_sensitive=False),
     help="Instance family to show (default: all).",
 )
-@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option(
+    "--region",
+    default=None,
+    metavar="REGION",
+    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def quota_show(ctx, family, region, profile):
     """Show current spot and on-demand vCPU quota values."""
+    region = resolve_single_region(region, profile)
     session = boto3.Session(profile_name=profile, region_name=region)
     sq = session.client("service-quotas")
 
@@ -1126,7 +1257,12 @@ def quota_show(ctx, family, region, profile):
     help="Quota type to increase.",
 )
 @click.option("--desired-value", required=True, type=float, help="Desired quota value (vCPUs).")
-@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option(
+    "--region",
+    default=None,
+    metavar="REGION",
+    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.pass_context
@@ -1136,6 +1272,7 @@ def quota_request(ctx, family, quota_type, desired_value, region, profile, yes):
     if not is_text(ctx) and not yes:
         raise CLIError("--yes is required when using structured output (--output json/yaml/table).")
 
+    region = resolve_single_region(region, profile)
     session = boto3.Session(profile_name=profile, region_name=region)
     sq = session.client("service-quotas")
 
@@ -1204,11 +1341,17 @@ def quota_request(ctx, family, quota_type, desired_value, region, profile, yes):
     ),
     help="Filter by request status.",
 )
-@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option(
+    "--region",
+    default=None,
+    metavar="REGION",
+    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def quota_history(ctx, family, quota_type, status_filter, region, profile):
     """Show history of vCPU quota increase requests."""
+    region = resolve_single_region(region, profile)
     session = boto3.Session(profile_name=profile, region_name=region)
     sq = session.client("service-quotas")
 

@@ -24,7 +24,7 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 
 | Command | Purpose | Key Options |
 |---------|---------|-------------|
-| `aws-bootstrap launch` | Provision a GPU instance (spot by default) | `--instance-type`, `--spot/--on-demand`, `--ebs-storage`, `--dry-run` |
+| `aws-bootstrap launch` | Provision a GPU instance (spot by default) | `--instance-type`, `--spot/--on-demand`, `--region` (repeatable), `--wait`, `--wait-timeout`, `--ebs-storage`, `--dry-run` |
 | `aws-bootstrap status` | List running instances with IPs, pricing | `--gpu` (CUDA info), `--no-instructions` |
 | `aws-bootstrap terminate` | Terminate instances and clean up | `[ID_OR_ALIAS...]`, `--keep-ebs`, `--yes` |
 | `aws-bootstrap cleanup` | Remove stale SSH config + orphan EBS | `--include-ebs`, `--dry-run` |
@@ -58,11 +58,14 @@ Commands requiring confirmation (`terminate`, `cleanup`) **must include `--yes`*
 ### Launch a GPU Instance
 
 ```bash
-# Default: spot g4dn.xlarge in us-west-2
+# Default: spot g4dn.xlarge (region: env/profile, else us-west-2)
 aws-bootstrap launch
 
 # Specify instance type and region
 aws-bootstrap launch --instance-type g5.xlarge --region us-east-1
+
+# Try multiple regions in order, then wait (backoff) for spot capacity
+aws-bootstrap launch --region us-east-1 --region us-west-2 --wait --wait-timeout 30m
 
 # On-demand pricing (no spot interruption risk)
 aws-bootstrap launch --on-demand
@@ -198,8 +201,8 @@ The `/data` volume is **not lost on spot interruption** — when AWS reclaims th
 
 ## Error Handling
 
-- **Spot capacity errors**: The CLI auto-falls back to on-demand pricing
-- **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`): Check with `aws-bootstrap quota show` and request increases with `aws-bootstrap quota request --family gvt --type spot --desired-value 4`. Other families: `--family p` (P2-P6), `--family dl`
+- **Spot capacity errors** (`InsufficientInstanceCapacity`): prefer multiple `--region` values (tried in order) and/or `--wait --wait-timeout` over manual retry loops — the CLI handles bounded backoff internally. Without `--wait`, an exhausted spot pass auto-falls back to on-demand in structured modes. `--wait` hard-fails on timeout (it does not auto-buy on-demand).
+- **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`) and `SpotMaxPriceTooLow`: fail fast — never retried by `--wait`. Check with `aws-bootstrap quota show` and request increases with `aws-bootstrap quota request --family gvt --type spot --desired-value 4`. Other families: `--family p` (P2-P6), `--family dl`
 - **SSH timeouts**: Instance may still be initializing -- check `aws-bootstrap status`
 - **No public IP**: Check VPC settings or assign an Elastic IP
 - **EBS mount failures**: Non-fatal -- instance remains usable, may need manual mount

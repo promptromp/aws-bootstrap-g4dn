@@ -1,6 +1,9 @@
 """EC2 instance provisioning: AMI lookup, security groups, and instance launch."""
 
 from __future__ import annotations
+import time
+from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import UTC, datetime
 
 import botocore.exceptions
@@ -8,6 +11,7 @@ import click
 
 from .config import LaunchConfig
 from .output import echo, is_text, secho
+from .retry import backoff_sleep_seconds
 
 
 EBS_DEVICE_NAME = "/dev/sdf"
@@ -118,9 +122,41 @@ def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int =
     return sg_id
 
 
-def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -> dict:
-    """Launch an EC2 instance (spot or on-demand)."""
-    launch_params = {
+class CapacityError(Exception):
+    """Retryable: AWS has no capacity for the requested type in this region/AZ.
+
+    Distinct from quota errors (never retryable) and ``SpotMaxPriceTooLow``
+    (won't fix itself without raising the bid), both of which fail fast.
+    """
+
+    def __init__(self, region: str, market: str, message: str) -> None:
+        super().__init__(message)
+        self.region = region
+        self.market = market
+
+
+@dataclass
+class RegionContext:
+    """Region-scoped launch prerequisites, prepared once and reused across retries."""
+
+    region: str
+    ec2_client: object
+    ami: dict
+    sg_id: str
+
+
+@dataclass
+class RegionLaunch:
+    """Result of a successful launch: which region/market won and its context."""
+
+    region: str
+    context: RegionContext
+    instance: dict
+    pricing: str
+
+
+def _build_launch_params(config: LaunchConfig, ami_id: str, sg_id: str, spot: bool) -> dict:
+    params: dict = {
         "ImageId": ami_id,
         "InstanceType": config.instance_type,
         "KeyName": config.key_name,
@@ -147,51 +183,169 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
             }
         ],
     }
-
-    if config.spot:
-        launch_params["InstanceMarketOptions"] = {
+    if spot:
+        params["InstanceMarketOptions"] = {
             "MarketType": "spot",
             "SpotOptions": {
                 "SpotInstanceType": "one-time",
                 "InstanceInterruptionBehavior": "terminate",
             },
         }
+    return params
 
+
+def _run_instances(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str, region: str, spot: bool) -> dict:
+    """Single ``run_instances`` call.
+
+    Raises :class:`CapacityError` (retryable) on ``InsufficientInstanceCapacity``.
+    Quota errors and ``SpotMaxPriceTooLow`` fail fast (never retried).
+    """
+    market = "spot" if spot else "on-demand"
     try:
-        response = ec2_client.run_instances(**launch_params)
+        response = ec2_client.run_instances(**_build_launch_params(config, ami_id, sg_id, spot))
     except botocore.exceptions.ClientError as e:
         code = e.response["Error"]["Code"]
         if code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
-            _raise_quota_error(code, config)
-        elif code in ("InsufficientInstanceCapacity", "SpotMaxPriceTooLow") and config.spot:
-            secho(f"\n  Spot request failed: {e.response['Error']['Message']}", fg="yellow")
-            if not is_text() or click.confirm("  Retry as on-demand instance?"):
-                launch_params.pop("InstanceMarketOptions", None)
-                try:
-                    response = ec2_client.run_instances(**launch_params)
-                except botocore.exceptions.ClientError as retry_e:
-                    retry_code = retry_e.response["Error"]["Code"]
-                    if retry_code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
-                        _raise_quota_error(retry_code, config)
-                    if retry_code == "InsufficientInstanceCapacity":
-                        raise CLIError(
-                            f"Insufficient capacity for {config.instance_type} (on-demand) in {config.region}.\n\n"
-                            "  Neither spot nor on-demand capacity is currently available.\n"
-                            "  Try a different region, availability zone, or instance type."
-                        ) from None
-                    raise
-            else:
-                raise CLIError("Launch cancelled.") from None
-        elif code == "InsufficientInstanceCapacity":
+            _raise_quota_error(code, config, region)
+        if code == "InsufficientInstanceCapacity":
+            raise CapacityError(
+                region,
+                market,
+                f"Insufficient {market} capacity for {config.instance_type} in {region}.",
+            ) from None
+        if code == "SpotMaxPriceTooLow":
             raise CLIError(
-                f"Insufficient capacity for {config.instance_type} in {config.region}.\n\n"
+                f"Spot price for {config.instance_type} in {region} exceeds the default maximum.\n\n"
+                "  Waiting will not help — retry with --on-demand or a different instance type."
+            ) from None
+        raise
+    return response["Instances"][0]
+
+
+def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -> dict:
+    """Launch a single instance in one region (spot, with interactive on-demand fallback).
+
+    Back-compat single-region primitive. Multi-region and ``--wait`` retries
+    go through :func:`launch_with_retry`.
+    """
+    region = config.region
+    try:
+        return _run_instances(ec2_client, config, ami_id, sg_id, region, config.spot)
+    except CapacityError:
+        if not config.spot:
+            raise CLIError(
+                f"Insufficient capacity for {config.instance_type} in {region}.\n\n"
                 "  The requested instance type is not currently available.\n"
                 "  Try a different region, availability zone, or instance type."
             ) from None
-        else:
-            raise
+        secho(f"\n  Spot request failed: insufficient capacity in {region}.", fg="yellow")
+        if not is_text() or click.confirm("  Retry as on-demand instance?"):
+            try:
+                return _run_instances(ec2_client, config, ami_id, sg_id, region, spot=False)
+            except CapacityError:
+                raise CLIError(
+                    f"Insufficient capacity for {config.instance_type} (on-demand) in {region}.\n\n"
+                    "  Neither spot nor on-demand capacity is currently available.\n"
+                    "  Try a different region, availability zone, or instance type."
+                ) from None
+        raise CLIError("Launch cancelled.") from None
 
-    return response["Instances"][0]
+
+def launch_with_retry(
+    config: LaunchConfig,
+    prepare_region: Callable[[str], RegionContext],
+    *,
+    on_attempt: Callable[[str, str, int], None] | None = None,
+    on_wait: Callable[[int, float, float], None] | None = None,
+    confirm_on_demand: Callable[[], bool] | None = None,
+    sleeper: Callable[[float], None] = time.sleep,
+    clock: Callable[[], float] = time.monotonic,
+    rng=None,
+) -> RegionLaunch:
+    """Launch across ``config.regions``, spot-first, with optional bounded-backoff wait.
+
+    Strategy: each cycle tries the primary market (spot, unless ``--on-demand``)
+    in every region in order. With ``config.wait``, exhausting all regions sleeps
+    with capped+jittered exponential backoff and retries until ``wait_timeout``,
+    then hard-fails. Without ``wait``, a single exhausted pass falls back to
+    on-demand across all regions (after confirmation).
+
+    ``prepare_region`` builds region-scoped prerequisites (client, AMI, SG); it
+    is invoked at most once per region and cached.
+    """
+    regions = config.regions
+    primary_spot = config.spot
+    market = "spot" if primary_spot else "on-demand"
+    cache: dict[str, RegionContext] = {}
+    start = clock()
+    deadline = start + config.wait_timeout if config.wait else None
+    attempt = 0
+
+    def ctx_for(region: str) -> RegionContext:
+        if region not in cache:
+            cache[region] = prepare_region(region)
+        return cache[region]
+
+    def try_market(spot: bool) -> RegionLaunch | None:
+        for region in regions:
+            ctx = ctx_for(region)
+            if on_attempt:
+                on_attempt(region, "spot" if spot else "on-demand", attempt)
+            try:
+                inst = _run_instances(ctx.ec2_client, config, ctx.ami["ImageId"], ctx.sg_id, region, spot)
+            except CapacityError:
+                continue
+            return RegionLaunch(region, ctx, inst, "spot" if spot else "on-demand")
+        return None
+
+    while True:
+        result = try_market(primary_spot)
+        if result is not None:
+            return result
+
+        if config.wait:
+            now = clock()
+            assert deadline is not None
+            if now >= deadline:
+                raise CLIError(
+                    f"No {market} capacity for {config.instance_type} in "
+                    f"{', '.join(regions)} within {config.wait_timeout}s.\n\n"
+                    "  Try --on-demand, more --region values, or a different instance type."
+                )
+            sleep_s = min(backoff_sleep_seconds(attempt, rng=rng), max(0.0, deadline - now))
+            if on_wait:
+                on_wait(attempt + 1, sleep_s, now - start)
+            sleeper(sleep_s)
+            attempt += 1
+            continue
+        break
+
+    # Single spot pass exhausted (not waiting): offer on-demand across all regions.
+    if primary_spot:
+        secho(
+            f"\n  No spot capacity for {config.instance_type} in {', '.join(regions)}.",
+            fg="yellow",
+        )
+        confirmed = (
+            confirm_on_demand()
+            if confirm_on_demand
+            else (not is_text() or click.confirm("  Retry as on-demand instance?"))
+        )
+        if not confirmed:
+            raise CLIError("Launch cancelled.") from None
+        result = try_market(spot=False)
+        if result is not None:
+            return result
+        raise CLIError(
+            f"Insufficient capacity for {config.instance_type} (on-demand) in {', '.join(regions)}.\n\n"
+            "  Neither spot nor on-demand capacity is currently available.\n"
+            "  Try a different region, availability zone, or instance type."
+        ) from None
+
+    raise CLIError(
+        f"Insufficient on-demand capacity for {config.instance_type} in {', '.join(regions)}.\n\n"
+        "  Try a different region, availability zone, or instance type."
+    ) from None
 
 
 _UBUNTU_AMI = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
@@ -227,7 +381,7 @@ def _quota_hint(quota_type: str, family: str) -> str:
     )
 
 
-def _raise_quota_error(code: str, config: LaunchConfig) -> None:
+def _raise_quota_error(code: str, config: LaunchConfig, region: str | None = None) -> None:
     if code == "MaxSpotInstanceCountExceeded":
         quota_type = "spot"
         label = "Spot instance"
@@ -238,7 +392,7 @@ def _raise_quota_error(code: str, config: LaunchConfig) -> None:
     family = instance_type_to_family(config.instance_type) or "gvt"
     hint = _quota_hint(quota_type, family)
     msg = (
-        f"{label} quota exceeded for {config.instance_type} in {config.region}.\n\n"
+        f"{label} quota exceeded for {config.instance_type} in {region or config.region}.\n\n"
         f"  Your account's {quota_type} vCPU limit for this instance family is too low.\n"
         f"  {hint}"
     )

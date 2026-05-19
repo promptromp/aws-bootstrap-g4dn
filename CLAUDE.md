@@ -41,6 +41,7 @@ aws_bootstrap/
     gpu.py               # GPU architecture mapping and GpuInfo dataclass
     output.py            # Output formatting: OutputFormat enum, emit(), echo/secho wrappers for structured output
     quota.py             # Service Quotas API: get/request GPU vCPU quotas (G/VT, P, DL families)
+    retry.py             # Pure helpers: region precedence (resolve_regions), wait duration parsing, backoff schedule
     ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management, GPU queries, EBS mount
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
@@ -57,6 +58,7 @@ aws_bootstrap/
         test_ec2.py
         test_output.py
         test_gpu.py
+        test_retry.py
         test_ssh_config.py
         test_ssh_gpu.py
         test_ebs.py
@@ -84,7 +86,9 @@ Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`
 
 **Global option:** `--output` / `-o` controls output format: `text` (default, human-readable with color), `json`, `yaml`, `table`. Structured formats (json/yaml/table) suppress all progress messages and emit machine-readable output. Commands requiring confirmation (`terminate`, `cleanup`) require `--yes` in structured modes.
 
-- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`; `--python-version` controls which Python `uv` installs in the remote venv; `--ssh-port` overrides the default SSH port (22) for security group ingress, connection checks, and SSH config; `--ebs-storage SIZE` creates and attaches a new gp3 EBS data volume (mounted at `/data`); `--ebs-volume-id ID` attaches an existing EBS volume (mutually exclusive with `--ebs-storage`)
+**Region resolution (all commands):** `--region` precedence is explicit flag(s) → `AWS_DEFAULT_REGION` / profile region → `us-west-2`. Implemented by `retry.resolve_regions` and the `resolve_region_list` / `resolve_single_region` helpers in `cli.py`. (Behavior change: the default is no longer hardcoded to `us-west-2` ignoring the profile.) The resolved/active region is echoed in `launch`, `status`, `terminate`, and `cleanup` output.
+
+- **`launch`** — provisions an EC2 instance (spot by default); `--region` is repeatable and tried in order (spot-first) on capacity shortfall; `--wait` retries with capped+jittered exponential backoff (30s→300s, ±20%) until `--wait-timeout` (default 30m; accepts `90s`/`30m`/`1h`/seconds) then hard-fails; quota errors and `SpotMaxPriceTooLow` fail fast; without `--wait`, a single exhausted spot pass offers the on-demand fallback across all regions. Orchestrated by `ec2.launch_with_retry` (with `ec2.launch_instance` retained as the single-region back-compat primitive); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`; `--python-version` controls which Python `uv` installs in the remote venv; `--ssh-port` overrides the default SSH port (22) for security group ingress, connection checks, and SSH config; `--ebs-storage SIZE` creates and attaches a new gp3 EBS data volume (mounted at `/data`); `--ebs-volume-id ID` attaches an existing EBS volume (mutually exclusive with `--ebs-storage`)
 - **`status`** — lists all non-terminated instances (including `shutting-down`) with type, IP, SSH alias, EBS data volumes, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`); `--instructions` (default: on) prints connection commands (SSH, Jupyter tunnel, VSCode Remote SSH, GPU benchmark) for each running instance; suppress with `--no-instructions`
 - **`terminate`** — terminates instances by ID or SSH alias (e.g. `aws-gpu1`, resolved via `~/.ssh/config`), or all aws-bootstrap instances in the region if no arguments given; removes SSH config aliases; deletes associated EBS data volumes by default; `--keep-ebs` preserves volumes and prints reattach commands
 - **`cleanup`** — removes stale `~/.ssh/config` entries for terminated/non-existent instances; compares managed SSH config blocks against live EC2 instances; `--include-ebs` also finds and deletes orphan EBS data volumes (volumes in `available` state whose linked instance no longer exists); `--dry-run` previews removals without modifying config; `--yes` skips the confirmation prompt
@@ -129,7 +133,18 @@ The `--output` option uses a context-aware suppression pattern via `aws_bootstra
 - **CLI helper guards** — `step()`, `info()`, `val()`, `success()`, `warn()` in `cli.py` check `is_text()` and return early in structured modes.
 - Each CLI command builds a result dict alongside existing logic, emits it via `emit()` for non-text formats, and falls through to text output for text mode.
 - **Confirmation prompts** (`terminate`, `cleanup`) require `--yes` in structured modes to avoid corrupting output.
-- The spot-fallback `click.confirm()` in `ec2.py` auto-confirms in structured modes.
+- The spot-fallback `click.confirm()` in `ec2.py` auto-confirms in structured modes (via the `confirm_on_demand` callback default in `launch_with_retry`).
+
+## Capacity, Multi-Region & Wait Retry
+
+`ec2.launch_with_retry(config, prepare_region, ...)` is the launch orchestrator:
+
+- **`prepare_region(region)`** — a `cli.py` callback returning a `RegionContext` (region-scoped boto3 client, AMI, security group); invoked at most once per region and cached across retries.
+- **Spot-first per cycle** — each cycle calls `_run_instances` for every region in `config.regions` order; the first success returns a `RegionLaunch` (winning region/client/AMI/instance/pricing). `_run_instances` raises retryable `CapacityError` on `InsufficientInstanceCapacity`; quota errors route to `_raise_quota_error` and `SpotMaxPriceTooLow` to `CLIError` (both fail fast, never retried).
+- **`--wait`** — when all regions miss, sleeps `retry.backoff_sleep_seconds(attempt)` (exponential, capped, jittered; clamped to the deadline) and retries until `config.wait_timeout`, then raises `CLIError` (hard-fail). Injectable `sleeper`/`clock`/`rng` keep it unit-testable without real time.
+- **No `--wait`** — a single exhausted spot pass triggers the on-demand fallback (`confirm_on_demand`) across all regions.
+- **Pure policy in `retry.py`** — `resolve_regions`, `parse_duration`, `backoff_sleep_seconds` are side-effect-free and tested in `test_retry.py`. The CLI exposes `--wait-timeout` via the `_Duration` Click param type.
+- `LaunchConfig` holds `regions: tuple[str, ...]` with a `region` property (`regions[0]`) for single-region callers; `wait` and `wait_timeout` fields drive the loop.
 
 ## CUDA-Aware PyTorch Installation
 
