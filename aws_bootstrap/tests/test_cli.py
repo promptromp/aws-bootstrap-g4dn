@@ -19,7 +19,7 @@ from aws_bootstrap.ssh import CleanupResult, SSHHostDetails
 def _region_launch(instance, *, region="us-west-2", pricing="spot", ami=None):
     """Build a RegionLaunch as launch_with_retry would return it."""
     ami = ami or {"ImageId": "ami-123", "Name": "TestAMI"}
-    ctx = RegionContext(region=region, ec2_client=MagicMock(), ami=ami, sg_id="sg-123")
+    ctx = RegionContext(region=region, ec2_client=MagicMock(), ami=ami, sg_id="sg-123", key_name="aws-bootstrap-key")
     return RegionLaunch(region=region, context=ctx, instance=instance, pricing=pricing)
 
 
@@ -51,11 +51,49 @@ def test_launch_help():
     assert "--key-path" in result.output
 
 
-def test_launch_missing_key():
+def test_launch_missing_key_ungeneratable_path_errors_clearly():
+    # Missing key now triggers auto-generation; an ungeneratable path
+    # (cannot create /nonexistent) must fail with a clear message.
     runner = CliRunner()
     result = runner.invoke(main, ["launch", "--key-path", "/nonexistent/key.pub"])
     assert result.exit_code != 0
-    assert "SSH public key not found" in result.output
+    assert "could not be generated" in result.output
+
+
+@patch("aws_bootstrap.cli.generate_ssh_keypair")
+def test_launch_missing_key_dry_run_does_not_generate(mock_gen, tmp_path):
+    # --dry-run must NOT touch the filesystem (and the notice would be
+    # invisible under --output json) — report intent and stop instead.
+    key = tmp_path / "id_ed25519.pub"
+    result = CliRunner().invoke(main, ["launch", "--key-path", str(key), "--dry-run", "--region", "us-west-2"])
+    assert result.exit_code != 0
+    mock_gen.assert_not_called()
+    assert not key.exists()
+    assert "re-run without --dry-run" in result.output
+
+
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_with_retry")
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.generate_ssh_keypair")
+def test_launch_missing_key_autogenerates_on_real_launch(
+    mock_gen, mock_session, mock_launch, mock_wait, mock_ssh, mock_add_ssh, tmp_path
+):
+    mock_session.return_value.region_name = None
+    key = tmp_path / "id_ed25519.pub"
+
+    def _fake_gen(pub_path):
+        Path(pub_path).write_text("ssh-ed25519 AAAAGEN generated\n")
+
+    mock_gen.side_effect = _fake_gen
+    mock_launch.return_value = _region_launch({"InstanceId": "i-xyz"}, region="us-west-2")
+    mock_wait.return_value = {"PublicIpAddress": "1.2.3.4", "Placement": {"AvailabilityZone": "us-west-2a"}}
+    result = CliRunner().invoke(main, ["launch", "--key-path", str(key), "--no-setup", "--region", "us-west-2"])
+    assert result.exit_code == 0
+    mock_gen.assert_called_once()
+    assert "generating a new ed25519 key pair" in result.output
 
 
 def test_status_help():

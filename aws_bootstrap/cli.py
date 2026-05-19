@@ -1,6 +1,7 @@
 """CLI entry point for aws-bootstrap-g4dn."""
 
 from __future__ import annotations
+import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -52,6 +53,7 @@ from .ssh import (
     add_ssh_host,
     cleanup_stale_ssh_hosts,
     find_stale_ssh_hosts,
+    generate_ssh_keypair,
     get_ssh_host_details,
     import_key_pair,
     list_ssh_hosts,
@@ -337,9 +339,26 @@ def launch(
     if profile:
         config.profile = profile
 
-    # Validate key path
+    # Validate key path — auto-generate an ed25519 key pair if absent so we
+    # never abort a real launch (or leave the user without a usable key).
+    # In --dry-run we MUST NOT touch the filesystem (and the notice would be
+    # invisible under --output json), so report intent and stop instead.
     if not config.key_path.exists():
-        raise CLIError(f"SSH public key not found: {config.key_path}")
+        if config.dry_run:
+            raise CLIError(
+                f"SSH public key not found at {config.key_path}.\n"
+                "  It would be auto-generated on a real launch — re-run without --dry-run,\n"
+                f"  or create one first: ssh-keygen -t ed25519 -f {private_key_path(config.key_path)}"
+            )
+        info(f"SSH public key not found at {config.key_path} — generating a new ed25519 key pair…")
+        try:
+            generate_ssh_keypair(config.key_path)
+        except (OSError, subprocess.CalledProcessError) as e:
+            raise CLIError(
+                f"SSH public key not found and could not be generated at {config.key_path}: {e}\n"
+                "  Create one with: ssh-keygen -t ed25519, or pass --key-path to an existing key."
+            ) from None
+        success(f"Generated {private_key_path(config.key_path)} (and .pub)")
 
     multi_region = len(config.regions) > 1
     # "us-west-2" for one region; "us-west-2 → us-east-1 → eu-west-1" for many,
@@ -366,11 +385,11 @@ def launch(
             ami_r = get_latest_ami(ec2r, config.ami_filter)
             if is_text():
                 click.echo(f"  {_rtag(region)} " + click.style(f"AMI {ami_r['ImageId']}", dim=True))
-            import_key_pair(ec2r, config.key_name, config.key_path)
+            effective_key = import_key_pair(ec2r, config.key_name, config.key_path)
             sg_id_r = ensure_security_group(ec2r, config.security_group, config.tag_value, ssh_port=config.ssh_port)
         except CLIError as e:
             raise CLIError(f"[{region}] {e.format_message()}") from None
-        return RegionContext(region=region, ec2_client=ec2r, ami=ami_r, sg_id=sg_id_r)
+        return RegionContext(region=region, ec2_client=ec2r, ami=ami_r, sg_id=sg_id_r, key_name=effective_key)
 
     if config.dry_run:
         ctx0 = prepare_region(config.regions[0])
@@ -381,7 +400,7 @@ def launch(
             val("Instance type", config.instance_type)
             val("AMI", f"{ami['ImageId']} ({ami['Name']})")
             val("Pricing", pricing)
-            val("Key pair", config.key_name)
+            val("Key pair", ctx0.key_name)
             val("Security group", ctx0.sg_id)
             val("Volume", f"{config.volume_size} GB gp3")
             val("Region(s)", regions_label)
@@ -405,7 +424,7 @@ def launch(
                 "ami_id": ami["ImageId"],
                 "ami_name": ami["Name"],
                 "pricing": pricing,
-                "key_name": config.key_name,
+                "key_name": ctx0.key_name,
                 "security_group": ctx0.sg_id,
                 "volume_size_gb": config.volume_size,
                 "regions": list(config.regions),

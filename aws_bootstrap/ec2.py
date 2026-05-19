@@ -175,6 +175,9 @@ class RegionContext:
     ec2_client: object
     ami: dict
     sg_id: str
+    # Effective key-pair name for this region — may differ from config.key_name
+    # when import_key_pair had to side-step a mismatched same-named pair.
+    key_name: str
 
 
 @dataclass
@@ -187,11 +190,11 @@ class RegionLaunch:
     pricing: str
 
 
-def _build_launch_params(config: LaunchConfig, ami_id: str, sg_id: str, spot: bool) -> dict:
+def _build_launch_params(config: LaunchConfig, ami_id: str, sg_id: str, spot: bool, key_name: str) -> dict:
     params: dict = {
         "ImageId": ami_id,
         "InstanceType": config.instance_type,
-        "KeyName": config.key_name,
+        "KeyName": key_name,
         "SecurityGroupIds": [sg_id],
         "MinCount": 1,
         "MaxCount": 1,
@@ -226,7 +229,9 @@ def _build_launch_params(config: LaunchConfig, ami_id: str, sg_id: str, spot: bo
     return params
 
 
-def _run_instances(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str, region: str, spot: bool) -> dict:
+def _run_instances(
+    ec2_client, config: LaunchConfig, ami_id: str, sg_id: str, region: str, spot: bool, key_name: str
+) -> dict:
     """Single ``run_instances`` call.
 
     Raises :class:`CapacityError` on ``InsufficientInstanceCapacity`` (retryable
@@ -235,7 +240,7 @@ def _run_instances(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str, re
     """
     market = "spot" if spot else "on-demand"
     try:
-        response = ec2_client.run_instances(**_build_launch_params(config, ami_id, sg_id, spot))
+        response = ec2_client.run_instances(**_build_launch_params(config, ami_id, sg_id, spot, key_name))
     except botocore.exceptions.ClientError as e:
         code = e.response["Error"]["Code"]
         if code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
@@ -266,7 +271,7 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
     region = config.region
     try:
         try:
-            return _run_instances(ec2_client, config, ami_id, sg_id, region, config.spot)
+            return _run_instances(ec2_client, config, ami_id, sg_id, region, config.spot, config.key_name)
         except CapacityError:
             if not config.spot:
                 raise CLIError(
@@ -277,7 +282,9 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
             secho(f"\n  Spot request failed: insufficient capacity in {region}.", fg="yellow")
             if not is_text() or click.confirm("  Retry as on-demand instance?"):
                 try:
-                    return _run_instances(ec2_client, config, ami_id, sg_id, region, spot=False)
+                    return _run_instances(
+                        ec2_client, config, ami_id, sg_id, region, spot=False, key_name=config.key_name
+                    )
                 except CapacityError:
                     raise CLIError(
                         f"Insufficient capacity for {config.instance_type} (on-demand) in {region}.\n\n"
@@ -383,7 +390,7 @@ def launch_with_retry(
             if on_attempt:
                 on_attempt(region, mkt, attempt)
             try:
-                inst = _run_instances(ctx.ec2_client, config, ctx.ami["ImageId"], ctx.sg_id, region, spot)
+                inst = _run_instances(ctx.ec2_client, config, ctx.ami["ImageId"], ctx.sg_id, region, spot, ctx.key_name)
             except CapacityError as e:
                 failures[region] = ("capacity", str(e))
                 continue

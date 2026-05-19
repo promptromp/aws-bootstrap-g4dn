@@ -157,7 +157,9 @@ def _region_ctx(region: str, run_side_effect):
     """RegionContext whose ec2 client's run_instances has the given side effect."""
     client = MagicMock()
     client.run_instances.side_effect = run_side_effect
-    return RegionContext(region=region, ec2_client=client, ami={"ImageId": f"ami-{region}"}, sg_id="sg-1")
+    return RegionContext(
+        region=region, ec2_client=client, ami={"ImageId": f"ami-{region}"}, sg_id="sg-1", key_name="aws-bootstrap-key"
+    )
 
 
 def _ok_instance(instance_id="i-ok"):
