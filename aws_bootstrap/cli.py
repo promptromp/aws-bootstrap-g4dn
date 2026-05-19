@@ -844,7 +844,7 @@ def status(ctx, region, profile, gpu, instructions):
     click.echo()
     first_id = instances[0]["InstanceId"]
     first_ref = ssh_hosts.get(first_id, first_id)
-    click.echo("  To terminate:  " + _cmd(f"aws-bootstrap terminate {first_ref}"))
+    click.echo("  To terminate:  " + _cmd(f"aws-bootstrap terminate {first_ref} --region {region}"))
     click.echo()
 
 
@@ -951,7 +951,9 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
                     click.echo()
                 info(f"Preserving EBS volume: {vid} ({vol['Size']} GB)")
                 if is_text(ctx):
-                    click.echo("  Reattach with: " + _cmd(f"aws-bootstrap launch --ebs-volume-id {vid}"))
+                    click.echo(
+                        "  Reattach with: " + _cmd(f"aws-bootstrap launch --ebs-volume-id {vid} --region {region}")
+                    )
             else:
                 if is_text(ctx):
                     click.echo()
@@ -1322,7 +1324,7 @@ def quota_show(ctx, family, region, profile):
     click.echo(
         "  "
         + click.style("To request an increase: ", fg="bright_black")
-        + _cmd(f"aws-bootstrap quota request --family {example_family} --type spot --desired-value 4")
+        + _cmd(f"aws-bootstrap quota request --family {example_family} --type spot --desired-value 4 --region {region}")
     )
     click.echo()
 
@@ -1400,7 +1402,7 @@ def quota_request(ctx, family, quota_type, desired_value, region, profile, yes):
         val("Support case", result["case_id"])
     click.echo()
     if is_text(ctx):
-        click.echo("  Track status with: " + _cmd("aws-bootstrap quota history"))
+        click.echo("  Track status with: " + _cmd(f"aws-bootstrap quota history --region {region}"))
     click.echo()
 
 

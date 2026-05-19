@@ -118,6 +118,61 @@ def test_status_shows_instances(mock_find, mock_spot_price, mock_session, mock_s
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
 @patch("aws_bootstrap.cli.find_tagged_instances")
+def test_status_terminate_hint_pins_resolved_region(
+    mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details
+):
+    """'To terminate' hint must carry --region for the region status used."""
+    mock_session.return_value.region_name = None
+    mock_find.return_value = [
+        {
+            "InstanceId": "i-abc123",
+            "Name": "aws-bootstrap-g4dn.xlarge",
+            "State": "running",
+            "InstanceType": "g4dn.xlarge",
+            "PublicIp": "1.2.3.4",
+            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+            "Lifecycle": "spot",
+            "AvailabilityZone": "us-west-1a",
+        }
+    ]
+    mock_spot_price.return_value = 0.1578
+    result = CliRunner().invoke(main, ["status", "--region", "us-west-1"])
+    assert result.exit_code == 0
+    assert "aws-bootstrap terminate i-abc123 --region us-west-1" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_family_quotas")
+def test_quota_show_request_hint_pins_resolved_region(mock_quotas, mock_session):
+    """quota show's 'To request an increase' hint must carry --region so it
+    targets the queried region, not the default (reported regression)."""
+    mock_session.return_value.region_name = None
+    mock_quotas.return_value = [
+        {
+            "quota_code": "L-3819A6DF",
+            "quota_name": "All G and VT Spot",
+            "value": 0.0,
+            "quota_type": "spot",
+            "family": "gvt",
+        },
+        {
+            "quota_code": "L-DB2E81BA",
+            "quota_name": "Running On-Demand G and VT",
+            "value": 0.0,
+            "quota_type": "on-demand",
+            "family": "gvt",
+        },
+    ]
+    result = CliRunner().invoke(main, ["quota", "show", "--family", "gvt", "--region", "us-west-1"])
+    assert result.exit_code == 0
+    assert "aws-bootstrap quota request --family gvt --type spot --desired-value 4 --region us-west-1" in result.output
+
+
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price")
+@patch("aws_bootstrap.cli.find_tagged_instances")
 def test_status_on_demand_no_cost(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details):
     mock_find.return_value = [
         {
