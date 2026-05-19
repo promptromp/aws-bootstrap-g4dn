@@ -103,6 +103,11 @@ def warn(msg: str) -> None:
 # Consistent hues let the eye group by region and spot actionable commands.
 
 
+def _cmd(s: str) -> str:
+    """Style a copy-paste runnable command consistently (bold bright-cyan)."""
+    return click.style(s, fg="bright_cyan", bold=True)
+
+
 def _rtag(region: str) -> str:
     """Region marker, same hue everywhere so attempts group visually."""
     return click.style(f"[{region}]", fg="bright_blue", bold=True)
@@ -602,31 +607,30 @@ def launch(
 
     click.echo()
     click.secho("  SSH:", fg="cyan")
-    click.secho(f"    ssh{port_flag} {alias}", bold=True)
+    click.echo("    " + _cmd(f"ssh{port_flag} {alias}"))
     info(f"or: ssh -i {private_key}{port_flag} {config.ssh_user}@{public_ip}")
 
     click.echo()
     click.secho("  Jupyter (via SSH tunnel):", fg="cyan")
-    click.secho(f"    ssh -NL {JUPYTER_PORT}:localhost:{JUPYTER_PORT}{port_flag} {alias}", bold=True)
-    info(f"or: ssh -i {private_key} -NL 8888:localhost:8888{port_flag} {config.ssh_user}@{public_ip}")
-    info("Then open: http://localhost:{JUPYTER_PORT}")
+    click.echo("    " + _cmd(f"ssh -NL {JUPYTER_PORT}:localhost:{JUPYTER_PORT}{port_flag} {alias}"))
+    info(
+        f"or: ssh -i {private_key} -NL {JUPYTER_PORT}:localhost:{JUPYTER_PORT}{port_flag} {config.ssh_user}@{public_ip}"
+    )
+    info(f"Then open: http://localhost:{JUPYTER_PORT}")
     info("Notebook: ~/gpu_smoke_test.ipynb (GPU smoke test)")
 
     click.echo()
     click.secho("  VSCode Remote SSH:", fg="cyan")
-    click.secho(
-        f"    code --folder-uri vscode-remote://ssh-remote+{alias}/home/{config.ssh_user}/workspace",
-        bold=True,
-    )
+    click.echo("    " + _cmd(f"code --folder-uri vscode-remote://ssh-remote+{alias}/home/{config.ssh_user}/workspace"))
 
     click.echo()
     click.secho("  GPU Benchmark:", fg="cyan")
-    click.secho(f"    ssh {alias} 'python ~/gpu_benchmark.py'", bold=True)
+    click.echo("    " + _cmd(f"ssh {alias} 'python ~/gpu_benchmark.py'"))
     info("Runs CNN (MNIST) and Transformer benchmarks with tqdm progress")
 
     click.echo()
     click.secho("  Terminate:", fg="cyan")
-    click.secho(f"    aws-bootstrap terminate {alias} --region {active_region}", bold=True)
+    click.echo("    " + _cmd(f"aws-bootstrap terminate {alias} --region {active_region}"))
     click.echo()
 
 
@@ -808,19 +812,16 @@ def status(ctx, region, profile, gpu, instructions):
 
             click.echo()
             click.secho("    SSH:", fg="cyan")
-            click.secho(f"      ssh{port_flag} {alias}", bold=True)
+            click.echo("      " + _cmd(f"ssh{port_flag} {alias}"))
 
             click.secho("    Jupyter (via SSH tunnel):", fg="cyan")
-            click.secho(f"      ssh -NL {JUPYTER_PORT}:localhost:{JUPYTER_PORT}{port_flag} {alias}", bold=True)
+            click.echo("      " + _cmd(f"ssh -NL {JUPYTER_PORT}:localhost:{JUPYTER_PORT}{port_flag} {alias}"))
 
             click.secho("    VSCode Remote SSH:", fg="cyan")
-            click.secho(
-                f"      code --folder-uri vscode-remote://ssh-remote+{alias}/home/{user}/workspace",
-                bold=True,
-            )
+            click.echo("      " + _cmd(f"code --folder-uri vscode-remote://ssh-remote+{alias}/home/{user}/workspace"))
 
             click.secho("    GPU Benchmark:", fg="cyan")
-            click.secho(f"      ssh {alias} 'python ~/gpu_benchmark.py'", bold=True)
+            click.echo("      " + _cmd(f"ssh {alias} 'python ~/gpu_benchmark.py'"))
 
         structured_instances.append(inst_data)
 
@@ -843,7 +844,7 @@ def status(ctx, region, profile, gpu, instructions):
     click.echo()
     first_id = instances[0]["InstanceId"]
     first_ref = ssh_hosts.get(first_id, first_id)
-    click.echo("  To terminate:  " + click.style(f"aws-bootstrap terminate {first_ref}", bold=True))
+    click.echo("  To terminate:  " + _cmd(f"aws-bootstrap terminate {first_ref}"))
     click.echo()
 
 
@@ -949,7 +950,8 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
                 if is_text(ctx):
                     click.echo()
                 info(f"Preserving EBS volume: {vid} ({vol['Size']} GB)")
-                info(f"Reattach with: aws-bootstrap launch --ebs-volume-id {vid}")
+                if is_text(ctx):
+                    click.echo("  Reattach with: " + _cmd(f"aws-bootstrap launch --ebs-volume-id {vid}"))
             else:
                 if is_text(ctx):
                     click.echo()
@@ -1320,9 +1322,7 @@ def quota_show(ctx, family, region, profile):
     click.echo(
         "  "
         + click.style("To request an increase: ", fg="bright_black")
-        + click.style(
-            f"aws-bootstrap quota request --family {example_family} --type spot --desired-value 4", fg="bright_black"
-        )
+        + _cmd(f"aws-bootstrap quota request --family {example_family} --type spot --desired-value 4")
     )
     click.echo()
 
@@ -1399,7 +1399,8 @@ def quota_request(ctx, family, quota_type, desired_value, region, profile, yes):
     if result.get("case_id"):
         val("Support case", result["case_id"])
     click.echo()
-    info("Track status with: aws-bootstrap quota history")
+    if is_text(ctx):
+        click.echo("  Track status with: " + _cmd("aws-bootstrap quota history"))
     click.echo()
 
 
