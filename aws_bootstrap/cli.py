@@ -437,13 +437,21 @@ def launch(
             verb = click.style(f"requesting {market}", fg="cyan", bold=True)
             click.echo(f"  {_rtag(region)} {verb} {config.instance_type}…")
 
-    def on_wait(cycle: int, sleep_s: float, elapsed: float) -> None:
+    def on_wait(cycle: int, sleep_s: float, elapsed: float, retrying: list[str], skipped: list[str]) -> None:
         if is_text():
             nxt = click.style(f"{sleep_s:.0f}s", fg="yellow", bold=True)
+            retry_label = " → ".join(retrying) if len(retrying) > 1 else retrying[0]
             click.secho(
-                f"\n  ⏳ wait cycle {cycle}: no {pricing} capacity in {regions_label} — next sweep in {nxt}",
+                f"\n  ⏳ wait cycle {cycle}: no {pricing} capacity in {retry_label} — next sweep in {nxt}",
                 fg="yellow",
             )
+            if skipped:
+                click.secho(
+                    f"     (not retried — quota/price blocked: {', '.join(skipped)}; "
+                    "fix quota then re-run to include them)",
+                    fg="yellow",
+                    dim=True,
+                )
             click.secho(f"     (elapsed {elapsed:.0f}s of {config.wait_timeout}s budget)", fg="yellow", dim=True)
 
     def on_region_fatal(region: str, kind: str, message: str) -> None:

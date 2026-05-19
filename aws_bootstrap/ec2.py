@@ -334,7 +334,7 @@ def launch_with_retry(
     prepare_region: Callable[[str], RegionContext],
     *,
     on_attempt: Callable[[str, str, int], None] | None = None,
-    on_wait: Callable[[int, float, float], None] | None = None,
+    on_wait: Callable[[int, float, float, list[str], list[str]], None] | None = None,
     on_region_fatal: Callable[[str, str, str], None] | None = None,
     confirm_on_demand: Callable[[], bool] | None = None,
     sleeper: Callable[[float], None] = time.sleep,
@@ -417,7 +417,11 @@ def launch_with_retry(
                 raise _aggregated_error(config, regions, failures, market, suffix=f" within {config.wait_timeout}s")
             sleep_s = min(backoff_sleep_seconds(attempt, rng=rng), max(0.0, deadline - now))
             if on_wait:
-                on_wait(attempt + 1, sleep_s, now - start)
+                # Only capacity-limited regions are re-swept; quota/price
+                # regions were dropped (waiting can't fix them). Report both
+                # so the heartbeat reflects what is actually being retried.
+                skipped = [r for r in regions if r in fatal]
+                on_wait(attempt + 1, sleep_s, now - start, capacity_left, skipped)
             sleeper(sleep_s)
             attempt += 1
             continue
