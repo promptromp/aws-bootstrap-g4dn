@@ -210,19 +210,19 @@ A GPU throughput benchmark is pre-installed at `~/gpu_benchmark.py` on every ins
 
 ```bash
 # Run both CNN and Transformer benchmarks (default)
-ssh aws-gpu1 'python ~/gpu_benchmark.py'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py'
 
 # CNN only, quick run
-ssh aws-gpu1 'python ~/gpu_benchmark.py --mode cnn --benchmark-batches 20'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py --mode cnn --benchmark-batches 20'
 
 # Transformer only with custom batch size
-ssh aws-gpu1 'python ~/gpu_benchmark.py --mode transformer --transformer-batch-size 16'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py --mode transformer --transformer-batch-size 16'
 
 # Run CUDA diagnostics first (tests FP16/FP32 matmul, autocast, etc.)
-ssh aws-gpu1 'python ~/gpu_benchmark.py --diagnose'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py --diagnose'
 
 # Force FP32 precision (if FP16 has issues on your GPU)
-ssh aws-gpu1 'python ~/gpu_benchmark.py --precision fp32'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py --precision fp32'
 ```
 
 Reports: iterations/sec, samples/sec, peak GPU memory, and avg batch time for each model.

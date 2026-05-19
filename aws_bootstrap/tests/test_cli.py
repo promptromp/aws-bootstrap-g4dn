@@ -1091,6 +1091,30 @@ def test_launch_text_output_shows_resolved_region(
     assert "Region: us-east-1" in result.output
 
 
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_with_retry")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_launch_benchmark_hint_uses_venv_python(
+    mock_session, mock_launch, mock_wait, mock_ssh, mock_setup, mock_add_ssh, tmp_path
+):
+    """`ssh alias 'cmd'` is non-interactive (no ~/.bashrc / venv activation)
+    and Ubuntu 24.04 has no unversioned `python` — the GPU-benchmark hint
+    must invoke the venv interpreter by absolute path."""
+    mock_session.return_value.region_name = None
+    mock_launch.return_value = _region_launch({"InstanceId": "i-xyz"}, region="us-west-2")
+    mock_wait.return_value = {"PublicIpAddress": "1.2.3.4", "Placement": {"AvailabilityZone": "us-west-2a"}}
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    result = CliRunner().invoke(main, ["launch", "--key-path", str(key_path), "--no-setup"])
+    assert result.exit_code == 0
+    assert "~/venv/bin/python ~/gpu_benchmark.py" in result.output
+    assert "'python ~/gpu_benchmark.py'" not in result.output
+
+
 # ---------------------------------------------------------------------------
 # --ssh-port tests
 # ---------------------------------------------------------------------------

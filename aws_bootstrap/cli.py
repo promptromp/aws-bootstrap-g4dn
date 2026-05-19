@@ -652,7 +652,7 @@ def launch(
 
     click.echo()
     click.secho("  GPU Benchmark:", fg="cyan")
-    click.echo("    " + _cmd(f"ssh {alias} 'python ~/gpu_benchmark.py'"))
+    click.echo("    " + _cmd(f"ssh {alias} '~/venv/bin/python ~/gpu_benchmark.py'"))
     info("Runs CNN (MNIST) and Transformer benchmarks with tqdm progress")
 
     click.echo()
@@ -848,7 +848,7 @@ def status(ctx, region, profile, gpu, instructions):
             click.echo("      " + _cmd(f"code --folder-uri vscode-remote://ssh-remote+{alias}/home/{user}/workspace"))
 
             click.secho("    GPU Benchmark:", fg="cyan")
-            click.echo("      " + _cmd(f"ssh {alias} 'python ~/gpu_benchmark.py'"))
+            click.echo("      " + _cmd(f"ssh {alias} '~/venv/bin/python ~/gpu_benchmark.py'"))
 
         structured_instances.append(inst_data)
 
