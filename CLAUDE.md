@@ -41,6 +41,8 @@ aws_bootstrap/
     gpu.py               # GPU architecture mapping and GpuInfo dataclass
     output.py            # Output formatting: OutputFormat enum, emit(), echo/secho wrappers for structured output
     quota.py             # Service Quotas API: get/request GPU vCPU quotas (G/VT, P, DL families)
+    retry.py             # Pure helpers: region precedence (resolve_regions), wait duration parsing, backoff schedule
+    constants.py         # Centralized infra/tag literals (tag keys, resource types, ports, waiter configs, AMI owner IDs); re-exports config defaults
     ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management, GPU queries, EBS mount
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
@@ -57,6 +59,7 @@ aws_bootstrap/
         test_ec2.py
         test_output.py
         test_gpu.py
+        test_retry.py
         test_ssh_config.py
         test_ssh_gpu.py
         test_ebs.py
@@ -84,7 +87,9 @@ Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`
 
 **Global option:** `--output` / `-o` controls output format: `text` (default, human-readable with color), `json`, `yaml`, `table`. Structured formats (json/yaml/table) suppress all progress messages and emit machine-readable output. Commands requiring confirmation (`terminate`, `cleanup`) require `--yes` in structured modes.
 
-- **`launch`** — provisions an EC2 instance (spot by default, falls back to on-demand on capacity errors); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`; `--python-version` controls which Python `uv` installs in the remote venv; `--ssh-port` overrides the default SSH port (22) for security group ingress, connection checks, and SSH config; `--ebs-storage SIZE` creates and attaches a new gp3 EBS data volume (mounted at `/data`); `--ebs-volume-id ID` attaches an existing EBS volume (mutually exclusive with `--ebs-storage`)
+**Region resolution (all commands):** `--region` precedence is explicit flag(s) → `AWS_DEFAULT_REGION` / profile region → `us-west-2`. Implemented by `retry.resolve_regions` and the `resolve_region_list` / `resolve_single_region` helpers in `cli.py`. (Behavior change: the default is no longer hardcoded to `us-west-2` ignoring the profile.) The resolved/active region is echoed in `launch`, `status`, `terminate`, and `cleanup` output.
+
+- **`launch`** — provisions an EC2 instance (spot by default); `--region` is repeatable and tried in order (spot-first) on capacity shortfall; `--wait` retries with capped+jittered exponential backoff (30s→300s, ±20%) until `--wait-timeout` (default 30m; accepts `90s`/`30m`/`1h`/seconds) then hard-fails; quota / `SpotMaxPriceTooLow` are never waited on but warn and fall through to the next `--region`, hard-failing (aggregated, region-pinned hints) only when every region is blocked; without `--wait`, a single exhausted spot pass offers the on-demand fallback across all regions. Orchestrated by `ec2.launch_with_retry` (with `ec2.launch_instance` retained as the single-region back-compat primitive); adds SSH config alias (e.g. `aws-gpu1`) to `~/.ssh/config`; `--python-version` controls which Python `uv` installs in the remote venv; `--ssh-port` overrides the default SSH port (22) for security group ingress, connection checks, and SSH config; `--ebs-storage SIZE` creates and attaches a new gp3 EBS data volume (mounted at `/data`); `--ebs-volume-id ID` attaches an existing EBS volume (mutually exclusive with `--ebs-storage`)
 - **`status`** — lists all non-terminated instances (including `shutting-down`) with type, IP, SSH alias, EBS data volumes, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances; `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`); `--instructions` (default: on) prints connection commands (SSH, Jupyter tunnel, VSCode Remote SSH, GPU benchmark) for each running instance; suppress with `--no-instructions`
 - **`terminate`** — terminates instances by ID or SSH alias (e.g. `aws-gpu1`, resolved via `~/.ssh/config`), or all aws-bootstrap instances in the region if no arguments given; removes SSH config aliases; deletes associated EBS data volumes by default; `--keep-ebs` preserves volumes and prints reattach commands
 - **`cleanup`** — removes stale `~/.ssh/config` entries for terminated/non-existent instances; compares managed SSH config blocks against live EC2 instances; `--include-ebs` also finds and deletes orphan EBS data volumes (volumes in `available` state whose linked instance no longer exists); `--dry-run` previews removals without modifying config; `--yes` skips the confirmation prompt
@@ -129,7 +134,21 @@ The `--output` option uses a context-aware suppression pattern via `aws_bootstra
 - **CLI helper guards** — `step()`, `info()`, `val()`, `success()`, `warn()` in `cli.py` check `is_text()` and return early in structured modes.
 - Each CLI command builds a result dict alongside existing logic, emits it via `emit()` for non-text formats, and falls through to text output for text mode.
 - **Confirmation prompts** (`terminate`, `cleanup`) require `--yes` in structured modes to avoid corrupting output.
-- The spot-fallback `click.confirm()` in `ec2.py` auto-confirms in structured modes.
+- The spot-fallback `click.confirm()` in `ec2.py` auto-confirms in structured modes (via the `confirm_on_demand` callback default in `launch_with_retry`).
+
+## Capacity, Multi-Region & Wait Retry
+
+`ec2.launch_with_retry(config, prepare_region, ...)` is the launch orchestrator:
+
+- **`prepare_region(region)`** — a `cli.py` callback returning a `RegionContext` (region-scoped boto3 client, AMI, security group); invoked at most once per region and cached across retries.
+- **Spot-first per sweep** — each sweep calls `_run_instances` for every non-fatal region in `config.regions` order; first success returns a `RegionLaunch`. `_run_instances` raises `CapacityError` (`InsufficientInstanceCapacity`; retryable by next-region fallthrough *and* `--wait`) or `RegionFatalError` (quota via `_quota_error_message`, or `SpotMaxPriceTooLow`; `kind="quota"|"price"`).
+- **`RegionFatalError` handling** — the region is recorded, dropped from later sweeps, and `on_region_fatal(region, kind, message)` fires so `cli.py` prints an immediate `WARNING` (region-pinned hint) before the next region is tried. Quota/price never trigger a `--wait` sleep. If every region is exhausted, `_aggregated_error` raises a single `CLIError` listing each region's reason + the full hint for each quota/price region.
+- **`--wait`** — only sleeps while ≥1 region still has a retryable `CapacityError`; sleeps `retry.backoff_sleep_seconds(attempt)` (exponential, capped, jittered; clamped to the deadline) until `config.wait_timeout`, then hard-fails via `_aggregated_error`. Injectable `sleeper`/`clock`/`rng` keep it unit-testable.
+- **No `--wait`** — a fully-exhausted spot sweep triggers the on-demand fallback (`confirm_on_demand`) which sweeps **all** regions afresh (spot quota ≠ on-demand quota).
+- **Region-aware errors** — `cli.prepare_region` prefixes setup failures with `[region]`; `validate_ebs_volume` and `quota._not_found_msg` name the region (EBS volumes and quotas are region-scoped).
+- **Pure policy in `retry.py`** — `resolve_regions`, `parse_duration`, `backoff_sleep_seconds` are side-effect-free and tested in `test_retry.py`. The CLI exposes `--wait-timeout` via the `_Duration` Click param type.
+- `LaunchConfig` holds `regions: tuple[str, ...]` with a `region` property (`regions[0]`, falls back to `DEFAULT_REGION` if empty) for single-region callers; `wait` and `wait_timeout` fields drive the loop.
+- **Text-mode color scheme** — `cli.py` helpers `_cmd()` (copy-paste commands → bold bright-cyan, used tool-wide), `_rtag()` / `_region_rule()` (per-region grouping → bold bright-blue), `_emit_region_fatal()` (bold-yellow verdict + cyan commands). All are `is_text()`-guarded, so structured output is never colorized/polluted. Reuse `_cmd()` for any new suggested-command output to stay consistent.
 
 ## CUDA-Aware PyTorch Installation
 
@@ -156,7 +175,7 @@ The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags publi
 
 The `--ebs-storage` and `--ebs-volume-id` options on `launch` create or attach persistent gp3 EBS volumes mounted at `/data`. The implementation spans three modules:
 
-- **`ec2.py`** — Volume lifecycle: `create_ebs_volume`, `validate_ebs_volume`, `attach_ebs_volume`, `detach_ebs_volume`, `delete_ebs_volume`, `find_ebs_volumes_for_instance`. Constants `EBS_DEVICE_NAME` (`/dev/sdf`) and `EBS_MOUNT_POINT` (`/data`).
+- **`ec2.py`** — Volume lifecycle: `create_ebs_volume`, `validate_ebs_volume`, `attach_ebs_volume`, `detach_ebs_volume`, `delete_ebs_volume`, `find_ebs_volumes_for_instance`. `EBS_DEVICE_NAME` (`/dev/sdf`) and `EBS_MOUNT_POINT` (`/data`) are defined in `constants.py` (`EBS_DEVICE_NAME` is also imported into `ec2.py` as an attach default).
 - **`ssh.py`** — `mount_ebs_volume()` SSHs to the instance and runs a shell script that detects the device, optionally formats it, mounts it, and adds an fstab entry.
 - **`cli.py`** — Orchestrates the flow: create/validate → attach → wait for SSH → mount. Mount failures are non-fatal (warn and continue).
 

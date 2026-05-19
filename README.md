@@ -118,6 +118,13 @@ aws-bootstrap launch
 # Launch on-demand in a specific region with a custom instance type
 aws-bootstrap launch --on-demand --instance-type g5.xlarge --region us-east-1
 
+# Try multiple regions in order until one has spot capacity
+aws-bootstrap launch --region us-west-2 --region us-east-1 --region eu-west-1
+
+# Keep retrying (bounded exponential backoff) until spot capacity frees up
+aws-bootstrap launch --wait --wait-timeout 30m
+aws-bootstrap launch --region us-west-2 --region us-east-1 --wait --wait-timeout 1h
+
 # Launch without running the remote setup script
 aws-bootstrap launch --no-setup
 
@@ -149,6 +156,30 @@ After launch, the CLI:
 ```bash
 ssh aws-gpu1                  # venv auto-activates on login
 ```
+
+### 🌍 Finding Capacity (regions & `--wait`)
+
+Spot `InsufficientInstanceCapacity` is scoped to a **region and availability zone** — a type that's unavailable in `us-west-2` right now may be plentiful in `us-east-1`, and capacity for a given AZ frees up continuously as other instances terminate. Two options help you get a GPU without babysitting the prompt:
+
+- **Multiple regions** — pass `--region` more than once. Each launch attempt tries the regions **in the order given**, spot-first, and uses the first one with capacity:
+
+  ```bash
+  aws-bootstrap launch --region us-west-2 --region us-east-1 --region eu-west-1
+  ```
+
+- **`--wait`** — on insufficient spot capacity, keep retrying with **capped, jittered exponential backoff** until `--wait-timeout` (default `30m`; accepts `90s`, `30m`, `1h`, or bare seconds). On timeout it **hard-fails** (it does not silently fall back to on-demand):
+
+  ```bash
+  aws-bootstrap launch --region us-west-2 --region us-east-1 --wait --wait-timeout 1h
+  ```
+
+**How `--wait` + multiple `--region` combine:** a **region sweep is the inner loop, backoff is the outer loop**. Each cycle tries spot in every `--region` in order *with no delay between regions*; only when **all** regions miss does it sleep (backoff) and sweep again. So `--wait --region A --region B` means "try A then B instantly; if both dry, back off and retry A then B" — repeating until timeout — *not* "wait on A, then try B." Backoff escalates per sweep (not per region), region order wins every tie, and `--wait-timeout` is total wall-clock. See [docs/capacity-and-retry.md](docs/capacity-and-retry.md#how---wait-and-multiple---region-combine) for the full model.
+
+Quota errors (`VcpuLimitExceeded`, `MaxSpotInstanceCountExceeded`) and `SpotMaxPriceTooLow` are **never retried by `--wait`** (waiting can't fix them). In multi-region mode they are *not* fatal on their own: the launcher prints a `WARNING` for that region (with a region-pinned `aws-bootstrap quota …` hint), skips it, and tries the next `--region` — failing hard only once **every** region is blocked, with an aggregated message listing each region's reason and hint. Without `--wait`, a fully-exhausted spot pass still offers the interactive on-demand fallback (across all regions).
+
+**Region default precedence** (a behavior change — previously hardcoded to `us-west-2`): explicit `--region` flags → `AWS_DEFAULT_REGION` / active profile region → `us-west-2`. This applies to every command, so a profile configured for `us-east-1` now operates in `us-east-1` by default. The active region is shown in command output.
+
+See [docs/capacity-and-retry.md](docs/capacity-and-retry.md) for the backoff design and recommended region lists per instance family.
 
 ### 🔧 What Remote Setup Does
 

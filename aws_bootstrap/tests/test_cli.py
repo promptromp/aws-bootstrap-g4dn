@@ -11,9 +11,16 @@ import yaml
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import main
-from aws_bootstrap.ec2 import CLIError
+from aws_bootstrap.ec2 import CLIError, RegionContext, RegionLaunch
 from aws_bootstrap.gpu import GpuInfo
 from aws_bootstrap.ssh import CleanupResult, SSHHostDetails
+
+
+def _region_launch(instance, *, region="us-west-2", pricing="spot", ami=None):
+    """Build a RegionLaunch as launch_with_retry would return it."""
+    ami = ami or {"ImageId": "ami-123", "Name": "TestAMI"}
+    ctx = RegionContext(region=region, ec2_client=MagicMock(), ami=ami, sg_id="sg-123")
+    return RegionLaunch(region=region, context=ctx, instance=instance, pricing=pricing)
 
 
 def test_help():
@@ -340,7 +347,7 @@ def test_list_amis_empty(mock_list, mock_session):
 @patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
 @patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
 @patch("aws_bootstrap.cli.wait_instance_ready")
-@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.launch_with_retry")
 @patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
 @patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
 @patch("aws_bootstrap.cli.get_latest_ami")
@@ -349,7 +356,7 @@ def test_launch_output_shows_ssh_alias(
     mock_session, mock_ami, mock_import, mock_sg, mock_launch, mock_wait, mock_ssh, mock_setup, mock_add_ssh, tmp_path
 ):
     mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
-    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_launch.return_value = _region_launch({"InstanceId": "i-test123"})
     mock_wait.return_value = {
         "PublicIpAddress": "1.2.3.4",
         "Placement": {"AvailabilityZone": "us-west-2a"},
@@ -795,7 +802,7 @@ def test_no_credentials_caught_on_list(mock_session, mock_list):
 @patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
 @patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
 @patch("aws_bootstrap.cli.wait_instance_ready")
-@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.launch_with_retry")
 @patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
 @patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
 @patch("aws_bootstrap.cli.get_latest_ami")
@@ -804,7 +811,7 @@ def test_launch_python_version_passed_to_setup(
     mock_session, mock_ami, mock_import, mock_sg, mock_launch, mock_wait, mock_ssh, mock_setup, mock_add_ssh, tmp_path
 ):
     mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
-    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_launch.return_value = _region_launch({"InstanceId": "i-test123"})
     mock_wait.return_value = {
         "PublicIpAddress": "1.2.3.4",
         "Placement": {"AvailabilityZone": "us-west-2a"},
@@ -851,6 +858,115 @@ def test_launch_dry_run_omits_python_version_when_unset(mock_sg, mock_import, mo
     result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run"])
     assert result.exit_code == 0
     assert "Python version" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# multi-region + --wait tests
+# ---------------------------------------------------------------------------
+
+
+def test_launch_help_shows_region_and_wait():
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--help"])
+    assert result.exit_code == 0
+    assert "--wait" in result.output
+    assert "--wait-timeout" in result.output
+    # Help text is line-wrapped by Click; normalize whitespace before matching.
+    flat = " ".join(result.output.split())
+    assert "attempted one at a time in the given order" in flat
+    assert "NOT one instance per region" in flat
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_json_multi_region_and_wait(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+    mock_session.return_value.region_name = None
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "-o",
+            "json",
+            "launch",
+            "--key-path",
+            str(key_path),
+            "--dry-run",
+            "--region",
+            "us-east-1",
+            "--region",
+            "us-west-2",
+            "--wait",
+            "--wait-timeout",
+            "90s",
+        ],
+    )
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["regions"] == ["us-east-1", "us-west-2"]
+    assert data["wait"] is True
+    assert data["wait_timeout_seconds"] == 90
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_dry_run_region_defaults_to_profile_region(mock_sg, mock_import, mock_ami, mock_session, tmp_path):
+    """With no --region, the profile/env region is used (not hardcoded us-west-2)."""
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+    mock_session.return_value.region_name = "ap-south-1"
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "launch", "--key-path", str(key_path), "--dry-run"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["regions"] == ["ap-south-1"]
+
+
+def test_launch_invalid_wait_timeout_rejected(tmp_path):
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--dry-run", "--wait-timeout", "bogus"])
+    assert result.exit_code != 0
+    assert "Invalid duration" in result.output or "duration" in result.output.lower()
+
+
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_with_retry")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_launch_text_output_shows_resolved_region(
+    mock_session, mock_launch, mock_wait, mock_ssh, mock_setup, mock_add_ssh, tmp_path
+):
+    mock_session.return_value.region_name = None
+    mock_launch.return_value = _region_launch({"InstanceId": "i-xyz"}, region="us-east-1")
+    mock_wait.return_value = {
+        "PublicIpAddress": "1.2.3.4",
+        "Placement": {"AvailabilityZone": "us-east-1a"},
+    }
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["launch", "--key-path", str(key_path), "--no-setup", "--region", "us-west-2", "--region", "us-east-1"]
+    )
+    assert result.exit_code == 0
+    assert "Region: us-east-1" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -963,7 +1079,7 @@ def test_launch_dry_run_with_ebs_volume_id(mock_sg, mock_import, mock_ami, mock_
 @patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
 @patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
 @patch("aws_bootstrap.cli.wait_instance_ready")
-@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.launch_with_retry")
 @patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
 @patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
 @patch("aws_bootstrap.cli.get_latest_ami")
@@ -984,7 +1100,7 @@ def test_launch_with_ebs_storage_full_flow(
     tmp_path,
 ):
     mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
-    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_launch.return_value = _region_launch({"InstanceId": "i-test123"})
     mock_wait.return_value = {
         "PublicIpAddress": "1.2.3.4",
         "Placement": {"AvailabilityZone": "us-west-2a"},
@@ -1011,7 +1127,7 @@ def test_launch_with_ebs_storage_full_flow(
 @patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
 @patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
 @patch("aws_bootstrap.cli.wait_instance_ready")
-@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.launch_with_retry")
 @patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
 @patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
 @patch("aws_bootstrap.cli.get_latest_ami")
@@ -1032,7 +1148,7 @@ def test_launch_with_ebs_volume_id_full_flow(
     tmp_path,
 ):
     mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
-    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_launch.return_value = _region_launch({"InstanceId": "i-test123"})
     mock_wait.return_value = {
         "PublicIpAddress": "1.2.3.4",
         "Placement": {"AvailabilityZone": "us-west-2a"},
@@ -1060,7 +1176,7 @@ def test_launch_with_ebs_volume_id_full_flow(
 @patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
 @patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
 @patch("aws_bootstrap.cli.wait_instance_ready")
-@patch("aws_bootstrap.cli.launch_instance")
+@patch("aws_bootstrap.cli.launch_with_retry")
 @patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
 @patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
 @patch("aws_bootstrap.cli.get_latest_ami")
@@ -1080,7 +1196,7 @@ def test_launch_ebs_mount_failure_warns(
     tmp_path,
 ):
     mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
-    mock_launch.return_value = {"InstanceId": "i-test123"}
+    mock_launch.return_value = _region_launch({"InstanceId": "i-test123"})
     mock_wait.return_value = {
         "PublicIpAddress": "1.2.3.4",
         "Placement": {"AvailabilityZone": "us-west-2a"},
@@ -1493,7 +1609,9 @@ def test_launch_output_json_dry_run(mock_sg, mock_import, mock_ami, mock_session
     assert data["instance_type"] == "g4dn.xlarge"
     assert data["ami_id"] == "ami-123"
     assert data["pricing"] == "spot"
-    assert data["region"] == "us-west-2"
+    assert data["regions"] == ["us-west-2"]
+    assert data["wait"] is False
+    assert data["wait_timeout_seconds"] == 1800
 
 
 @patch("aws_bootstrap.cli.remove_ssh_host", return_value="aws-gpu1")

@@ -12,6 +12,15 @@ from pathlib import Path
 
 import click
 
+from .constants import (
+    ALIAS_PREFIX,
+    EBS_MOUNT_POINT,
+    RES_KEY_PAIR,
+    SSH_CONNECT_TIMEOUT,
+    SSH_PORT_DEFAULT,
+    TAG_CREATED_BY,
+    TAG_VALUE,
+)
 from .gpu import _GPU_ARCHITECTURES, GpuInfo
 from .output import echo, secho
 
@@ -66,8 +75,8 @@ def import_key_pair(ec2_client, key_name: str, key_path: Path) -> str:
         PublicKeyMaterial=pub_key,
         TagSpecifications=[
             {
-                "ResourceType": "key-pair",
-                "Tags": [{"Key": "created-by", "Value": "aws-bootstrap-g4dn"}],
+                "ResourceType": RES_KEY_PAIR,
+                "Tags": [{"Key": TAG_CREATED_BY, "Value": TAG_VALUE}],
             }
         ],
     )
@@ -75,13 +84,15 @@ def import_key_pair(ec2_client, key_name: str, key_path: Path) -> str:
     return key_name
 
 
-def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay: int = 10, port: int = 22) -> bool:
+def wait_for_ssh(
+    host: str, user: str, key_path: Path, retries: int = 30, delay: int = 10, port: int = SSH_PORT_DEFAULT
+) -> bool:
     """Wait for SSH to become available on the instance.
 
     Tries a TCP connection to the SSH port first, then an actual SSH command.
     """
     base_opts = _ssh_opts(key_path)
-    port_opts = ["-p", str(port)] if port != 22 else []
+    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
 
     for attempt in range(1, retries + 1):
         # First check if the SSH port is open
@@ -99,7 +110,7 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
             *base_opts,
             *port_opts,
             "-o",
-            "ConnectTimeout=10",
+            f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
             "-o",
             "BatchMode=yes",
             f"{user}@{host}",
@@ -117,12 +128,17 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
 
 
 def run_remote_setup(
-    host: str, user: str, key_path: Path, script_path: Path, python_version: str | None = None, port: int = 22
+    host: str,
+    user: str,
+    key_path: Path,
+    script_path: Path,
+    python_version: str | None = None,
+    port: int = SSH_PORT_DEFAULT,
 ) -> bool:
     """SCP the setup script and requirements.txt to the instance and execute."""
     ssh_opts = _ssh_opts(key_path)
-    scp_port_opts = ["-P", str(port)] if port != 22 else []
-    ssh_port_opts = ["-p", str(port)] if port != 22 else []
+    scp_port_opts = ["-P", str(port)] if port != SSH_PORT_DEFAULT else []
+    ssh_port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
     requirements_path = script_path.parent / "requirements.txt"
 
     # SCP the requirements file
@@ -265,7 +281,7 @@ def _write_ssh_config(config_path: Path, content: str) -> None:
         raise
 
 
-def _next_alias(content: str, prefix: str = "aws-gpu") -> str:
+def _next_alias(content: str, prefix: str = ALIAS_PREFIX) -> str:
     """Return the next sequential alias like ``aws-gpu3``.
 
     Only considers aliases inside aws-bootstrap marker blocks so that
@@ -289,10 +305,12 @@ def _next_alias(content: str, prefix: str = "aws-gpu") -> str:
     return f"{prefix}{max_n + 1}"
 
 
-def _build_stanza(instance_id: str, alias: str, hostname: str, user: str, key_path: Path, port: int = 22) -> str:
+def _build_stanza(
+    instance_id: str, alias: str, hostname: str, user: str, key_path: Path, port: int = SSH_PORT_DEFAULT
+) -> str:
     """Build a complete SSH config stanza with markers."""
     priv_key = private_key_path(key_path)
-    port_line = f"    Port {port}\n" if port != 22 else ""
+    port_line = f"    Port {port}\n" if port != SSH_PORT_DEFAULT else ""
     return (
         f"{_BEGIN_MARKER.format(instance_id=instance_id)}\n"
         f"Host {alias}\n"
@@ -312,8 +330,8 @@ def add_ssh_host(
     user: str,
     key_path: Path,
     config_path: Path | None = None,
-    alias_prefix: str = "aws-gpu",
-    port: int = 22,
+    alias_prefix: str = ALIAS_PREFIX,
+    port: int = SSH_PORT_DEFAULT,
 ) -> str:
     """Add (or update) an SSH host stanza for *instance_id*.
 
@@ -462,7 +480,7 @@ class SSHHostDetails:
     hostname: str
     user: str
     identity_file: Path
-    port: int = 22
+    port: int = SSH_PORT_DEFAULT
 
 
 def get_ssh_host_details(instance_id: str, config_path: Path | None = None) -> SSHHostDetails | None:
@@ -483,7 +501,7 @@ def get_ssh_host_details(instance_id: str, config_path: Path | None = None) -> S
     hostname: str | None = None
     user: str | None = None
     identity_file: str | None = None
-    port: int = 22
+    port: int = SSH_PORT_DEFAULT
 
     for line in content.splitlines():
         if line == begin_marker:
@@ -507,14 +525,16 @@ def get_ssh_host_details(instance_id: str, config_path: Path | None = None) -> S
     return None
 
 
-def query_gpu_info(host: str, user: str, key_path: Path, timeout: int = 10, port: int = 22) -> GpuInfo | None:
+def query_gpu_info(
+    host: str, user: str, key_path: Path, timeout: int = SSH_CONNECT_TIMEOUT, port: int = SSH_PORT_DEFAULT
+) -> GpuInfo | None:
     """SSH into a host and query GPU info via ``nvidia-smi``.
 
     Returns ``GpuInfo`` on success, or ``None`` if the SSH connection fails,
     ``nvidia-smi`` is unavailable, or the output is malformed.
     """
     ssh_opts = _ssh_opts(key_path)
-    port_opts = ["-p", str(port)] if port != 22 else []
+    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
     remote_cmd = (
         "nvidia-smi --query-gpu=driver_version,name,compute_cap --format=csv,noheader,nounits"
         " && nvidia-smi | grep -oP 'CUDA Version: \\K[\\d.]+'"
@@ -578,9 +598,9 @@ def mount_ebs_volume(
     user: str,
     key_path: Path,
     volume_id: str,
-    mount_point: str = "/data",
+    mount_point: str = EBS_MOUNT_POINT,
     format_volume: bool = True,
-    port: int = 22,
+    port: int = SSH_PORT_DEFAULT,
 ) -> bool:
     """Mount an EBS volume on the remote instance via SSH.
 
@@ -590,7 +610,7 @@ def mount_ebs_volume(
     Returns True on success, False on failure.
     """
     ssh_opts = _ssh_opts(key_path)
-    port_opts = ["-p", str(port)] if port != 22 else []
+    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
 
     # Strip the vol- prefix and hyphen for NVMe serial matching
     vol_serial = volume_id.replace("-", "")
@@ -640,7 +660,7 @@ def mount_ebs_volume(
         *ssh_opts,
         *port_opts,
         "-o",
-        "ConnectTimeout=10",
+        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
         f"{user}@{host}",
         remote_script,
     ]
