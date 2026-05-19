@@ -202,7 +202,7 @@ The `/data` volume is **not lost on spot interruption** — when AWS reclaims th
 ## Error Handling
 
 - **Spot capacity errors** (`InsufficientInstanceCapacity`): prefer multiple `--region` values (tried in order) and/or `--wait --wait-timeout` over manual retry loops — the CLI handles bounded backoff internally. Without `--wait`, an exhausted spot pass auto-falls back to on-demand in structured modes. `--wait` hard-fails on timeout (it does not auto-buy on-demand).
-- **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`) and `SpotMaxPriceTooLow`: fail fast — never retried by `--wait`. Check with `aws-bootstrap quota show` and request increases with `aws-bootstrap quota request --family gvt --type spot --desired-value 4`. Other families: `--family p` (P2-P6), `--family dl`
+- **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`) and `SpotMaxPriceTooLow`: never retried by `--wait`, but in multi-region mode the launcher warns (with a region-pinned hint) and tries the next `--region`; it fails hard only when every region is blocked. Quotas are per-region — the suggested `aws-bootstrap quota show` / `quota request` commands are auto-pinned to `--region <failed-region>`. Run them as-is; other families: `--family p` (P2-P6), `--family dl`.
 - **SSH timeouts**: Instance may still be initializing -- check `aws-bootstrap status`
 - **No public IP**: Check VPC settings or assign an Elastic IP
 - **EBS mount failures**: Non-fatal -- instance remains usable, may need manual mount

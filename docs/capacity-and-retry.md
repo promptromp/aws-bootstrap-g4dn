@@ -90,18 +90,23 @@ sleep ~60s; … capped at ~300s between sweeps; the moment either region has
 spot capacity, launch there; if 1h elapses with no capacity in either,
 hard-fail.
 
-### Fail-fast errors (never retried)
+### Region-fatal errors (never *waited*, but the next region is still tried)
 
-| Error | Why no retry |
-|-------|--------------|
-| `VcpuLimitExceeded` / `MaxSpotInstanceCountExceeded` | Account quota — see `aws-bootstrap quota` |
-| `SpotMaxPriceTooLow` | Bid below market; waiting won't change it — use `--on-demand` |
+| Error | Behavior |
+|-------|----------|
+| `VcpuLimitExceeded` / `MaxSpotInstanceCountExceeded` (quota) | Account quota is **per region**. The launcher prints a `WARNING` for that region (with a region-pinned `aws-bootstrap quota show` / `quota request` hint), drops the region, and **moves on to the next `--region`**. It never triggers a `--wait` sleep (quota won't free up by waiting). |
+| `SpotMaxPriceTooLow` | Same handling: warn, drop the region, try the next one (spot price differs per region). |
 
-A quota error stops the run immediately (it does not continue to later
-`--region` values). Quotas are **per region**, so the suggested
-`aws-bootstrap quota show` / `quota request` commands in the error are
-automatically pinned to `--region <the region that failed>` — run them
-verbatim; don't let them resolve to your default region.
+If **every** region is quota/price-blocked (and none have retryable
+capacity errors), the command **fails hard** with an aggregated message
+listing each region's reason and the full, region-pinned remediation hint
+for every quota/price region. The per-region `WARNING`s are emitted *as they
+happen* (before the next region is tried), so you see the quota hint for a
+region even if a later region ultimately succeeds.
+
+> Run the suggested `aws-bootstrap quota …` commands verbatim — they are
+> already pinned to `--region <the region that failed>`; don't let them
+> resolve to your default region.
 
 ### On-demand fallback (without `--wait`)
 

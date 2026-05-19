@@ -8,9 +8,18 @@ import boto3
 import botocore.exceptions
 import click
 
-from .config import DEFAULT_WAIT_TIMEOUT, LaunchConfig
-from .ec2 import (
+from .config import LaunchConfig
+from .constants import (
+    DEFAULT_WAIT_TIMEOUT,
+    EBS_DETACH_WAITER,
     EBS_MOUNT_POINT,
+    JUPYTER_PORT,
+    SSH_PORT_DEFAULT,
+    TAG_BOOTSTRAP_INSTANCE,
+    TAG_CREATED_BY,
+    TAG_VALUE,
+)
+from .ec2 import (
     CLIError,
     RegionContext,
     attach_ebs_volume,
@@ -300,13 +309,21 @@ def launch(
     total_steps = 4 if has_ebs else 3
 
     def prepare_region(region: str) -> RegionContext:
-        """Build region-scoped prerequisites: client, AMI, key pair, security group."""
+        """Build region-scoped prerequisites: client, AMI, key pair, security group.
+
+        Setup failures (no matching AMI, no default VPC, …) are region-specific —
+        prefix them with the region so the message is unambiguous in
+        multi-region mode.
+        """
         ec2r = boto3.Session(profile_name=config.profile, region_name=region).client("ec2")
-        info(f"[{region}] Looking up AMI...")
-        ami_r = get_latest_ami(ec2r, config.ami_filter)
-        info(f"[{region}] AMI: {ami_r['ImageId']} ({ami_r['Name']})")
-        import_key_pair(ec2r, config.key_name, config.key_path)
-        sg_id_r = ensure_security_group(ec2r, config.security_group, config.tag_value, ssh_port=config.ssh_port)
+        try:
+            info(f"[{region}] Looking up AMI...")
+            ami_r = get_latest_ami(ec2r, config.ami_filter)
+            info(f"[{region}] AMI: {ami_r['ImageId']} ({ami_r['Name']})")
+            import_key_pair(ec2r, config.key_name, config.key_path)
+            sg_id_r = ensure_security_group(ec2r, config.security_group, config.tag_value, ssh_port=config.ssh_port)
+        except CLIError as e:
+            raise CLIError(f"[{region}] {e.format_message()}") from None
         return RegionContext(region=region, ec2_client=ec2r, ami=ami_r, sg_id=sg_id_r)
 
     if config.dry_run:
@@ -325,7 +342,7 @@ def launch(
             if config.wait:
                 val("Wait", f"yes (timeout {config.wait_timeout}s)")
             val("Remote setup", "yes" if config.run_setup else "no")
-            if config.ssh_port != 22:
+            if config.ssh_port != SSH_PORT_DEFAULT:
                 val("SSH port", str(config.ssh_port))
             if config.python_version:
                 val("Python version", config.python_version)
@@ -349,7 +366,7 @@ def launch(
                 "wait": config.wait,
                 "wait_timeout_seconds": config.wait_timeout,
             }
-            if config.ssh_port != 22:
+            if config.ssh_port != SSH_PORT_DEFAULT:
                 result["ssh_port"] = config.ssh_port
             if config.python_version:
                 result["python_version"] = config.python_version
@@ -380,7 +397,23 @@ def launch(
                 fg="yellow",
             )
 
-    launched = launch_with_retry(config, prepare_region, on_attempt=on_attempt, on_wait=on_wait)
+    def on_region_fatal(region: str, kind: str, message: str) -> None:
+        # Quota / spot-price problem in this region: warn with the full
+        # remediation hint, then the launcher moves on to the next region.
+        if is_text():
+            label = "quota" if kind == "quota" else "spot price"
+            click.secho(f"\n  WARNING: {region} skipped ({label}):", fg="yellow", err=True)
+            click.secho(f"  {message}", fg="yellow", err=True)
+            if len(config.regions) > 1:
+                click.secho("  Trying the next region...", fg="yellow", err=True)
+
+    launched = launch_with_retry(
+        config,
+        prepare_region,
+        on_attempt=on_attempt,
+        on_wait=on_wait,
+        on_region_fatal=on_region_fatal,
+    )
     ec2 = launched.context.ec2_client
     ami = launched.context.ami
     active_region = launched.region
@@ -421,8 +454,8 @@ def launch(
             ec2.create_tags(
                 Resources=[ebs_volume_attached],
                 Tags=[
-                    {"Key": "aws-bootstrap-instance", "Value": instance_id},
-                    {"Key": "created-by", "Value": config.tag_value},
+                    {"Key": TAG_BOOTSTRAP_INSTANCE, "Value": instance_id},
+                    {"Key": TAG_CREATED_BY, "Value": config.tag_value},
                 ],
             )
             ebs_format = False
@@ -437,7 +470,7 @@ def launch(
     private_key = private_key_path(config.key_path)
     if not wait_for_ssh(public_ip, config.ssh_user, config.key_path, port=config.ssh_port):
         warn("SSH did not become available within the timeout.")
-        port_flag = f" -p {config.ssh_port}" if config.ssh_port != 22 else ""
+        port_flag = f" -p {config.ssh_port}" if config.ssh_port != SSH_PORT_DEFAULT else ""
         info(
             f"Instance is running — try connecting manually:"
             f" ssh -i {private_key}{port_flag} {config.ssh_user}@{public_ip}"
@@ -526,7 +559,7 @@ def launch(
             ebs_label = f"{ebs_volume_attached} ({EBS_MOUNT_POINT})"
         val("EBS data volume", ebs_label)
 
-    port_flag = f" -p {config.ssh_port}" if config.ssh_port != 22 else ""
+    port_flag = f" -p {config.ssh_port}" if config.ssh_port != SSH_PORT_DEFAULT else ""
 
     click.echo()
     click.secho("  SSH:", fg="cyan")
@@ -535,9 +568,9 @@ def launch(
 
     click.echo()
     click.secho("  Jupyter (via SSH tunnel):", fg="cyan")
-    click.secho(f"    ssh -NL 8888:localhost:8888{port_flag} {alias}", bold=True)
+    click.secho(f"    ssh -NL {JUPYTER_PORT}:localhost:{JUPYTER_PORT}{port_flag} {alias}", bold=True)
     info(f"or: ssh -i {private_key} -NL 8888:localhost:8888{port_flag} {config.ssh_user}@{public_ip}")
-    info("Then open: http://localhost:8888")
+    info("Then open: http://localhost:{JUPYTER_PORT}")
     info("Notebook: ~/gpu_smoke_test.ipynb (GPU smoke test)")
 
     click.echo()
@@ -584,7 +617,7 @@ def status(ctx, region, profile, gpu, instructions):
     if is_text(ctx):
         val("Region", region)
 
-    instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
+    instances = find_tagged_instances(ec2, TAG_VALUE)
     if not instances:
         if is_text(ctx):
             click.secho("No active aws-bootstrap instances found.", fg="yellow")
@@ -677,7 +710,7 @@ def status(ctx, region, profile, gpu, instructions):
                     click.echo("    GPU: " + click.style("unavailable", dim=True))
 
         # EBS data volumes
-        ebs_volumes = find_ebs_volumes_for_instance(ec2, inst["InstanceId"], "aws-bootstrap-g4dn")
+        ebs_volumes = find_ebs_volumes_for_instance(ec2, inst["InstanceId"], TAG_VALUE)
         if ebs_volumes:
             if is_text(ctx):
                 for vol in ebs_volumes:
@@ -732,14 +765,14 @@ def status(ctx, region, profile, gpu, instructions):
         if is_text(ctx) and instructions and state == "running" and inst["PublicIp"] and alias:
             user = details.user if details else "ubuntu"
             port = details.port if details else 22
-            port_flag = f" -p {port}" if port != 22 else ""
+            port_flag = f" -p {port}" if port != SSH_PORT_DEFAULT else ""
 
             click.echo()
             click.secho("    SSH:", fg="cyan")
             click.secho(f"      ssh{port_flag} {alias}", bold=True)
 
             click.secho("    Jupyter (via SSH tunnel):", fg="cyan")
-            click.secho(f"      ssh -NL 8888:localhost:8888{port_flag} {alias}", bold=True)
+            click.secho(f"      ssh -NL {JUPYTER_PORT}:localhost:{JUPYTER_PORT}{port_flag} {alias}", bold=True)
 
             click.secho("    VSCode Remote SSH:", fg="cyan")
             click.secho(
@@ -817,7 +850,7 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
                 info(f"Resolved alias '{value}' -> {resolved}")
             targets.append(resolved)
     else:
-        instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
+        instances = find_tagged_instances(ec2, TAG_VALUE)
         if not instances:
             if is_text(ctx):
                 click.secho("No active aws-bootstrap instances found.", fg="yellow")
@@ -840,7 +873,7 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
     # Discover EBS volumes before termination (while instances still exist)
     ebs_by_instance: dict[str, list[dict]] = {}
     for target in targets:
-        volumes = find_ebs_volumes_for_instance(ec2, target, "aws-bootstrap-g4dn")
+        volumes = find_ebs_volumes_for_instance(ec2, target, TAG_VALUE)
         if volumes:
             ebs_by_instance[target] = volumes
 
@@ -884,7 +917,7 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
                 info(f"Waiting for EBS volume {vid} to detach...")
                 try:
                     waiter = ec2.get_waiter("volume_available")
-                    waiter.wait(VolumeIds=[vid], WaiterConfig={"Delay": 10, "MaxAttempts": 30})
+                    waiter.wait(VolumeIds=[vid], WaiterConfig=EBS_DETACH_WAITER)
                     delete_ebs_volume(ec2, vid)
                     success(f"Deleted EBS volume: {vid}")
                     # Record deleted volume in the corresponding terminated result
@@ -927,7 +960,7 @@ def cleanup(ctx, dry_run, yes, include_ebs, region, profile):
     if is_text(ctx):
         val("Region", region)
 
-    live_instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
+    live_instances = find_tagged_instances(ec2, TAG_VALUE)
     live_ids = {inst["InstanceId"] for inst in live_instances}
 
     stale = find_stale_ssh_hosts(live_ids)
@@ -935,7 +968,7 @@ def cleanup(ctx, dry_run, yes, include_ebs, region, profile):
     # Orphan EBS discovery
     orphan_volumes: list[dict] = []
     if include_ebs:
-        orphan_volumes = find_orphan_ebs_volumes(ec2, "aws-bootstrap-g4dn", live_ids)
+        orphan_volumes = find_orphan_ebs_volumes(ec2, TAG_VALUE, live_ids)
 
     if not stale and not orphan_volumes:
         if is_text(ctx):

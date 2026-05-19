@@ -8,6 +8,12 @@ from pathlib import Path
 
 DEFAULT_REGION = "us-west-2"
 DEFAULT_WAIT_TIMEOUT = 1800  # seconds (30m)
+# Value of the `created-by` tag on every resource this tool creates; the basis
+# for status/terminate/cleanup discovery. (Defined here, not in constants.py,
+# to avoid a config<->constants import cycle; re-exported as constants.TAG_VALUE.)
+DEFAULT_TAG_VALUE = "aws-bootstrap-g4dn"
+DEFAULT_SSH_PORT = 22
+DEFAULT_ALIAS_PREFIX = "aws-gpu"
 
 
 @dataclass
@@ -24,9 +30,9 @@ class LaunchConfig:
     dry_run: bool = False
     profile: str | None = field(default_factory=lambda: os.environ.get("AWS_PROFILE"))
     ssh_user: str = "ubuntu"
-    tag_value: str = "aws-bootstrap-g4dn"
-    alias_prefix: str = "aws-gpu"
-    ssh_port: int = 22
+    tag_value: str = DEFAULT_TAG_VALUE
+    alias_prefix: str = DEFAULT_ALIAS_PREFIX
+    ssh_port: int = DEFAULT_SSH_PORT
     python_version: str | None = None
     ebs_storage: int | None = None
     ebs_volume_id: str | None = None

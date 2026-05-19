@@ -10,12 +10,27 @@ import botocore.exceptions
 import click
 
 from .config import LaunchConfig
+from .constants import (
+    AMI_OWNER_AMAZON,
+    AMI_OWNER_CANONICAL,
+    AMI_OWNER_RHEL,
+    EBS_DEVICE_NAME,
+    EBS_VOLUME_WAITER,
+    INSTANCE_RUNNING_WAITER,
+    INSTANCE_STATUS_OK_WAITER,
+    RES_INSTANCE,
+    RES_SECURITY_GROUP,
+    RES_VOLUME,
+    ROOT_DEVICE_NAME,
+    SSH_INGRESS_CIDR,
+    SSH_PORT_DEFAULT,
+    TAG_BOOTSTRAP_INSTANCE,
+    TAG_CREATED_BY,
+    TAG_NAME,
+    VOLUME_TYPE,
+)
 from .output import echo, is_text, secho
 from .retry import backoff_sleep_seconds
-
-
-EBS_DEVICE_NAME = "/dev/sdf"
-EBS_MOUNT_POINT = "/data"
 
 
 class CLIError(click.ClickException):
@@ -29,11 +44,11 @@ class CLIError(click.ClickException):
 
 # Well-known AMI owners by name prefix
 _OWNER_HINTS = {
-    "Deep Learning": ["amazon"],
-    "ubuntu": ["099720109477"],  # Canonical
-    "Ubuntu": ["099720109477"],
-    "RHEL": ["309956199498"],
-    "al20": ["amazon"],  # Amazon Linux
+    "Deep Learning": [AMI_OWNER_AMAZON],
+    "ubuntu": [AMI_OWNER_CANONICAL],
+    "Ubuntu": [AMI_OWNER_CANONICAL],
+    "RHEL": [AMI_OWNER_RHEL],
+    "al20": [AMI_OWNER_AMAZON],  # Amazon Linux
 }
 
 
@@ -68,7 +83,7 @@ def get_latest_ami(ec2_client, ami_filter: str) -> dict:
     return images[0]
 
 
-def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int = 22) -> str:
+def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int = SSH_PORT_DEFAULT) -> str:
     """Find or create a security group with SSH ingress in the default VPC."""
     # Find default VPC
     vpcs = ec2_client.describe_vpcs(Filters=[{"Name": "isDefault", "Values": ["true"]}])
@@ -96,10 +111,10 @@ def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int =
         VpcId=vpc_id,
         TagSpecifications=[
             {
-                "ResourceType": "security-group",
+                "ResourceType": RES_SECURITY_GROUP,
                 "Tags": [
-                    {"Key": "created-by", "Value": tag_value},
-                    {"Key": "Name", "Value": name},
+                    {"Key": TAG_CREATED_BY, "Value": tag_value},
+                    {"Key": TAG_NAME, "Value": name},
                 ],
             }
         ],
@@ -114,7 +129,7 @@ def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int =
                 "IpProtocol": "tcp",
                 "FromPort": ssh_port,
                 "ToPort": ssh_port,
-                "IpRanges": [{"CidrIp": "0.0.0.0/0", "Description": "SSH access"}],
+                "IpRanges": [{"CidrIp": SSH_INGRESS_CIDR, "Description": "SSH access"}],
             }
         ],
     )
@@ -125,14 +140,31 @@ def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int =
 class CapacityError(Exception):
     """Retryable: AWS has no capacity for the requested type in this region/AZ.
 
-    Distinct from quota errors (never retryable) and ``SpotMaxPriceTooLow``
-    (won't fix itself without raising the bid), both of which fail fast.
+    Eligible for both next-region fallthrough and ``--wait`` backoff retries,
+    unlike :class:`RegionFatalError` (quota / spot price) which only falls
+    through to the next region.
     """
 
     def __init__(self, region: str, market: str, message: str) -> None:
         super().__init__(message)
         self.region = region
         self.market = market
+
+
+class RegionFatalError(Exception):
+    """A region can't satisfy this launch and waiting won't help (quota / spot price).
+
+    Unlike :class:`CapacityError` it never justifies a ``--wait`` sleep, but in
+    multi-region mode the launcher still moves on to the next ``--region`` (a
+    different region may have quota/price headroom). ``kind`` is ``"quota"`` or
+    ``"price"``; ``message`` is the full user-facing remediation text.
+    """
+
+    def __init__(self, region: str, kind: str, message: str) -> None:
+        super().__init__(message)
+        self.region = region
+        self.kind = kind
+        self.message = message
 
 
 @dataclass
@@ -165,20 +197,20 @@ def _build_launch_params(config: LaunchConfig, ami_id: str, sg_id: str, spot: bo
         "MaxCount": 1,
         "BlockDeviceMappings": [
             {
-                "DeviceName": "/dev/sda1",
+                "DeviceName": ROOT_DEVICE_NAME,
                 "Ebs": {
                     "VolumeSize": config.volume_size,
-                    "VolumeType": "gp3",
+                    "VolumeType": VOLUME_TYPE,
                     "DeleteOnTermination": True,
                 },
             }
         ],
         "TagSpecifications": [
             {
-                "ResourceType": "instance",
+                "ResourceType": RES_INSTANCE,
                 "Tags": [
-                    {"Key": "Name", "Value": f"aws-bootstrap-{config.instance_type}"},
-                    {"Key": "created-by", "Value": config.tag_value},
+                    {"Key": TAG_NAME, "Value": f"aws-bootstrap-{config.instance_type}"},
+                    {"Key": TAG_CREATED_BY, "Value": config.tag_value},
                 ],
             }
         ],
@@ -197,8 +229,9 @@ def _build_launch_params(config: LaunchConfig, ami_id: str, sg_id: str, spot: bo
 def _run_instances(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str, region: str, spot: bool) -> dict:
     """Single ``run_instances`` call.
 
-    Raises :class:`CapacityError` (retryable) on ``InsufficientInstanceCapacity``.
-    Quota errors and ``SpotMaxPriceTooLow`` fail fast (never retried).
+    Raises :class:`CapacityError` on ``InsufficientInstanceCapacity`` (retryable
+    by next-region fallthrough and ``--wait``), or :class:`RegionFatalError` on
+    quota / ``SpotMaxPriceTooLow`` (next-region fallthrough only — never waited).
     """
     market = "spot" if spot else "on-demand"
     try:
@@ -206,7 +239,7 @@ def _run_instances(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str, re
     except botocore.exceptions.ClientError as e:
         code = e.response["Error"]["Code"]
         if code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
-            _raise_quota_error(code, config, region)
+            raise RegionFatalError(region, "quota", _quota_error_message(code, config, region)) from None
         if code == "InsufficientInstanceCapacity":
             raise CapacityError(
                 region,
@@ -214,9 +247,11 @@ def _run_instances(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str, re
                 f"Insufficient {market} capacity for {config.instance_type} in {region}.",
             ) from None
         if code == "SpotMaxPriceTooLow":
-            raise CLIError(
+            raise RegionFatalError(
+                region,
+                "price",
                 f"Spot price for {config.instance_type} in {region} exceeds the default maximum.\n\n"
-                "  Waiting will not help — retry with --on-demand or a different instance type."
+                "  Waiting will not help — retry with --on-demand or a different instance type.",
             ) from None
         raise
     return response["Instances"][0]
@@ -230,25 +265,68 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
     """
     region = config.region
     try:
-        return _run_instances(ec2_client, config, ami_id, sg_id, region, config.spot)
-    except CapacityError:
-        if not config.spot:
-            raise CLIError(
-                f"Insufficient capacity for {config.instance_type} in {region}.\n\n"
-                "  The requested instance type is not currently available.\n"
-                "  Try a different region, availability zone, or instance type."
-            ) from None
-        secho(f"\n  Spot request failed: insufficient capacity in {region}.", fg="yellow")
-        if not is_text() or click.confirm("  Retry as on-demand instance?"):
-            try:
-                return _run_instances(ec2_client, config, ami_id, sg_id, region, spot=False)
-            except CapacityError:
+        try:
+            return _run_instances(ec2_client, config, ami_id, sg_id, region, config.spot)
+        except CapacityError:
+            if not config.spot:
                 raise CLIError(
-                    f"Insufficient capacity for {config.instance_type} (on-demand) in {region}.\n\n"
-                    "  Neither spot nor on-demand capacity is currently available.\n"
+                    f"Insufficient capacity for {config.instance_type} in {region}.\n\n"
+                    "  The requested instance type is not currently available.\n"
                     "  Try a different region, availability zone, or instance type."
                 ) from None
-        raise CLIError("Launch cancelled.") from None
+            secho(f"\n  Spot request failed: insufficient capacity in {region}.", fg="yellow")
+            if not is_text() or click.confirm("  Retry as on-demand instance?"):
+                try:
+                    return _run_instances(ec2_client, config, ami_id, sg_id, region, spot=False)
+                except CapacityError:
+                    raise CLIError(
+                        f"Insufficient capacity for {config.instance_type} (on-demand) in {region}.\n\n"
+                        "  Neither spot nor on-demand capacity is currently available.\n"
+                        "  Try a different region, availability zone, or instance type."
+                    ) from None
+            raise CLIError("Launch cancelled.") from None
+    except RegionFatalError as e:
+        # Single-region path: quota / spot-price problems are terminal.
+        raise CLIError(e.message) from None
+
+
+def _describe_failures(regions: tuple[str, ...], failures: dict[str, tuple[str, str]], market: str) -> str:
+    """One '- region: reason' line per region, in attempt order."""
+    reason = {
+        "capacity": f"no {market} capacity",
+        "quota": f"{market} quota exceeded",
+        "price": "spot price exceeds the default maximum",
+    }
+    lines = []
+    for region in regions:
+        if region in failures:
+            kind = failures[region][0]
+            lines.append(f"    - {region}: {reason.get(kind, kind)}")
+    return "\n".join(lines)
+
+
+def _aggregated_error(
+    config: LaunchConfig,
+    regions: tuple[str, ...],
+    failures: dict[str, tuple[str, str]],
+    market: str,
+    *,
+    suffix: str = "",
+) -> CLIError:
+    """Hard-fail message: per-region reasons + full hint for every quota/price region."""
+    header = f"Could not launch {config.instance_type} ({market}) in any region{suffix}:\n\n"
+    body = _describe_failures(regions, failures, market)
+    hints: list[str] = []
+    for region in regions:
+        if region in failures and failures[region][0] in ("quota", "price"):
+            msg = failures[region][1]
+            if msg not in hints:
+                hints.append(msg)
+    if hints:
+        tail = "\n\n" + "\n\n".join(f"  {h}" for h in hints)
+    else:
+        tail = "\n\n  Try --wait, more --region values, --on-demand, or a different instance type."
+    return CLIError(header + body + tail)
 
 
 def launch_with_retry(
@@ -257,6 +335,7 @@ def launch_with_retry(
     *,
     on_attempt: Callable[[str, str, int], None] | None = None,
     on_wait: Callable[[int, float, float], None] | None = None,
+    on_region_fatal: Callable[[str, str, str], None] | None = None,
     confirm_on_demand: Callable[[], bool] | None = None,
     sleeper: Callable[[float], None] = time.sleep,
     clock: Callable[[], float] = time.monotonic,
@@ -264,18 +343,22 @@ def launch_with_retry(
 ) -> RegionLaunch:
     """Launch across ``config.regions``, spot-first, with optional bounded-backoff wait.
 
-    Strategy: each cycle tries the primary market (spot, unless ``--on-demand``)
-    in every region in order. With ``config.wait``, exhausting all regions sleeps
-    with capped+jittered exponential backoff and retries until ``wait_timeout``,
-    then hard-fails. Without ``wait``, a single exhausted pass falls back to
-    on-demand across all regions (after confirmation).
+    Each sweep tries the primary market (spot, unless ``--on-demand``) in every
+    region in order. ``InsufficientInstanceCapacity`` moves on to the next
+    region (and, with ``--wait``, is retried after backoff). A quota or
+    spot-price problem (:class:`RegionFatalError`) also moves on to the next
+    region — a different region may have headroom — but that region is then
+    dropped (waiting/re-sweeping can't fix it) and ``on_region_fatal`` is fired
+    so the caller can warn immediately. If every region is exhausted the command
+    fails hard with an aggregated message that includes the remediation hint for
+    each quota/price region. Without ``--wait``, a fully-exhausted spot sweep
+    offers the on-demand fallback (across all regions).
 
     ``prepare_region`` builds region-scoped prerequisites (client, AMI, SG); it
     is invoked at most once per region and cached.
     """
     regions = config.regions
     primary_spot = config.spot
-    market = "spot" if primary_spot else "on-demand"
     cache: dict[str, RegionContext] = {}
     start = clock()
     deadline = start + config.wait_timeout if config.wait else None
@@ -286,32 +369,50 @@ def launch_with_retry(
             cache[region] = prepare_region(region)
         return cache[region]
 
-    def try_market(spot: bool) -> RegionLaunch | None:
-        for region in regions:
+    def sweep(
+        spot: bool,
+        candidates: list[str],
+        failures: dict[str, tuple[str, str]],
+        fatal: set[str],
+    ) -> RegionLaunch | None:
+        mkt = "spot" if spot else "on-demand"
+        for region in candidates:
             ctx = ctx_for(region)
             if on_attempt:
-                on_attempt(region, "spot" if spot else "on-demand", attempt)
+                on_attempt(region, mkt, attempt)
             try:
                 inst = _run_instances(ctx.ec2_client, config, ctx.ami["ImageId"], ctx.sg_id, region, spot)
-            except CapacityError:
+            except CapacityError as e:
+                failures[region] = ("capacity", str(e))
                 continue
-            return RegionLaunch(region, ctx, inst, "spot" if spot else "on-demand")
+            except RegionFatalError as e:
+                failures[region] = (e.kind, e.message)
+                if region not in fatal:
+                    fatal.add(region)
+                    if on_region_fatal:
+                        on_region_fatal(region, e.kind, e.message)
+                continue
+            return RegionLaunch(region, ctx, inst, mkt)
         return None
 
+    # --- Primary market (spot unless --on-demand), with optional wait loop ---
+    market = "spot" if primary_spot else "on-demand"
+    failures: dict[str, tuple[str, str]] = {}
+    fatal: set[str] = set()
+
     while True:
-        result = try_market(primary_spot)
+        candidates = [r for r in regions if r not in fatal]
+        result = sweep(primary_spot, candidates, failures, fatal) if candidates else None
         if result is not None:
             return result
 
-        if config.wait:
+        capacity_left = [r for r in regions if r not in fatal and failures.get(r, ("", ""))[0] == "capacity"]
+
+        if config.wait and capacity_left:
             now = clock()
             assert deadline is not None
             if now >= deadline:
-                raise CLIError(
-                    f"No {market} capacity for {config.instance_type} in "
-                    f"{', '.join(regions)} within {config.wait_timeout}s.\n\n"
-                    "  Try --on-demand, more --region values, or a different instance type."
-                )
+                raise _aggregated_error(config, regions, failures, market, suffix=f" within {config.wait_timeout}s")
             sleep_s = min(backoff_sleep_seconds(attempt, rng=rng), max(0.0, deadline - now))
             if on_wait:
                 on_wait(attempt + 1, sleep_s, now - start)
@@ -320,7 +421,7 @@ def launch_with_retry(
             continue
         break
 
-    # Single spot pass exhausted (not waiting): offer on-demand across all regions.
+    # --- No-wait on-demand fallback (spot was the primary market) ---
     if primary_spot:
         secho(
             f"\n  No spot capacity for {config.instance_type} in {', '.join(regions)}.",
@@ -333,19 +434,15 @@ def launch_with_retry(
         )
         if not confirmed:
             raise CLIError("Launch cancelled.") from None
-        result = try_market(spot=False)
+        # Spot quota/price is independent of on-demand quota — try every region.
+        od_failures: dict[str, tuple[str, str]] = {}
+        od_fatal: set[str] = set()
+        result = sweep(False, list(regions), od_failures, od_fatal)
         if result is not None:
             return result
-        raise CLIError(
-            f"Insufficient capacity for {config.instance_type} (on-demand) in {', '.join(regions)}.\n\n"
-            "  Neither spot nor on-demand capacity is currently available.\n"
-            "  Try a different region, availability zone, or instance type."
-        ) from None
+        raise _aggregated_error(config, regions, od_failures, "on-demand")
 
-    raise CLIError(
-        f"Insufficient on-demand capacity for {config.instance_type} in {', '.join(regions)}.\n\n"
-        "  Try a different region, availability zone, or instance type."
-    ) from None
+    raise _aggregated_error(config, regions, failures, "on-demand")
 
 
 _UBUNTU_AMI = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
@@ -384,7 +481,8 @@ def _quota_hint(quota_type: str, family: str, region: str | None = None) -> str:
     )
 
 
-def _raise_quota_error(code: str, config: LaunchConfig, region: str | None = None) -> None:
+def _quota_error_message(code: str, config: LaunchConfig, region: str | None = None) -> str:
+    """Full, region-pinned quota-exceeded message + remediation hint."""
     if code == "MaxSpotInstanceCountExceeded":
         quota_type = "spot"
         label = "Spot instance"
@@ -395,19 +493,22 @@ def _raise_quota_error(code: str, config: LaunchConfig, region: str | None = Non
     family = instance_type_to_family(config.instance_type) or "gvt"
     failed_region = region or config.region
     hint = _quota_hint(quota_type, family, failed_region)
-    msg = (
+    return (
         f"{label} quota exceeded for {config.instance_type} in {failed_region}.\n\n"
         f"  Your account's {quota_type} vCPU limit for this instance family is too low.\n"
         f"  {hint}"
     )
-    raise CLIError(msg)
+
+
+def _raise_quota_error(code: str, config: LaunchConfig, region: str | None = None) -> None:
+    raise CLIError(_quota_error_message(code, config, region))
 
 
 def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
     """Find all non-terminated instances with the created-by tag."""
     response = ec2_client.describe_instances(
         Filters=[
-            {"Name": "tag:created-by", "Values": [tag_value]},
+            {"Name": f"tag:{TAG_CREATED_BY}", "Values": [tag_value]},
             {
                 "Name": "instance-state-name",
                 "Values": ["pending", "running", "stopping", "stopped", "shutting-down"],
@@ -417,7 +518,7 @@ def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
     instances = []
     for reservation in response["Reservations"]:
         for inst in reservation["Instances"]:
-            name = next((tag["Value"] for tag in inst.get("Tags", []) if tag["Key"] == "Name"), "")
+            name = next((tag["Value"] for tag in inst.get("Tags", []) if tag["Key"] == TAG_NAME), "")
             instances.append(
                 {
                     "InstanceId": inst["InstanceId"],
@@ -528,12 +629,12 @@ def wait_instance_ready(ec2_client, instance_id: str) -> dict:
     """Wait for the instance to be running and pass status checks."""
     echo("  Waiting for instance " + click.style(instance_id, fg="bright_white") + " to enter 'running' state...")
     waiter = ec2_client.get_waiter("instance_running")
-    waiter.wait(InstanceIds=[instance_id], WaiterConfig={"Delay": 10, "MaxAttempts": 60})
+    waiter.wait(InstanceIds=[instance_id], WaiterConfig=INSTANCE_RUNNING_WAITER)
     secho("  Instance running.", fg="green")
 
     echo("  Waiting for instance status checks to pass...")
     waiter = ec2_client.get_waiter("instance_status_ok")
-    waiter.wait(InstanceIds=[instance_id], WaiterConfig={"Delay": 15, "MaxAttempts": 60})
+    waiter.wait(InstanceIds=[instance_id], WaiterConfig=INSTANCE_STATUS_OK_WAITER)
     secho("  Status checks passed.", fg="green")
 
     # Refresh instance info to get public IP
@@ -555,14 +656,14 @@ def create_ebs_volume(ec2_client, size_gb: int, availability_zone: str, tag_valu
     response = ec2_client.create_volume(
         AvailabilityZone=availability_zone,
         Size=size_gb,
-        VolumeType="gp3",
+        VolumeType=VOLUME_TYPE,
         TagSpecifications=[
             {
-                "ResourceType": "volume",
+                "ResourceType": RES_VOLUME,
                 "Tags": [
-                    {"Key": "created-by", "Value": tag_value},
-                    {"Key": "Name", "Value": f"aws-bootstrap-data-{instance_id}"},
-                    {"Key": "aws-bootstrap-instance", "Value": instance_id},
+                    {"Key": TAG_CREATED_BY, "Value": tag_value},
+                    {"Key": TAG_NAME, "Value": f"aws-bootstrap-data-{instance_id}"},
+                    {"Key": TAG_BOOTSTRAP_INSTANCE, "Value": instance_id},
                 ],
             }
         ],
@@ -570,7 +671,7 @@ def create_ebs_volume(ec2_client, size_gb: int, availability_zone: str, tag_valu
     volume_id = response["VolumeId"]
 
     waiter = ec2_client.get_waiter("volume_available")
-    waiter.wait(VolumeIds=[volume_id], WaiterConfig={"Delay": 5, "MaxAttempts": 24})
+    waiter.wait(VolumeIds=[volume_id], WaiterConfig=EBS_VOLUME_WAITER)
     return volume_id
 
 
@@ -582,16 +683,25 @@ def validate_ebs_volume(ec2_client, volume_id: str, availability_zone: str) -> d
 
     Raises CLIError for validation failures.
     """
+    # AZ -> region (e.g. "us-east-1a" -> "us-east-1"); EBS volumes are
+    # region/AZ-scoped, so name the region the lookup actually used.
+    region = availability_zone[:-1] if availability_zone else None
+    not_found = (
+        f"EBS volume not found: {volume_id}"
+        + (f" in {region} (the region this launch landed in)." if region else ".")
+        + "\n  EBS volumes are region-scoped — pass --ebs-volume-id only when launching"
+        " in the volume's region."
+    )
     try:
         response = ec2_client.describe_volumes(VolumeIds=[volume_id])
     except botocore.exceptions.ClientError as e:
         if e.response["Error"]["Code"] == "InvalidVolume.NotFound":
-            raise CLIError(f"EBS volume not found: {volume_id}") from None
+            raise CLIError(not_found) from None
         raise
 
     volumes = response["Volumes"]
     if not volumes:
-        raise CLIError(f"EBS volume not found: {volume_id}")
+        raise CLIError(not_found)
 
     vol = volumes[0]
 
@@ -619,14 +729,14 @@ def attach_ebs_volume(ec2_client, volume_id: str, instance_id: str, device_name:
         Device=device_name,
     )
     waiter = ec2_client.get_waiter("volume_in_use")
-    waiter.wait(VolumeIds=[volume_id], WaiterConfig={"Delay": 5, "MaxAttempts": 24})
+    waiter.wait(VolumeIds=[volume_id], WaiterConfig=EBS_VOLUME_WAITER)
 
 
 def detach_ebs_volume(ec2_client, volume_id: str) -> None:
     """Detach an EBS volume and wait for it to become available."""
     ec2_client.detach_volume(VolumeId=volume_id)
     waiter = ec2_client.get_waiter("volume_available")
-    waiter.wait(VolumeIds=[volume_id], WaiterConfig={"Delay": 5, "MaxAttempts": 24})
+    waiter.wait(VolumeIds=[volume_id], WaiterConfig=EBS_VOLUME_WAITER)
 
 
 def delete_ebs_volume(ec2_client, volume_id: str) -> None:
@@ -643,8 +753,8 @@ def find_ebs_volumes_for_instance(ec2_client, instance_id: str, tag_value: str) 
     try:
         response = ec2_client.describe_volumes(
             Filters=[
-                {"Name": "tag:aws-bootstrap-instance", "Values": [instance_id]},
-                {"Name": "tag:created-by", "Values": [tag_value]},
+                {"Name": f"tag:{TAG_BOOTSTRAP_INSTANCE}", "Values": [instance_id]},
+                {"Name": f"tag:{TAG_CREATED_BY}", "Values": [tag_value]},
             ]
         )
     except botocore.exceptions.ClientError:
@@ -679,7 +789,7 @@ def find_orphan_ebs_volumes(ec2_client, tag_value: str, live_instance_ids: set[s
     try:
         response = ec2_client.describe_volumes(
             Filters=[
-                {"Name": "tag:created-by", "Values": [tag_value]},
+                {"Name": f"tag:{TAG_CREATED_BY}", "Values": [tag_value]},
                 {"Name": "status", "Values": ["available"]},
             ]
         )
@@ -689,7 +799,7 @@ def find_orphan_ebs_volumes(ec2_client, tag_value: str, live_instance_ids: set[s
     orphans = []
     for vol in response.get("Volumes", []):
         tags = {t["Key"]: t["Value"] for t in vol.get("Tags", [])}
-        linked_instance = tags.get("aws-bootstrap-instance", "")
+        linked_instance = tags.get(TAG_BOOTSTRAP_INSTANCE, "")
         if linked_instance and linked_instance not in live_instance_ids:
             orphans.append(
                 {

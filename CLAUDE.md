@@ -42,6 +42,7 @@ aws_bootstrap/
     output.py            # Output formatting: OutputFormat enum, emit(), echo/secho wrappers for structured output
     quota.py             # Service Quotas API: get/request GPU vCPU quotas (G/VT, P, DL families)
     retry.py             # Pure helpers: region precedence (resolve_regions), wait duration parsing, backoff schedule
+    constants.py         # Centralized infra/tag literals (tag keys, resource types, ports, waiter configs, AMI owner IDs); re-exports config defaults
     ssh.py               # SSH key pair import, SSH readiness check, remote setup, ~/.ssh/config management, GPU queries, EBS mount
     resources/           # Non-Python artifacts SCP'd to remote instances
         __init__.py
@@ -140,9 +141,11 @@ The `--output` option uses a context-aware suppression pattern via `aws_bootstra
 `ec2.launch_with_retry(config, prepare_region, ...)` is the launch orchestrator:
 
 - **`prepare_region(region)`** — a `cli.py` callback returning a `RegionContext` (region-scoped boto3 client, AMI, security group); invoked at most once per region and cached across retries.
-- **Spot-first per cycle** — each cycle calls `_run_instances` for every region in `config.regions` order; the first success returns a `RegionLaunch` (winning region/client/AMI/instance/pricing). `_run_instances` raises retryable `CapacityError` on `InsufficientInstanceCapacity`; quota errors route to `_raise_quota_error` and `SpotMaxPriceTooLow` to `CLIError` (both fail fast, never retried).
-- **`--wait`** — when all regions miss, sleeps `retry.backoff_sleep_seconds(attempt)` (exponential, capped, jittered; clamped to the deadline) and retries until `config.wait_timeout`, then raises `CLIError` (hard-fail). Injectable `sleeper`/`clock`/`rng` keep it unit-testable without real time.
-- **No `--wait`** — a single exhausted spot pass triggers the on-demand fallback (`confirm_on_demand`) across all regions.
+- **Spot-first per sweep** — each sweep calls `_run_instances` for every non-fatal region in `config.regions` order; first success returns a `RegionLaunch`. `_run_instances` raises `CapacityError` (`InsufficientInstanceCapacity`; retryable by next-region fallthrough *and* `--wait`) or `RegionFatalError` (quota via `_quota_error_message`, or `SpotMaxPriceTooLow`; `kind="quota"|"price"`).
+- **`RegionFatalError` handling** — the region is recorded, dropped from later sweeps, and `on_region_fatal(region, kind, message)` fires so `cli.py` prints an immediate `WARNING` (region-pinned hint) before the next region is tried. Quota/price never trigger a `--wait` sleep. If every region is exhausted, `_aggregated_error` raises a single `CLIError` listing each region's reason + the full hint for each quota/price region.
+- **`--wait`** — only sleeps while ≥1 region still has a retryable `CapacityError`; sleeps `retry.backoff_sleep_seconds(attempt)` (exponential, capped, jittered; clamped to the deadline) until `config.wait_timeout`, then hard-fails via `_aggregated_error`. Injectable `sleeper`/`clock`/`rng` keep it unit-testable.
+- **No `--wait`** — a fully-exhausted spot sweep triggers the on-demand fallback (`confirm_on_demand`) which sweeps **all** regions afresh (spot quota ≠ on-demand quota).
+- **Region-aware errors** — `cli.prepare_region` prefixes setup failures with `[region]`; `validate_ebs_volume` and `quota._not_found_msg` name the region (EBS volumes and quotas are region-scoped).
 - **Pure policy in `retry.py`** — `resolve_regions`, `parse_duration`, `backoff_sleep_seconds` are side-effect-free and tested in `test_retry.py`. The CLI exposes `--wait-timeout` via the `_Duration` Click param type.
 - `LaunchConfig` holds `regions: tuple[str, ...]` with a `region` property (`regions[0]`) for single-region callers; `wait` and `wait_timeout` fields drive the loop.
 
@@ -171,7 +174,7 @@ The `KNOWN_CUDA_TAGS` array in `remote_setup.sh` lists the CUDA wheel tags publi
 
 The `--ebs-storage` and `--ebs-volume-id` options on `launch` create or attach persistent gp3 EBS volumes mounted at `/data`. The implementation spans three modules:
 
-- **`ec2.py`** — Volume lifecycle: `create_ebs_volume`, `validate_ebs_volume`, `attach_ebs_volume`, `detach_ebs_volume`, `delete_ebs_volume`, `find_ebs_volumes_for_instance`. Constants `EBS_DEVICE_NAME` (`/dev/sdf`) and `EBS_MOUNT_POINT` (`/data`).
+- **`ec2.py`** — Volume lifecycle: `create_ebs_volume`, `validate_ebs_volume`, `attach_ebs_volume`, `detach_ebs_volume`, `delete_ebs_volume`, `find_ebs_volumes_for_instance`. `EBS_DEVICE_NAME` (`/dev/sdf`) and `EBS_MOUNT_POINT` (`/data`) are defined in `constants.py` (`EBS_DEVICE_NAME` is also imported into `ec2.py` as an attach default).
 - **`ssh.py`** — `mount_ebs_volume()` SSHs to the instance and runs a shell script that detects the device, optionally formats it, mounts it, and adds an fstab entry.
 - **`cli.py`** — Orchestrates the flow: create/validate → attach → wait for SSH → mount. Mount failures are non-fatal (warn and continue).
 

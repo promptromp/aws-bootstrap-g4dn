@@ -97,7 +97,7 @@ The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id`
 }
 ```
 
-On capacity timeout (`--wait` exhausted) or exhausted regions, `launch` exits non-zero with a `CLIError` message; quota errors and `SpotMaxPriceTooLow` fail fast (never retried).
+On capacity timeout (`--wait` exhausted) or all regions exhausted, `launch` exits non-zero with an aggregated `CLIError` (per-region reasons + region-pinned quota hints). Quota / `SpotMaxPriceTooLow` are never *waited* on, but in multi-region mode the launcher warns and moves on to the next `--region`; it only fails hard once every region is blocked.
 
 ---
 

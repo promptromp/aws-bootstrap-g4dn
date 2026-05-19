@@ -9,6 +9,19 @@ from .ec2 import CLIError
 
 SERVICE_CODE = "ec2"
 
+
+def _client_region(sq_client) -> str | None:
+    """Region the client is bound to (None for non-str, e.g. mocked clients)."""
+    region = getattr(getattr(sq_client, "meta", None), "region_name", None)
+    return region if isinstance(region, str) else None
+
+
+def _not_found_msg(sq_client, quota_code: str) -> str:
+    region = _client_region(sq_client)
+    where = f" in region {region}" if region else ""
+    return f"Quota {quota_code} not found{where}. Quotas are per-region — check the --region and quota code."
+
+
 # G/VT family (g4dn, g5, g6, vt1) — default for this tool
 QUOTA_CODE_SPOT = "L-3819A6DF"
 QUOTA_CODE_ON_DEMAND = "L-DB2E81BA"
@@ -51,7 +64,7 @@ def get_quota(sq_client, quota_code: str) -> dict:
     except botocore.exceptions.ClientError as e:
         code = e.response["Error"]["Code"]
         if code == "NoSuchResourceException":
-            raise CLIError(f"Quota {quota_code} not found. Check your region and quota code.") from None
+            raise CLIError(_not_found_msg(sq_client, quota_code)) from None
         raise
     quota = response["Quota"]
     return {
@@ -96,7 +109,7 @@ def request_quota_increase(sq_client, quota_code: str, desired_value: float) -> 
     except botocore.exceptions.ClientError as e:
         code = e.response["Error"]["Code"]
         if code == "NoSuchResourceException":
-            raise CLIError(f"Quota {quota_code} not found. Check your region and quota code.") from None
+            raise CLIError(_not_found_msg(sq_client, quota_code)) from None
         if code == "ResourceAlreadyExistsException":
             raise CLIError(
                 "A quota increase request for this quota is already pending.\n\n"
@@ -134,7 +147,7 @@ def get_quota_request_history(sq_client, quota_code: str, status_filter: str | N
     except botocore.exceptions.ClientError as e:
         code = e.response["Error"]["Code"]
         if code == "NoSuchResourceException":
-            raise CLIError(f"Quota {quota_code} not found. Check your region and quota code.") from None
+            raise CLIError(_not_found_msg(sq_client, quota_code)) from None
         raise
     requests = []
     for req in response.get("RequestedQuotas", []):

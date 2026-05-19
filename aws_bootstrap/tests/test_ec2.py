@@ -184,21 +184,89 @@ def test_launch_with_retry_falls_through_to_second_region_on_capacity():
     assert calls == ["us-west-2:spot", "us-east-1:spot"]
 
 
-def test_launch_with_retry_quota_error_fails_fast_no_retry():
-    """Quota errors are never retried, even across regions."""
-    ctx = _region_ctx("us-west-2", _make_client_error("VcpuLimitExceeded"))
-    second = _region_ctx("us-east-1", [_ok_instance()])
+def test_launch_with_retry_quota_skips_to_next_region():
+    """A per-region quota error moves on to the next region (no longer fail-fast)."""
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("VcpuLimitExceeded")),
+        "us-east-1": _region_ctx("us-east-1", [_ok_instance("i-east")]),
+    }
+    fatal: list[tuple[str, str]] = []
     config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False)
-    with pytest.raises(click.ClickException, match="vCPU quota exceeded"):
-        launch_with_retry(config, lambda r: {"us-west-2": ctx, "us-east-1": second}[r])
-    second.ec2_client.run_instances.assert_not_called()
+    result = launch_with_retry(
+        config,
+        lambda r: contexts[r],
+        on_region_fatal=lambda region, kind, msg: fatal.append((region, kind)),
+    )
+    assert result.region == "us-east-1"
+    contexts["us-east-1"].ec2_client.run_instances.assert_called_once()
+    assert fatal == [("us-west-2", "quota")]
 
 
-def test_launch_with_retry_spot_max_price_too_low_fails_fast():
+def test_launch_with_retry_all_regions_quota_aggregated_hard_fail():
+    """Every region quota-blocked -> hard fail listing each region + pinned hints."""
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("VcpuLimitExceeded")),
+        "us-east-1": _region_ctx("us-east-1", _make_client_error("VcpuLimitExceeded")),
+    }
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False, instance_type="g4dn.xlarge")
+    with pytest.raises(click.ClickException) as exc:
+        launch_with_retry(config, lambda r: contexts[r])
+    msg = exc.value.format_message()
+    assert "us-west-2: on-demand quota exceeded" in msg
+    assert "us-east-1: on-demand quota exceeded" in msg
+    assert "aws-bootstrap quota show --family gvt --region us-west-2" in msg
+    assert "aws-bootstrap quota show --family gvt --region us-east-1" in msg
+
+
+def test_launch_with_retry_spot_price_skips_to_next_region():
+    """SpotMaxPriceTooLow is region-fatal but the next region is still tried."""
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("SpotMaxPriceTooLow")),
+        "us-east-1": _region_ctx("us-east-1", [_ok_instance("i-east")]),
+    }
+    fatal: list[tuple[str, str]] = []
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True)
+    result = launch_with_retry(
+        config,
+        lambda r: contexts[r],
+        on_region_fatal=lambda region, kind, msg: fatal.append((region, kind)),
+    )
+    assert result.region == "us-east-1"
+    assert result.pricing == "spot"
+    assert fatal == [("us-west-2", "price")]
+
+
+def test_launch_with_retry_single_region_price_emits_hint_then_fails():
+    """Price-fatal single region: hint surfaced via callback, then hard fail."""
     ctx = _region_ctx("us-west-2", _make_client_error("SpotMaxPriceTooLow"))
     config = LaunchConfig(regions=("us-west-2",), spot=True)
-    with pytest.raises(click.ClickException, match="exceeds the default maximum"):
-        launch_with_retry(config, lambda r: ctx)
+    fatal: list[tuple[str, str, str]] = []
+    with pytest.raises(click.ClickException, match="Launch cancelled"):
+        launch_with_retry(
+            config,
+            lambda r: ctx,
+            on_region_fatal=lambda region, kind, msg: fatal.append((region, kind, msg)),
+            confirm_on_demand=lambda: False,
+        )
+    assert fatal[0][0] == "us-west-2"
+    assert fatal[0][1] == "price"
+    assert "exceeds the default maximum" in fatal[0][2]
+
+
+def test_launch_with_retry_on_demand_quota_aggregated_after_spot_capacity():
+    """Spot capacity miss -> on-demand fallback hits quota -> aggregated hint."""
+    contexts = {
+        "us-west-2": _region_ctx(
+            "us-west-2",
+            [_make_client_error("InsufficientInstanceCapacity"), _make_client_error("VcpuLimitExceeded")],
+        ),
+    }
+    config = LaunchConfig(regions=("us-west-2",), spot=True, instance_type="g4dn.xlarge")
+    with pytest.raises(click.ClickException) as exc:
+        launch_with_retry(config, lambda r: contexts[r], confirm_on_demand=lambda: True)
+    msg = exc.value.format_message()
+    assert "on-demand quota exceeded" in msg
+    assert "aws-bootstrap quota show --family gvt --region us-west-2" in msg
 
 
 def test_launch_with_retry_wait_times_out_hard_fail():
@@ -273,18 +341,18 @@ def test_launch_with_retry_prepares_each_region_once():
 
 
 def test_launch_with_retry_quota_hint_pins_failed_region():
-    """Quota error suggestions include --region for the region that failed."""
+    """Aggregated failure pins the quota hint to the region that failed."""
     contexts = {
         "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
-        "us-east-1": _region_ctx("us-east-1", _make_client_error("MaxSpotInstanceCountExceeded")),
+        "us-east-1": _region_ctx("us-east-1", _make_client_error("VcpuLimitExceeded")),
     }
-    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True, instance_type="g4dn.xlarge")
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False, instance_type="g4dn.xlarge")
     with pytest.raises(click.ClickException) as exc:
         launch_with_retry(config, lambda r: contexts[r])
     msg = exc.value.format_message()
-    assert "in us-east-1" in msg
+    assert "us-east-1: on-demand quota exceeded" in msg
     assert "aws-bootstrap quota show --family gvt --region us-east-1" in msg
-    assert "--type spot --desired-value 4 --region us-east-1" in msg
+    assert "--type on-demand --desired-value 4 --region us-east-1" in msg
 
 
 def test_quota_hint_without_region_omits_flag():
