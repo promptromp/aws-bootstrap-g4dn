@@ -25,14 +25,14 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 | Command | Purpose | Key Options |
 |---------|---------|-------------|
 | `aws-bootstrap launch` | Provision a GPU instance (spot by default) | `--instance-type`, `--spot/--on-demand`, `--region` (repeatable), `--wait`, `--wait-timeout`, `--ebs-storage`, `--dry-run` |
-| `aws-bootstrap status` | List running instances with IPs, pricing | `--gpu` (CUDA info), `--no-instructions` |
+| `aws-bootstrap status` | List running instances (all enabled regions by default) with region, IPs, pricing | `--gpu` (CUDA info), `--region/-r` (repeatable), `--no-instructions` |
 | `aws-bootstrap terminate` | Terminate instances and clean up | `[ID_OR_ALIAS...]`, `--keep-ebs`, `--yes` |
 | `aws-bootstrap cleanup` | Remove stale SSH config + orphan EBS | `--include-ebs`, `--dry-run` |
-| `aws-bootstrap list instance-types` | Browse GPU instance types | `--prefix` (default: g4dn) |
-| `aws-bootstrap list amis` | Browse Deep Learning AMIs | `--filter` |
-| `aws-bootstrap quota show` | Show GPU vCPU quotas (all families) | `--family` |
-| `aws-bootstrap quota request` | Request a quota increase | `--family`, `--type`, `--desired-value`, `--yes` |
-| `aws-bootstrap quota history` | Show quota increase request history | `--family`, `--type`, `--status` |
+| `aws-bootstrap list instance-types` | Browse GPU instance types (+ suggested quota commands) | `--prefix` (default: g4dn), `--region/-r` (repeatable) |
+| `aws-bootstrap list amis` | Browse Deep Learning AMIs (region-labelled; IDs differ per region) | `--filter`, `--region/-r` (repeatable) |
+| `aws-bootstrap quota show` | Show GPU vCPU quotas (all families) | `--family`, `--region/-r` (repeatable) |
+| `aws-bootstrap quota request` | Request a quota increase (per region) | `--family`, `--type`, `--desired-value`, `--region/-r` (repeatable), `--yes` |
+| `aws-bootstrap quota history` | Show quota increase request history | `--family`, `--type`, `--status`, `--region/-r` (repeatable) |
 
 **Global options** (before the command): `--output json|yaml|table|text`, `--profile`, `--region`
 

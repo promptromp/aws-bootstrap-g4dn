@@ -16,10 +16,10 @@ Per-command options `--region` and `--profile` are available on all commands:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--region` | string | `AWS_DEFAULT_REGION`/profile region, then `us-west-2` | AWS region. Precedence: explicit flag → env/profile region → `us-west-2`. On `launch` it is **repeatable** (tried in order). |
+| `--region` / `-r` | string | `AWS_DEFAULT_REGION`/profile region, then `us-west-2` | AWS region. Precedence: explicit flag → env/profile region → `us-west-2`. **Repeatable** on `launch` (tried in order), `quota show`/`request`/`history`, and `list instance-types`/`amis` (queried/submitted per region; each structured record carries a `region`). On `status` it is also repeatable and, when omitted, defaults to *all enabled regions* (see below) instead of a single region. |
 | `--profile` | string | `AWS_PROFILE` env | AWS profile override |
 
-The resolved/active region is included in `launch`, `status`, `terminate`, and `cleanup` output.
+The active region(s) are shown in `launch`, `status`, `terminate`, `cleanup`, `quota`, and `list` output (single region → a `Region:` line; multiple → a per-region block).
 
 ---
 
@@ -114,8 +114,11 @@ aws-bootstrap status [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
+| `--region` / `-r` | string (repeatable) | all enabled regions | Region(s) to query. Repeat for multiple. If omitted, queries every region enabled for the account. |
 | `--gpu` | flag | false | Query GPU info (CUDA, driver) via SSH |
 | `--instructions` / `--no-instructions` / `-I` | flag | true | Show connection commands for running instances |
+
+> Note: unlike other commands, `status` `--region` is **repeatable** and defaults to *all enabled regions* (not `us-west-2`). Each instance is labelled with its `region`.
 
 ### JSON Output
 
@@ -124,6 +127,7 @@ aws-bootstrap status [OPTIONS]
   "instances": [
     {
       "instance_id": "i-0abc123def456",
+      "region": "us-west-2",
       "state": "running",
       "instance_type": "g4dn.xlarge",
       "public_ip": "54.200.1.2",
@@ -150,11 +154,15 @@ aws-bootstrap status [OPTIONS]
         }
       ]
     }
+  ],
+  "regions_queried": ["us-east-1", "us-west-2"],
+  "regions_failed": [
+    {"region": "ap-south-1", "error": "AuthFailure: ..."}
   ]
 }
 ```
 
-Fields `gpu`, `ebs_volumes`, `spot_price_per_hour`, `uptime_seconds`, and `estimated_cost` are conditional.
+Top-level `regions_queried` lists every region the query was attempted against (including any that subsequently failed). `regions_failed` is present only when one or more regions could not be queried (e.g. unauthorized); those regions appear in both lists. Per-instance fields `gpu`, `ebs_volumes`, `spot_price_per_hour`, `uptime_seconds`, and `estimated_cost` are conditional.
 
 ---
 
@@ -257,25 +265,38 @@ aws-bootstrap list instance-types [OPTIONS]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--prefix` | string | `g4dn` | Instance type family prefix to filter on |
+| `--region` / `-r` | string (repeatable) | env/profile, then `us-west-2` | Region(s) to query. Each record is tagged with its `region`. |
+
+The table includes a **Quota Family** column (`gvt`/`p`/`dl`) — the AWS vCPU quota
+family each type draws from. (These group multiple prefixes, e.g. all G/VT types
+including `g5` share `gvt`, which is why a suggested `--family` may not match the
+`--prefix`.) In text mode the output ends with copy-paste **Next steps**
+(`quota show` and `quota request` pinned to the queried region) for the family
+derived from `--prefix`; suppressed for non-GPU families.
 
 ### JSON Output
 
 ```json
 [
   {
+    "region": "us-west-2",
     "instance_type": "g4dn.xlarge",
     "vcpus": 4,
     "memory_mib": 16384,
+    "quota_family": "gvt",
     "gpu": "1x T4 (16384 MiB)"
   }
 ]
 ```
 
+`quota_family` is `null` for non-GPU instance types.
+
 ---
 
 ## `aws-bootstrap list amis`
 
-List available AMIs matching a name pattern.
+List available AMIs matching a name pattern. AMI IDs are region-specific, so each
+result is labelled with its region.
 
 ```
 aws-bootstrap list amis [OPTIONS]
@@ -286,12 +307,14 @@ aws-bootstrap list amis [OPTIONS]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--filter` | string | `Deep Learning Base OSS Nvidia Driver GPU AMI*` | AMI name pattern |
+| `--region` / `-r` | string (repeatable) | env/profile, then `us-west-2` | Region(s) to query. Each record is tagged with its `region`. |
 
 ### JSON Output
 
 ```json
 [
   {
+    "region": "us-west-2",
     "image_id": "ami-0abc123",
     "name": "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) ...",
     "creation_date": "2025-01-10",
@@ -315,15 +338,19 @@ aws-bootstrap quota show [OPTIONS]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--family` | `gvt\|p\|dl` | all | Instance family to show |
+| `--region` / `-r` | string (repeatable) | env/profile, then `us-west-2` | Region(s) to query. Each quota is tagged with its `region`. |
 
 Supported families: `gvt` (g3, g4dn, g5, g5g, g6, g6e, vt1), `p` (p2, p3, p4d, p4de, p5, p5e, p5en, p6), `dl` (dl1, dl2q).
 
 ### JSON Output
 
+Each quota entry includes its `region`.
+
 ```json
 {
   "quotas": [
     {
+      "region": "us-west-2",
       "family": "gvt",
       "quota_type": "spot",
       "quota_code": "L-3819A6DF",
@@ -373,7 +400,7 @@ Supported families: `gvt` (g3, g4dn, g5, g5g, g6, g6e, vt1), `p` (p2, p3, p4d, p
 
 ## `aws-bootstrap quota request`
 
-Request a vCPU quota increase for a GPU instance family.
+Request a vCPU quota increase for a GPU instance family, in one or more regions.
 
 ```
 aws-bootstrap quota request [OPTIONS]
@@ -386,23 +413,31 @@ aws-bootstrap quota request [OPTIONS]
 | `--family` | `gvt\|p\|dl` | `gvt` | Instance family |
 | `--type` | `spot\|on-demand` | required | Quota type to increase |
 | `--desired-value` | float | required | Desired quota value (vCPUs) |
+| `--region` / `-r` | string (repeatable) | env/profile, then `us-west-2` | Region(s) to submit the request in. All are validated up front; if any region's current value ≥ `--desired-value`, nothing is submitted. |
 | `--yes` / `-y` | flag | false | Skip confirmation prompt (required for `--output json/yaml/table`) |
 
 ### JSON Output
 
+Returns one entry per region under `requests` (the shape is a list even for a single region):
+
 ```json
 {
-  "request_id": "abc123-def456",
-  "status": "PENDING",
-  "quota_code": "L-3819A6DF",
-  "quota_name": "All G and VT Spot Instance Requests",
-  "desired_value": 4.0,
-  "quota_type": "spot",
-  "family": "gvt"
+  "requests": [
+    {
+      "request_id": "abc123-def456",
+      "status": "PENDING",
+      "quota_code": "L-3819A6DF",
+      "quota_name": "All G and VT Spot Instance Requests",
+      "desired_value": 4.0,
+      "region": "us-west-2",
+      "quota_type": "spot",
+      "family": "gvt"
+    }
+  ]
 }
 ```
 
-Field `case_id` is included when a support case is opened.
+Field `case_id` is included on an entry when a support case is opened.
 
 ---
 
@@ -421,8 +456,11 @@ aws-bootstrap quota history [OPTIONS]
 | `--family` | `gvt\|p\|dl` | all | Filter by instance family |
 | `--type` | `spot\|on-demand` | both | Filter by quota type |
 | `--status` | `PENDING\|CASE_OPENED\|APPROVED\|DENIED\|CASE_CLOSED\|NOT_APPROVED` | all | Filter by request status |
+| `--region` / `-r` | string (repeatable) | env/profile, then `us-west-2` | Region(s) to query. Each request is tagged with its `region`; results merged and sorted newest-first. |
 
 ### JSON Output
+
+Each request includes its `region`.
 
 ```json
 {
@@ -430,6 +468,7 @@ aws-bootstrap quota history [OPTIONS]
     {
       "request_id": "abc123-def456",
       "status": "APPROVED",
+      "region": "us-west-2",
       "family": "gvt",
       "quota_type": "spot",
       "quota_code": "L-3819A6DF",
