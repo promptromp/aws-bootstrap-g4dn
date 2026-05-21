@@ -1730,6 +1730,20 @@ def cluster_cmd():
 @click.option("--no-setup", is_flag=True, default=False, help="Skip running the remote setup script.")
 @click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port on the remote instances.")
 @click.option("--python-version", default=None, help="Python version for the remote venv.")
+@click.option(
+    "--wait",
+    is_flag=True,
+    default=False,
+    help="On insufficient spot capacity, retry each node with bounded backoff until --wait-timeout "
+    "(no on-demand prompt).",
+)
+@click.option(
+    "--wait-timeout",
+    type=DURATION,
+    default=DEFAULT_WAIT_TIMEOUT,
+    show_default="30m",
+    help="Max time to wait per node for spot capacity when --wait is set (e.g. 30m, 90s, 1h).",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def cluster_launch(
@@ -1746,6 +1760,8 @@ def cluster_launch(
     no_setup,
     ssh_port,
     python_version,
+    wait,
+    wait_timeout,
     profile,
 ):
     """Launch (or grow) a training cluster to N nodes in one AZ + placement group."""
@@ -1781,6 +1797,8 @@ def cluster_launch(
         run_setup=not no_setup,
         ssh_port=ssh_port,
         python_version=python_version,
+        wait=wait,
+        wait_timeout=wait_timeout,
     )
     if profile:
         config.profile = profile

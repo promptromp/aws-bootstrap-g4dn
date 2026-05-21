@@ -202,6 +202,65 @@ def test_cluster_launch_runs_remote_setup_per_node(
     assert mock_setup.call_count == 2  # remote setup ran on every node
 
 
+def test_cluster_launch_help_shows_wait(runner):
+    result = runner.invoke(main, ["cluster", "launch", "--help"])
+    assert result.exit_code == 0
+    assert "--wait" in result.output
+    assert "--wait-timeout" in result.output
+
+
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-ml1-0")
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_with_retry")
+@patch("aws_bootstrap.cli.ensure_cluster_security_group_rule")
+@patch("aws_bootstrap.cli.ensure_cluster_placement_group", return_value="aws-bootstrap-cluster-ml1")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.get_latest_ami", return_value={"ImageId": "ami-1", "Name": "DL"})
+@patch("aws_bootstrap.cli.find_cluster_instances", return_value=[])
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cluster_launch_threads_wait_into_config(
+    mock_session,
+    mock_find,
+    mock_ami,
+    mock_import,
+    mock_sg,
+    mock_pg,
+    mock_sgrule,
+    mock_launch,
+    mock_wait,
+    mock_add_ssh,
+    runner,
+    tmp_path,
+):
+    mock_launch.side_effect = _launch_side_effect
+    mock_wait.return_value = {"PublicIpAddress": "1.2.3.4", "Placement": {"AvailabilityZone": "us-east-1c"}}
+    result = runner.invoke(
+        main,
+        [
+            "cluster",
+            "launch",
+            "--cluster-id",
+            "ml1",
+            "--nodes",
+            "1",
+            "--region",
+            "us-east-1",
+            "--key-path",
+            str(_make_key(tmp_path)),
+            "--no-setup",
+            "--wait",
+            "--wait-timeout",
+            "90s",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    # The LaunchConfig handed to launch_with_retry carries the wait settings.
+    cfg = mock_launch.call_args[0][0]
+    assert cfg.wait is True
+    assert cfg.wait_timeout == 90
+
+
 # ---------------------------------------------------------------------------
 # prepare / test (Phase 2)
 # ---------------------------------------------------------------------------
