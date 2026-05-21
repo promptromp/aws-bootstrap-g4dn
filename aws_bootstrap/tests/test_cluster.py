@@ -1,6 +1,8 @@
 """Tests for cluster composition helpers (aws_bootstrap.cluster)."""
 
 from __future__ import annotations
+import ast
+from pathlib import Path
 from unittest.mock import MagicMock
 
 import pytest
@@ -147,3 +149,11 @@ def test_node_env_contract():
 def test_detect_version_skew(versions, expected_ok):
     mismatches = cluster.detect_version_skew(versions)
     assert (len(mismatches) == 0) == expected_ok
+
+
+def test_canary_resource_is_valid_python():
+    src = Path("aws_bootstrap/resources/cluster_canary.py").read_text()
+    ast.parse(src)  # raises SyntaxError if invalid
+    assert 'if __name__ == "__main__"' in src
+    assert "init_process_group" in src
+    assert "all_reduce" in src
