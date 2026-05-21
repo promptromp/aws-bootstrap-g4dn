@@ -26,6 +26,8 @@ from .constants import (
     SSH_INGRESS_CIDR,
     SSH_PORT_DEFAULT,
     TAG_BOOTSTRAP_INSTANCE,
+    TAG_CLUSTER_ID,
+    TAG_CLUSTER_RANK,
     TAG_CREATED_BY,
     TAG_NAME,
     VOLUME_TYPE,
@@ -636,6 +638,64 @@ def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
                 }
             )
     return instances
+
+
+_CLUSTER_STATES = ["pending", "running", "stopping", "stopped", "shutting-down"]
+
+
+def _cluster_node_dict(inst: dict) -> dict:
+    tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+    rank_raw = tags.get(TAG_CLUSTER_RANK)
+    return {
+        "InstanceId": inst["InstanceId"],
+        "ClusterId": tags.get(TAG_CLUSTER_ID, ""),
+        "Rank": int(rank_raw) if rank_raw is not None and rank_raw.isdigit() else None,
+        "State": inst["State"]["Name"],
+        "InstanceType": inst["InstanceType"],
+        "PublicIp": inst.get("PublicIpAddress", ""),
+        "PrivateIp": inst.get("PrivateIpAddress", ""),
+        "LaunchTime": inst["LaunchTime"],
+        "Lifecycle": inst.get("InstanceLifecycle", "on-demand"),
+        "AvailabilityZone": inst["Placement"]["AvailabilityZone"],
+    }
+
+
+def _rank_sort_key(node: dict) -> tuple[bool, int]:
+    # Unranked nodes (rank None) sort last, in a stable order.
+    return (node["Rank"] is None, node["Rank"] if node["Rank"] is not None else 0)
+
+
+def find_cluster_instances(ec2_client, cluster_id: str) -> list[dict]:
+    """Return non-terminated instances tagged with this cluster id, rank-sorted."""
+    response = ec2_client.describe_instances(
+        Filters=[
+            {"Name": f"tag:{TAG_CLUSTER_ID}", "Values": [cluster_id]},
+            {"Name": "instance-state-name", "Values": _CLUSTER_STATES},
+        ]
+    )
+    nodes = [_cluster_node_dict(inst) for reservation in response["Reservations"] for inst in reservation["Instances"]]
+    nodes.sort(key=_rank_sort_key)
+    return nodes
+
+
+def list_clusters(ec2_client, tag_value: str) -> dict[str, list[dict]]:
+    """Group all tool-tagged cluster instances by cluster id."""
+    response = ec2_client.describe_instances(
+        Filters=[
+            {"Name": f"tag:{TAG_CREATED_BY}", "Values": [tag_value]},
+            {"Name": "tag-key", "Values": [TAG_CLUSTER_ID]},
+            {"Name": "instance-state-name", "Values": _CLUSTER_STATES},
+        ]
+    )
+    clusters: dict[str, list[dict]] = {}
+    for reservation in response["Reservations"]:
+        for inst in reservation["Instances"]:
+            node = _cluster_node_dict(inst)
+            if node["ClusterId"]:
+                clusters.setdefault(node["ClusterId"], []).append(node)
+    for nodes in clusters.values():
+        nodes.sort(key=_rank_sort_key)
+    return clusters
 
 
 def list_enabled_regions(ec2_client) -> list[str]:

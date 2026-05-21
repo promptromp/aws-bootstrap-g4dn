@@ -19,6 +19,7 @@ from aws_bootstrap.ec2 import (
     delete_cluster_placement_group,
     ensure_cluster_placement_group,
     ensure_cluster_security_group_rule,
+    find_cluster_instances,
     find_tagged_instances,
     find_tagged_instances_in_regions,
     get_latest_ami,
@@ -26,6 +27,7 @@ from aws_bootstrap.ec2 import (
     launch_instance,
     launch_with_retry,
     list_amis,
+    list_clusters,
     list_enabled_regions,
     list_instance_types,
     resolve_ebs_placement_az,
@@ -882,3 +884,61 @@ def test_ensure_cluster_sg_rule_idempotent_on_duplicate():
     )
     # Must not raise.
     ensure_cluster_security_group_rule(ec2, "sg-123")
+
+
+# ---------------------------------------------------------------------------
+# Cluster instance discovery
+# ---------------------------------------------------------------------------
+
+
+def _cluster_reservation(instance_id, cluster_id, rank, az="us-east-1c", private="10.0.0.5"):
+    return {
+        "Instances": [
+            {
+                "InstanceId": instance_id,
+                "State": {"Name": "running"},
+                "InstanceType": "g5.xlarge",
+                "PublicIpAddress": "1.2.3.4",
+                "PrivateIpAddress": private,
+                "LaunchTime": datetime(2026, 5, 21, tzinfo=UTC),
+                "Placement": {"AvailabilityZone": az},
+                "InstanceLifecycle": "spot",
+                "Tags": [
+                    {"Key": "aws-bootstrap-cluster", "Value": cluster_id},
+                    {"Key": "aws-bootstrap-cluster-rank", "Value": str(rank)},
+                ],
+            }
+        ]
+    }
+
+
+def test_find_cluster_instances_sorted_by_rank():
+    ec2 = MagicMock()
+    ec2.describe_instances.return_value = {
+        "Reservations": [
+            _cluster_reservation("i-2", "ml1", 1, private="10.0.0.6"),
+            _cluster_reservation("i-1", "ml1", 0, private="10.0.0.5"),
+        ]
+    }
+    nodes = find_cluster_instances(ec2, "ml1")
+    assert [n["Rank"] for n in nodes] == [0, 1]
+    assert nodes[0]["InstanceId"] == "i-1"
+    assert nodes[0]["PrivateIp"] == "10.0.0.5"
+    assert nodes[0]["AvailabilityZone"] == "us-east-1c"
+    filters = ec2.describe_instances.call_args[1]["Filters"]
+    assert {"Name": "tag:aws-bootstrap-cluster", "Values": ["ml1"]} in filters
+
+
+def test_list_clusters_groups_by_cluster_id():
+    ec2 = MagicMock()
+    ec2.describe_instances.return_value = {
+        "Reservations": [
+            _cluster_reservation("i-1", "ml1", 0),
+            _cluster_reservation("i-2", "ml1", 1),
+            _cluster_reservation("i-3", "exp2", 0),
+        ]
+    }
+    clusters = list_clusters(ec2, "aws-bootstrap-g4dn")
+    assert set(clusters) == {"ml1", "exp2"}
+    assert len(clusters["ml1"]) == 2
+    assert len(clusters["exp2"]) == 1
