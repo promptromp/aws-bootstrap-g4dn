@@ -1278,7 +1278,7 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
         click.echo(
             "  "
             + click.style(
-                f"{'Instance Type':<20}{'vCPUs':>6}{'Memory (MiB)':>14}{'Quota Family':>14}  GPU",
+                f"{'Instance Type':<20}{'vCPUs':>7}{'Memory (MiB)':>15}  {'Quota Family':<14}GPU",
                 fg="bright_white",
                 bold=True,
             )
@@ -1287,7 +1287,7 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
         for t in types:
             gpu_str = t["GpuSummary"] or "-"
             fam_str = instance_type_to_family(t["InstanceType"]) or "-"
-            click.echo(f"  {t['InstanceType']:<20}{t['VCpuCount']:>6}{t['MemoryMiB']:>14}{fam_str:>14}  {gpu_str}")
+            click.echo(f"  {t['InstanceType']:<20}{t['VCpuCount']:>7}{t['MemoryMiB']:>15}  {fam_str:<14}{gpu_str}")
 
     click.echo()
     click.echo(

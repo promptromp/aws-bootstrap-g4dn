@@ -8,6 +8,7 @@ than the decorator-stacking style of the older ``test_cli.py`` cases.
 
 from __future__ import annotations
 import json
+import re
 from unittest.mock import patch
 
 import pytest
@@ -16,6 +17,12 @@ from aws_bootstrap.cli import main
 
 
 MULTI_REGIONS = ["us-east-1", "us-west-2"]
+
+_ANSI_RE = re.compile(r"\x1b\[[0-9;]*m")
+
+
+def _strip_ansi(text: str) -> str:
+    return _ANSI_RE.sub("", text)
 
 
 def _r(regions):
@@ -231,6 +238,22 @@ def test_list_instance_types_shows_quota_family_column(runner, cli_session, inst
     assert "Quota Family" in result.output
     # g4dn.xlarge (the fixture row) belongs to the gvt quota family
     assert "gvt" in result.output
+
+
+def test_list_instance_types_quota_family_value_aligned_under_header(runner, cli_session, instance_type_rows):
+    """Regression: the Quota Family value must sit directly under its header.
+
+    It was right-aligned in a wide column, leaving the left of the column blank
+    so the column read as 'empty'. The value should start at the same column as
+    the 'Quota Family' header label (left-aligned, like the Instance Type column).
+    """
+    with patch("aws_bootstrap.cli.list_instance_types", return_value=instance_type_rows):
+        result = runner.invoke(main, ["list", "instance-types", "--prefix", "g4dn"])
+    assert result.exit_code == 0
+    lines = _strip_ansi(result.output).splitlines()
+    header = next(line for line in lines if "Quota Family" in line)
+    row = next(line for line in lines if "g4dn.xlarge" in line)
+    assert header.index("Quota Family") == row.index("gvt")
 
 
 def test_list_instance_types_json_includes_quota_family(runner, cli_session, instance_type_rows):
