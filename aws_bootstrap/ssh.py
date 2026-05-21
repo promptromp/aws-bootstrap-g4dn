@@ -459,10 +459,13 @@ def add_ssh_host(
     config_path: Path | None = None,
     alias_prefix: str = ALIAS_PREFIX,
     port: int = SSH_PORT_DEFAULT,
+    alias: str | None = None,
 ) -> str:
     """Add (or update) an SSH host stanza for *instance_id*.
 
-    Returns the alias that was created (e.g. ``aws-gpu1``).
+    Returns the alias that was created (e.g. ``aws-gpu1``). Pass an explicit
+    *alias* (e.g. ``aws-ml1-0`` for a cluster node) to use a deterministic name
+    instead of the auto-incremented ``<prefix><n>``.
     """
     config_path = config_path or _DEFAULT_SSH_CONFIG
     content = _read_ssh_config(config_path)
@@ -471,7 +474,7 @@ def add_ssh_host(
     existing_alias = _find_alias_in_content(content, instance_id)
     content = _remove_block(content, instance_id)
 
-    alias = existing_alias or _next_alias(content, alias_prefix)
+    alias = alias or existing_alias or _next_alias(content, alias_prefix)
     stanza = _build_stanza(instance_id, alias, hostname, user, key_path, port=port)
 
     # Ensure a blank line before our block if file has content
