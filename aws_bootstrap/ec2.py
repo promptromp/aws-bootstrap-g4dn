@@ -179,6 +179,10 @@ class RegionContext:
     # Effective key-pair name for this region — may differ from config.key_name
     # when import_key_pair had to side-step a mismatched same-named pair.
     key_name: str
+    # AZ to pin the instance to (the AZ of an existing --ebs-volume-id), or None
+    # to let AWS pick. EBS volumes are AZ-scoped, so an instance must launch in
+    # the volume's AZ to be able to attach it.
+    placement_az: str | None = None
 
 
 @dataclass
@@ -191,7 +195,9 @@ class RegionLaunch:
     pricing: str
 
 
-def _build_launch_params(config: LaunchConfig, ami_id: str, sg_id: str, spot: bool, key_name: str) -> dict:
+def _build_launch_params(
+    config: LaunchConfig, ami_id: str, sg_id: str, spot: bool, key_name: str, placement_az: str | None = None
+) -> dict:
     params: dict = {
         "ImageId": ami_id,
         "InstanceType": config.instance_type,
@@ -219,6 +225,8 @@ def _build_launch_params(config: LaunchConfig, ami_id: str, sg_id: str, spot: bo
             }
         ],
     }
+    if placement_az:
+        params["Placement"] = {"AvailabilityZone": placement_az}
     if spot:
         params["InstanceMarketOptions"] = {
             "MarketType": "spot",
@@ -231,9 +239,19 @@ def _build_launch_params(config: LaunchConfig, ami_id: str, sg_id: str, spot: bo
 
 
 def _run_instances(
-    ec2_client, config: LaunchConfig, ami_id: str, sg_id: str, region: str, spot: bool, key_name: str
+    ec2_client,
+    config: LaunchConfig,
+    ami_id: str,
+    sg_id: str,
+    region: str,
+    spot: bool,
+    key_name: str,
+    placement_az: str | None = None,
 ) -> dict:
     """Single ``run_instances`` call.
+
+    ``placement_az`` pins the instance to a specific availability zone (resolved
+    once upstream from an existing ``--ebs-volume-id``); ``None`` lets AWS pick.
 
     Raises :class:`CapacityError` on ``InsufficientInstanceCapacity`` (retryable
     by next-region fallthrough and ``--wait``), or :class:`RegionFatalError` on
@@ -241,7 +259,7 @@ def _run_instances(
     """
     market = "spot" if spot else "on-demand"
     try:
-        response = ec2_client.run_instances(**_build_launch_params(config, ami_id, sg_id, spot, key_name))
+        response = ec2_client.run_instances(**_build_launch_params(config, ami_id, sg_id, spot, key_name, placement_az))
     except botocore.exceptions.ClientError as e:
         code = e.response["Error"]["Code"]
         if code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
@@ -270,9 +288,10 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
     go through :func:`launch_with_retry`.
     """
     region = config.region
+    placement_az = resolve_ebs_placement_az(ec2_client, config.ebs_volume_id, region) if config.ebs_volume_id else None
     try:
         try:
-            return _run_instances(ec2_client, config, ami_id, sg_id, region, config.spot, config.key_name)
+            return _run_instances(ec2_client, config, ami_id, sg_id, region, config.spot, config.key_name, placement_az)
         except CapacityError:
             if not config.spot:
                 raise CLIError(
@@ -284,7 +303,14 @@ def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -
             if not is_text() or click.confirm("  Retry as on-demand instance?"):
                 try:
                     return _run_instances(
-                        ec2_client, config, ami_id, sg_id, region, spot=False, key_name=config.key_name
+                        ec2_client,
+                        config,
+                        ami_id,
+                        sg_id,
+                        region,
+                        spot=False,
+                        key_name=config.key_name,
+                        placement_az=placement_az,
                     )
                 except CapacityError:
                     raise CLIError(
@@ -391,7 +417,9 @@ def launch_with_retry(
             if on_attempt:
                 on_attempt(region, mkt, attempt)
             try:
-                inst = _run_instances(ctx.ec2_client, config, ctx.ami["ImageId"], ctx.sg_id, region, spot, ctx.key_name)
+                inst = _run_instances(
+                    ctx.ec2_client, config, ctx.ami["ImageId"], ctx.sg_id, region, spot, ctx.key_name, ctx.placement_az
+                )
             except CapacityError as e:
                 failures[region] = ("capacity", str(e))
                 continue
@@ -744,6 +772,37 @@ def create_ebs_volume(ec2_client, size_gb: int, availability_zone: str, tag_valu
     return volume_id
 
 
+def _ebs_volume_not_found_message(volume_id: str, region: str | None) -> str:
+    """Region-named 'volume not found' guidance (EBS volumes are region-scoped)."""
+    where = f" in {region}" if region else ""
+    return (
+        f"EBS volume not found: {volume_id}{where}.\n"
+        "  EBS volumes are region-scoped — pass --ebs-volume-id only when launching"
+        " in the volume's region."
+    )
+
+
+def resolve_ebs_placement_az(ec2_client, volume_id: str, region: str) -> str:
+    """Return the availability zone of an existing EBS volume.
+
+    EBS volumes are AZ-scoped — an instance can only attach a volume in its own
+    availability zone. Resolving the AZ up front lets the launch pin the
+    instance to it (via ``Placement.AvailabilityZone``) instead of landing in a
+    random AZ and failing to attach. Raises :class:`CLIError` (region-named) if
+    the volume does not exist in ``region``.
+    """
+    try:
+        response = ec2_client.describe_volumes(VolumeIds=[volume_id])
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "InvalidVolume.NotFound":
+            raise CLIError(_ebs_volume_not_found_message(volume_id, region)) from None
+        raise
+    volumes = response["Volumes"]
+    if not volumes:
+        raise CLIError(_ebs_volume_not_found_message(volume_id, region))
+    return volumes[0]["AvailabilityZone"]
+
+
 def validate_ebs_volume(ec2_client, volume_id: str, availability_zone: str) -> dict:
     """Validate that an existing EBS volume can be attached.
 
@@ -755,12 +814,7 @@ def validate_ebs_volume(ec2_client, volume_id: str, availability_zone: str) -> d
     # AZ -> region (e.g. "us-east-1a" -> "us-east-1"); EBS volumes are
     # region/AZ-scoped, so name the region the lookup actually used.
     region = availability_zone[:-1] if availability_zone else None
-    not_found = (
-        f"EBS volume not found: {volume_id}"
-        + (f" in {region} (the region this launch landed in)." if region else ".")
-        + "\n  EBS volumes are region-scoped — pass --ebs-volume-id only when launching"
-        " in the volume's region."
-    )
+    not_found = _ebs_volume_not_found_message(volume_id, region)
     try:
         response = ec2_client.describe_volumes(VolumeIds=[volume_id])
     except botocore.exceptions.ClientError as e:

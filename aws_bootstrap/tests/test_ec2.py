@@ -15,6 +15,7 @@ from aws_bootstrap.ec2 import (
     CLIError,
     RegionContext,
     RegionLaunch,
+    _run_instances,
     find_tagged_instances,
     find_tagged_instances_in_regions,
     get_latest_ami,
@@ -24,6 +25,7 @@ from aws_bootstrap.ec2 import (
     list_amis,
     list_enabled_regions,
     list_instance_types,
+    resolve_ebs_placement_az,
     terminate_tagged_instances,
 )
 
@@ -743,3 +745,76 @@ def test_find_tagged_instances_in_regions_propagates_credential_error():
 
     with pytest.raises(botocore.exceptions.NoCredentialsError):
         find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", ["us-east-1"])
+
+
+# ---------------------------------------------------------------------------
+# EBS AZ pinning: an existing data volume is AZ-scoped, so the instance must be
+# launched in the volume's AZ. resolve_ebs_placement_az looks up the AZ once;
+# _run_instances pins the run_instances request to it via Placement.
+# ---------------------------------------------------------------------------
+
+
+def test_resolve_ebs_placement_az_returns_volume_az():
+    ec2 = MagicMock()
+    ec2.describe_volumes.return_value = {"Volumes": [{"VolumeId": "vol-abc", "AvailabilityZone": "us-east-1c"}]}
+    assert resolve_ebs_placement_az(ec2, "vol-abc", "us-east-1") == "us-east-1c"
+    ec2.describe_volumes.assert_called_once_with(VolumeIds=["vol-abc"])
+
+
+def test_resolve_ebs_placement_az_not_found_names_region():
+    ec2 = MagicMock()
+    ec2.describe_volumes.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "InvalidVolume.NotFound", "Message": "not found"}},
+        "DescribeVolumes",
+    )
+    with pytest.raises(CLIError, match="EBS volume not found: vol-x in us-west-2"):
+        resolve_ebs_placement_az(ec2, "vol-x", "us-west-2")
+
+
+def test_resolve_ebs_placement_az_empty_response():
+    ec2 = MagicMock()
+    ec2.describe_volumes.return_value = {"Volumes": []}
+    with pytest.raises(CLIError, match="EBS volume not found"):
+        resolve_ebs_placement_az(ec2, "vol-x", "us-west-2")
+
+
+def test_run_instances_pins_placement_az_when_provided():
+    ec2 = MagicMock()
+    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-test"}]}
+    config = LaunchConfig(ebs_volume_id="vol-abc", spot=True)
+
+    _run_instances(ec2, config, "ami-test", "sg-test", "us-east-1", True, "key-test", "us-east-1c")
+
+    # _run_instances no longer resolves the AZ itself — it is passed in.
+    ec2.describe_volumes.assert_not_called()
+    assert ec2.run_instances.call_args[1]["Placement"] == {"AvailabilityZone": "us-east-1c"}
+
+
+def test_run_instances_omits_placement_without_az():
+    ec2 = MagicMock()
+    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-test"}]}
+    config = LaunchConfig(spot=True)
+
+    _run_instances(ec2, config, "ami-test", "sg-test", "us-east-1", True, "key-test")
+
+    assert "Placement" not in ec2.run_instances.call_args[1]
+
+
+def test_launch_with_retry_passes_placement_az_to_run_instances():
+    """The AZ resolved into RegionContext is threaded through to run_instances."""
+    client = MagicMock()
+    client.run_instances.return_value = _ok_instance("i-east")
+    ctx = RegionContext(
+        region="us-east-1",
+        ec2_client=client,
+        ami={"ImageId": "ami-east"},
+        sg_id="sg-1",
+        key_name="aws-bootstrap-key",
+        placement_az="us-east-1c",
+    )
+    config = LaunchConfig(regions=("us-east-1",), spot=True, ebs_volume_id="vol-abc")
+
+    result = launch_with_retry(config, lambda r: ctx)
+
+    assert result.region == "us-east-1"
+    assert client.run_instances.call_args[1]["Placement"] == {"AvailabilityZone": "us-east-1c"}

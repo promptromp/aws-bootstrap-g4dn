@@ -39,6 +39,7 @@ from .ec2 import (
     list_amis,
     list_enabled_regions,
     list_instance_types,
+    resolve_ebs_placement_az,
     terminate_tagged_instances,
     validate_ebs_volume,
     wait_instance_ready,
@@ -409,7 +410,13 @@ def launch(
             sg_id_r = ensure_security_group(ec2r, config.security_group, config.tag_value, ssh_port=config.ssh_port)
         except CLIError as e:
             raise CLIError(f"[{region}] {e.format_message()}") from None
-        return RegionContext(region=region, ec2_client=ec2r, ami=ami_r, sg_id=sg_id_r, key_name=effective_key)
+        # Pin the instance to an existing data volume's AZ (EBS is AZ-scoped, so
+        # a random AZ would fail to attach). resolve_ebs_placement_az raises a
+        # region-named CLIError if the volume isn't in this region.
+        placement_az = resolve_ebs_placement_az(ec2r, config.ebs_volume_id, region) if config.ebs_volume_id else None
+        return RegionContext(
+            region=region, ec2_client=ec2r, ami=ami_r, sg_id=sg_id_r, key_name=effective_key, placement_az=placement_az
+        )
 
     if config.dry_run:
         ctx0 = prepare_region(config.regions[0])

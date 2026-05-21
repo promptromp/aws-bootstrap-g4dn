@@ -155,7 +155,9 @@ aws-bootstrap terminate --keep-ebs
 aws-bootstrap launch --ebs-volume-id vol-0abc123def456
 ```
 
-EBS volumes are mounted at `/data`, survive spot interruptions, and persist independently of instances. Use `/data` for large datasets, model checkpoints, and training outputs — it persists across instance lifecycles while the root volume does not. For example:
+EBS volumes are mounted at `/data`, survive spot interruptions, and persist independently of instances. Use `/data` for large datasets, model checkpoints, and training outputs — it persists across instance lifecycles while the root volume does not.
+
+When you reattach with `--ebs-volume-id`, the launch automatically pins the new instance to the volume's availability zone (EBS volumes are AZ-scoped, so the instance must be in the same AZ to attach). This means a `--ebs-volume-id` launch targets the volume's region, and spot capacity is constrained to that one AZ — if you hit `InsufficientInstanceCapacity`, add `--wait` to retry until capacity frees up. For example:
 
 ```bash
 # Store training data on persistent volume
