@@ -13,10 +13,12 @@ from aws_bootstrap.config import LaunchConfig
 from aws_bootstrap.ec2 import (
     CLIError,
     find_tagged_instances,
+    find_tagged_instances_in_regions,
     get_latest_ami,
     get_spot_price,
     launch_instance,
     list_amis,
+    list_enabled_regions,
     list_instance_types,
     terminate_tagged_instances,
 )
@@ -373,3 +375,118 @@ def test_list_amis_uses_owner_hint_for_deep_learning():
     list_amis(ec2, "Deep Learning Base*")
     call_kwargs = ec2.describe_images.call_args[1]
     assert call_kwargs["Owners"] == ["amazon"]
+
+
+# ---------------------------------------------------------------------------
+# list_enabled_regions
+# ---------------------------------------------------------------------------
+
+
+def test_list_enabled_regions_sorted():
+    ec2 = MagicMock()
+    ec2.describe_regions.return_value = {
+        "Regions": [
+            {"RegionName": "us-west-2"},
+            {"RegionName": "eu-west-1"},
+            {"RegionName": "us-east-1"},
+        ]
+    }
+    regions = list_enabled_regions(ec2)
+    assert regions == ["eu-west-1", "us-east-1", "us-west-2"]
+    ec2.describe_regions.assert_called_once_with(AllRegions=False)
+
+
+def test_list_enabled_regions_empty():
+    ec2 = MagicMock()
+    ec2.describe_regions.return_value = {"Regions": []}
+    assert list_enabled_regions(ec2) == []
+
+
+# ---------------------------------------------------------------------------
+# find_tagged_instances_in_regions
+# ---------------------------------------------------------------------------
+
+
+def _instance_response(instance_id: str, az: str):
+    return {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": instance_id,
+                        "State": {"Name": "running"},
+                        "InstanceType": "g4dn.xlarge",
+                        "PublicIpAddress": "1.2.3.4",
+                        "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                        "InstanceLifecycle": "spot",
+                        "Placement": {"AvailabilityZone": az},
+                        "Tags": [{"Key": "created-by", "Value": "aws-bootstrap-g4dn"}],
+                    }
+                ]
+            }
+        ]
+    }
+
+
+def _session_with_region_clients(clients_by_region: dict[str, MagicMock]) -> MagicMock:
+    session = MagicMock()
+
+    def client_factory(_service, region_name=None, **_kwargs):
+        return clients_by_region[region_name]
+
+    session.client.side_effect = client_factory
+    return session
+
+
+def test_find_tagged_instances_in_regions_aggregates_and_labels():
+    east = MagicMock()
+    east.describe_instances.return_value = _instance_response("i-east", "us-east-1a")
+    west = MagicMock()
+    west.describe_instances.return_value = _instance_response("i-west", "us-west-2a")
+    session = _session_with_region_clients({"us-east-1": east, "us-west-2": west})
+
+    instances, failures = find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", ["us-east-1", "us-west-2"])
+
+    assert failures == []
+    assert {i["InstanceId"] for i in instances} == {"i-east", "i-west"}
+    by_id = {i["InstanceId"]: i for i in instances}
+    assert by_id["i-east"]["Region"] == "us-east-1"
+    assert by_id["i-west"]["Region"] == "us-west-2"
+    # Sorted by region then launch time
+    assert [i["Region"] for i in instances] == ["us-east-1", "us-west-2"]
+
+
+def test_find_tagged_instances_in_regions_captures_failure():
+    ok = MagicMock()
+    ok.describe_instances.return_value = _instance_response("i-ok", "us-east-1a")
+    bad = MagicMock()
+    bad.describe_instances.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "AuthFailure", "Message": "not authorized"}},
+        "DescribeInstances",
+    )
+    session = _session_with_region_clients({"us-east-1": ok, "ap-south-1": bad})
+
+    instances, failures = find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", ["us-east-1", "ap-south-1"])
+
+    assert [i["InstanceId"] for i in instances] == ["i-ok"]
+    assert len(failures) == 1
+    assert failures[0]["region"] == "ap-south-1"
+    assert "AuthFailure" in failures[0]["error"]
+
+
+def test_find_tagged_instances_in_regions_empty_region_list():
+    session = MagicMock()
+    instances, failures = find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", [])
+    assert instances == []
+    assert failures == []
+    session.client.assert_not_called()
+
+
+def test_find_tagged_instances_in_regions_propagates_credential_error():
+    """Non-ClientError exceptions (e.g. missing credentials) are not swallowed."""
+    bad = MagicMock()
+    bad.describe_instances.side_effect = botocore.exceptions.NoCredentialsError()
+    session = _session_with_region_clients({"us-east-1": bad})
+
+    with pytest.raises(botocore.exceptions.NoCredentialsError):
+        find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", ["us-east-1"])

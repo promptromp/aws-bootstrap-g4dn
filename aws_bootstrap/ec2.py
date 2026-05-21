@@ -1,6 +1,7 @@
 """EC2 instance provisioning: AMI lookup, security groups, and instance launch."""
 
 from __future__ import annotations
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import UTC, datetime
 
 import botocore.exceptions
@@ -273,6 +274,60 @@ def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
                 }
             )
     return instances
+
+
+def list_enabled_regions(ec2_client) -> list[str]:
+    """Return the names of regions enabled for the account, sorted alphabetically.
+
+    Uses ``describe_regions(AllRegions=False)``, which returns only regions the
+    account has opted into (the default partition regions plus any enabled
+    opt-in regions).
+    """
+    response = ec2_client.describe_regions(AllRegions=False)
+    return sorted(r["RegionName"] for r in response.get("Regions", []))
+
+
+def find_tagged_instances_in_regions(
+    session, tag_value: str, regions: list[str], max_workers: int = 10
+) -> tuple[list[dict], list[dict]]:
+    """Find tagged instances across multiple regions, querying them in parallel.
+
+    Returns ``(instances, failures)``:
+
+    - ``instances`` is the merged list across all regions; each instance dict
+      gains a ``"Region"`` key. Sorted by region, then launch time.
+    - ``failures`` is a list of ``{"region": str, "error": str}`` for regions
+      whose query raised a ``ClientError`` or connection error (e.g. an
+      unauthorized or unreachable region). These are captured rather than
+      raised so a single bad region does not abort the whole command.
+
+    Other exceptions (e.g. missing/incomplete credentials) propagate, so global
+    auth problems surface as a single fatal error rather than per-region noise.
+    """
+    instances: list[dict] = []
+    failures: list[dict] = []
+    if not regions:
+        return instances, failures
+
+    def query(region: str) -> list[dict]:
+        client = session.client("ec2", region_name=region)
+        found = find_tagged_instances(client, tag_value)
+        for inst in found:
+            inst["Region"] = region
+        return found
+
+    workers = min(max_workers, len(regions))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_to_region = {executor.submit(query, region): region for region in regions}
+        for future in as_completed(future_to_region):
+            region = future_to_region[future]
+            try:
+                instances.extend(future.result())
+            except (botocore.exceptions.ClientError, botocore.exceptions.EndpointConnectionError) as exc:
+                failures.append({"region": region, "error": str(exc)})
+
+    instances.sort(key=lambda i: (i["Region"], i["LaunchTime"]))
+    return instances, failures
 
 
 def get_spot_price(ec2_client, instance_type: str, availability_zone: str) -> float | None:

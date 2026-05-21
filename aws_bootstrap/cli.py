@@ -19,10 +19,12 @@ from .ec2 import (
     find_ebs_volumes_for_instance,
     find_orphan_ebs_volumes,
     find_tagged_instances,
+    find_tagged_instances_in_regions,
     get_latest_ami,
     get_spot_price,
     launch_instance,
     list_amis,
+    list_enabled_regions,
     list_instance_types,
     terminate_tagged_instances,
     validate_ebs_volume,
@@ -55,6 +57,10 @@ from .ssh import (
 
 
 SETUP_SCRIPT = Path(__file__).parent / "resources" / "remote_setup.sh"
+
+# Region used only to bootstrap the describe_regions call when --region is omitted
+# (a default-partition region that is always enabled).
+DEFAULT_DISCOVERY_REGION = "us-west-2"
 
 
 def step(number: int, total: int, msg: str) -> None:
@@ -459,7 +465,12 @@ def launch(
 
 
 @main.command()
-@click.option("--region", default="us-west-2", show_default=True, help="AWS region.")
+@click.option(
+    "--region",
+    "-r",
+    multiple=True,
+    help="AWS region to query (repeatable). If omitted, queries all enabled regions.",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.option("--gpu", is_flag=True, default=False, help="Query GPU info (CUDA, driver) via SSH.")
 @click.option(
@@ -471,22 +482,56 @@ def launch(
 )
 @click.pass_context
 def status(ctx, region, profile, gpu, instructions):
-    """Show running instances created by aws-bootstrap."""
-    session = boto3.Session(profile_name=profile, region_name=region)
-    ec2 = session.client("ec2")
+    """Show running instances created by aws-bootstrap.
 
-    instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
+    With no --region, queries all regions enabled for the account and labels
+    each instance with its region. Pass one or more --region values to restrict
+    the query to those regions.
+    """
+    session = boto3.Session(profile_name=profile)
+
+    selected = bool(region)
+    if selected:
+        regions = list(region)
+    else:
+        discovery_region = session.region_name or DEFAULT_DISCOVERY_REGION
+        regions = list_enabled_regions(session.client("ec2", region_name=discovery_region))
+
+    if is_text(ctx):
+        if selected:
+            click.secho(f"\n  Showing status for selected region(s): {', '.join(regions)}\n", bold=True, fg="cyan")
+        else:
+            shown = ", ".join(regions[:12])
+            extra = f" (+{len(regions) - 12} more)" if len(regions) > 12 else ""
+            click.secho(f"\n  Querying {len(regions)} enabled region(s): {shown}{extra}\n", bold=True, fg="cyan")
+
+    instances, failures = find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", regions)
+
+    for failure in failures:
+        warn(f"Skipped region {failure['region']}: {failure['error']}")
+
     if not instances:
         if is_text(ctx):
             click.secho("No active aws-bootstrap instances found.", fg="yellow")
         else:
-            emit({"instances": []}, ctx=ctx)
+            result: dict = {"instances": [], "regions_queried": regions}
+            if failures:
+                result["regions_failed"] = failures
+            emit(result, ctx=ctx)
         return
 
     ssh_hosts = list_ssh_hosts()
 
+    # Cache one EC2 client per region for per-instance follow-up calls.
+    region_clients: dict[str, object] = {}
+
+    def region_client(region_name: str):
+        if region_name not in region_clients:
+            region_clients[region_name] = session.client("ec2", region_name=region_name)
+        return region_clients[region_name]
+
     if is_text(ctx):
-        click.secho(f"\n  Found {len(instances)} instance(s):\n", bold=True, fg="cyan")
+        click.secho(f"  Found {len(instances)} instance(s):\n", bold=True, fg="cyan")
         if gpu:
             click.echo("  " + click.style("Querying GPU info via SSH...", dim=True))
             click.echo()
@@ -496,6 +541,7 @@ def status(ctx, region, profile, gpu, instructions):
     for inst in instances:
         state = inst["State"]
         alias = ssh_hosts.get(inst["InstanceId"])
+        ec2 = region_client(inst["Region"])
 
         # Text mode: inline display
         if is_text(ctx):
@@ -514,6 +560,7 @@ def status(ctx, region, profile, gpu, instructions):
                 + "  "
                 + click.style(state, fg=state_color)
             )
+            val("    Region", inst["Region"])
             val("    Type", inst["InstanceType"])
             if inst["PublicIp"]:
                 val("    IP", inst["PublicIp"])
@@ -521,6 +568,7 @@ def status(ctx, region, profile, gpu, instructions):
         # Build structured record
         inst_data: dict = {
             "instance_id": inst["InstanceId"],
+            "region": inst["Region"],
             "state": state,
             "instance_type": inst["InstanceType"],
             "public_ip": inst["PublicIp"] or None,
@@ -644,10 +692,14 @@ def status(ctx, region, profile, gpu, instructions):
         structured_instances.append(inst_data)
 
     if not is_text(ctx):
+        result = {"instances": structured_instances, "regions_queried": regions}
+        if failures:
+            result["regions_failed"] = failures
         emit(
-            {"instances": structured_instances},
+            result,
             headers={
                 "instance_id": "Instance ID",
+                "region": "Region",
                 "state": "State",
                 "instance_type": "Type",
                 "public_ip": "IP",
@@ -660,9 +712,11 @@ def status(ctx, region, profile, gpu, instructions):
         return
 
     click.echo()
-    first_id = instances[0]["InstanceId"]
-    first_ref = ssh_hosts.get(first_id, first_id)
-    click.echo("  To terminate:  " + click.style(f"aws-bootstrap terminate {first_ref}", bold=True))
+    first = instances[0]
+    first_ref = ssh_hosts.get(first["InstanceId"], first["InstanceId"])
+    click.echo(
+        "  To terminate:  " + click.style(f"aws-bootstrap terminate {first_ref} --region {first['Region']}", bold=True)
+    )
     click.echo()
 
 

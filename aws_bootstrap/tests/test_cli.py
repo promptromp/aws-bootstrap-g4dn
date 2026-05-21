@@ -67,34 +67,40 @@ def test_terminate_help():
     assert "--yes" in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_no_instances(mock_find, mock_session):
-    mock_find.return_value = []
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_no_instances(mock_find, mock_session, mock_regions):
+    mock_find.return_value = ([], [])
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
     assert result.exit_code == 0
     assert "No active" in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_shows_instances(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details):
-    mock_find.return_value = [
-        {
-            "InstanceId": "i-abc123",
-            "Name": "aws-bootstrap-g4dn.xlarge",
-            "State": "running",
-            "InstanceType": "g4dn.xlarge",
-            "PublicIp": "1.2.3.4",
-            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-            "Lifecycle": "spot",
-            "AvailabilityZone": "us-west-2a",
-        }
-    ]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_shows_instances(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_regions):
+    mock_find.return_value = (
+        [
+            {
+                "InstanceId": "i-abc123",
+                "Name": "aws-bootstrap-g4dn.xlarge",
+                "State": "running",
+                "InstanceType": "g4dn.xlarge",
+                "PublicIp": "1.2.3.4",
+                "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                "Lifecycle": "spot",
+                "AvailabilityZone": "us-west-2a",
+                "Region": "us-west-2",
+            }
+        ],
+        [],
+    )
     mock_spot_price.return_value = 0.1578
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
@@ -106,24 +112,29 @@ def test_status_shows_instances(mock_find, mock_spot_price, mock_session, mock_s
     assert "Est. cost" in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_on_demand_no_cost(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details):
-    mock_find.return_value = [
-        {
-            "InstanceId": "i-ondemand",
-            "Name": "aws-bootstrap-g4dn.xlarge",
-            "State": "running",
-            "InstanceType": "g4dn.xlarge",
-            "PublicIp": "5.6.7.8",
-            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-            "Lifecycle": "on-demand",
-            "AvailabilityZone": "us-west-2a",
-        }
-    ]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_on_demand_no_cost(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_regions):
+    mock_find.return_value = (
+        [
+            {
+                "InstanceId": "i-ondemand",
+                "Name": "aws-bootstrap-g4dn.xlarge",
+                "State": "running",
+                "InstanceType": "g4dn.xlarge",
+                "PublicIp": "5.6.7.8",
+                "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                "Lifecycle": "on-demand",
+                "AvailabilityZone": "us-west-2a",
+                "Region": "us-west-2",
+            }
+        ],
+        [],
+    )
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
     assert result.exit_code == 0
@@ -412,24 +423,29 @@ def test_terminate_removes_ssh_config(mock_terminate, mock_find, mock_session, m
     mock_remove_ssh.assert_called_once_with("i-abc123")
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts")
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_shows_alias(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details):
-    mock_find.return_value = [
-        {
-            "InstanceId": "i-abc123",
-            "Name": "aws-bootstrap-g4dn.xlarge",
-            "State": "running",
-            "InstanceType": "g4dn.xlarge",
-            "PublicIp": "1.2.3.4",
-            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-            "Lifecycle": "spot",
-            "AvailabilityZone": "us-west-2a",
-        }
-    ]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_shows_alias(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_regions):
+    mock_find.return_value = (
+        [
+            {
+                "InstanceId": "i-abc123",
+                "Name": "aws-bootstrap-g4dn.xlarge",
+                "State": "running",
+                "InstanceType": "g4dn.xlarge",
+                "PublicIp": "1.2.3.4",
+                "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                "Lifecycle": "spot",
+                "AvailabilityZone": "us-west-2a",
+                "Region": "us-west-2",
+            }
+        ],
+        [],
+    )
     mock_spot_price.return_value = 0.15
     mock_ssh_hosts.return_value = {"i-abc123": "aws-gpu1"}
     runner = CliRunner()
@@ -438,29 +454,172 @@ def test_status_shows_alias(mock_find, mock_spot_price, mock_session, mock_ssh_h
     assert "aws-gpu1" in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_no_alias_graceful(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details):
-    mock_find.return_value = [
-        {
-            "InstanceId": "i-old999",
-            "Name": "aws-bootstrap-g4dn.xlarge",
-            "State": "running",
-            "InstanceType": "g4dn.xlarge",
-            "PublicIp": "9.8.7.6",
-            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-            "Lifecycle": "spot",
-            "AvailabilityZone": "us-west-2a",
-        }
-    ]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_no_alias_graceful(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_regions):
+    mock_find.return_value = (
+        [
+            {
+                "InstanceId": "i-old999",
+                "Name": "aws-bootstrap-g4dn.xlarge",
+                "State": "running",
+                "InstanceType": "g4dn.xlarge",
+                "PublicIp": "9.8.7.6",
+                "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                "Lifecycle": "spot",
+                "AvailabilityZone": "us-west-2a",
+                "Region": "us-west-2",
+            }
+        ],
+        [],
+    )
     mock_spot_price.return_value = 0.15
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
     assert result.exit_code == 0
     assert "i-old999" in result.output
+
+
+# ---------------------------------------------------------------------------
+# multi-region status tests
+# ---------------------------------------------------------------------------
+
+
+def _west_instance(instance_id="i-west", region="us-west-2"):
+    return {
+        "InstanceId": instance_id,
+        "Name": "aws-bootstrap-g4dn.xlarge",
+        "State": "running",
+        "InstanceType": "g4dn.xlarge",
+        "PublicIp": "1.2.3.4",
+        "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+        "Lifecycle": "spot",
+        "AvailabilityZone": f"{region}a",
+        "Region": region,
+    }
+
+
+@patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[])
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["eu-west-1", "us-east-1", "us-west-2"])
+def test_status_no_region_queries_all_enabled(
+    mock_regions, mock_find, mock_session, mock_spot, mock_ssh_hosts, mock_details, mock_ebs
+):
+    """Naked status discovers all enabled regions and queries them."""
+    mock_find.return_value = ([_west_instance(region="us-east-1")], [])
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    mock_regions.assert_called_once()
+    # Passed the discovered region list to the query
+    assert mock_find.call_args[0][2] == ["eu-west-1", "us-east-1", "us-west-2"]
+    assert "Querying 3 enabled region(s)" in result.output
+    assert "us-east-1" in result.output
+
+
+@patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[])
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.list_enabled_regions")
+def test_status_selected_regions_filter(
+    mock_regions, mock_find, mock_session, mock_spot, mock_ssh_hosts, mock_details, mock_ebs
+):
+    """Explicit --region values skip discovery and restrict the query."""
+    mock_find.return_value = ([_west_instance(instance_id="i-east", region="us-east-1")], [])
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--region", "us-east-1", "--region", "eu-west-1"])
+    assert result.exit_code == 0
+    mock_regions.assert_not_called()
+    assert mock_find.call_args[0][2] == ["us-east-1", "eu-west-1"]
+    assert "Showing status for selected region(s): us-east-1, eu-west-1" in result.output
+
+
+@patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[])
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1", "ap-south-1"])
+def test_status_region_failure_warns_and_continues(
+    mock_regions, mock_find, mock_session, mock_spot, mock_ssh_hosts, mock_details, mock_ebs
+):
+    """A failed region produces a warning but does not abort the command."""
+    mock_find.return_value = (
+        [_west_instance(instance_id="i-east", region="us-east-1")],
+        [{"region": "ap-south-1", "error": "AuthFailure: not authorized"}],
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "Skipped region ap-south-1" in result.output
+    assert "i-east" in result.output
+
+
+@patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[])
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1", "us-west-2"])
+def test_status_shows_region_per_instance(
+    mock_regions, mock_find, mock_session, mock_spot, mock_ssh_hosts, mock_details, mock_ebs
+):
+    """Each instance is labelled with its region in text mode."""
+    mock_find.return_value = (
+        [
+            _west_instance(instance_id="i-east", region="us-east-1"),
+            _west_instance(instance_id="i-west", region="us-west-2"),
+        ],
+        [],
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["status"])
+    assert result.exit_code == 0
+    assert "i-east" in result.output
+    assert "i-west" in result.output
+    assert "Region: us-east-1" in result.output
+    assert "Region: us-west-2" in result.output
+    # Terminate hint carries the region of the first instance
+    assert "--region us-east-1" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1", "ap-south-1"])
+def test_status_json_includes_regions_failed(mock_regions, mock_find, mock_session):
+    """Structured output reports queried and failed regions when there are no instances."""
+    mock_find.return_value = (
+        [],
+        [{"region": "ap-south-1", "error": "AuthFailure: not authorized"}],
+    )
+    runner = CliRunner()
+    result = runner.invoke(main, ["-o", "json", "status"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["instances"] == []
+    assert data["regions_queried"] == ["us-east-1", "ap-south-1"]
+    assert data["regions_failed"] == [{"region": "ap-south-1", "error": "AuthFailure: not authorized"}]
+
+
+def test_status_help_shows_region_repeatable():
+    runner = CliRunner()
+    result = runner.invoke(main, ["status", "--help"])
+    assert result.exit_code == 0
+    assert "repeatable" in result.output
+    assert "all enabled regions" in result.output
 
 
 # ---------------------------------------------------------------------------
@@ -476,6 +635,7 @@ _RUNNING_INSTANCE = {
     "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
     "Lifecycle": "spot",
     "AvailabilityZone": "us-west-2a",
+    "Region": "us-west-2",
 }
 
 _SAMPLE_GPU_INFO = GpuInfo(
@@ -495,14 +655,17 @@ def test_status_help_shows_gpu_flag():
     assert "--gpu" in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.query_gpu_info", return_value=_SAMPLE_GPU_INFO)
 @patch("aws_bootstrap.cli.get_ssh_host_details")
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={"i-abc123": "aws-gpu1"})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_gpu_shows_info(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu):
-    mock_find.return_value = [_RUNNING_INSTANCE]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_gpu_shows_info(
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu, mock_regions
+):
+    mock_find.return_value = ([_RUNNING_INSTANCE], [])
     mock_details.return_value = SSHHostDetails(
         hostname="1.2.3.4", user="ubuntu", identity_file=Path("/home/user/.ssh/id_ed25519")
     )
@@ -516,14 +679,17 @@ def test_status_gpu_shows_info(mock_find, mock_spot, mock_session, mock_ssh_host
     mock_gpu.assert_called_once()
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.query_gpu_info", return_value=None)
 @patch("aws_bootstrap.cli.get_ssh_host_details")
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_gpu_ssh_fails_gracefully(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu):
-    mock_find.return_value = [_RUNNING_INSTANCE]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_gpu_ssh_fails_gracefully(
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu, mock_regions
+):
+    mock_find.return_value = ([_RUNNING_INSTANCE], [])
     mock_details.return_value = SSHHostDetails(
         hostname="1.2.3.4", user="ubuntu", identity_file=Path("/home/user/.ssh/id_ed25519")
     )
@@ -533,16 +699,17 @@ def test_status_gpu_ssh_fails_gracefully(mock_find, mock_spot, mock_session, moc
     assert "unavailable" in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.query_gpu_info", return_value=_SAMPLE_GPU_INFO)
 @patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
-@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
 def test_status_gpu_no_ssh_config_uses_defaults(
-    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu, mock_regions
 ):
-    mock_find.return_value = [_RUNNING_INSTANCE]
+    mock_find.return_value = ([_RUNNING_INSTANCE], [])
     runner = CliRunner()
     result = runner.invoke(main, ["status", "--gpu"])
     assert result.exit_code == 0
@@ -553,40 +720,46 @@ def test_status_gpu_no_ssh_config_uses_defaults(
     assert call_args[0][1] == "ubuntu"
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.query_gpu_info")
 @patch("aws_bootstrap.cli.get_ssh_host_details")
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_gpu_skips_non_running(mock_find, mock_session, mock_ssh_hosts, mock_details, mock_gpu):
-    mock_find.return_value = [
-        {
-            "InstanceId": "i-stopped",
-            "Name": "aws-bootstrap-g4dn.xlarge",
-            "State": "stopped",
-            "InstanceType": "g4dn.xlarge",
-            "PublicIp": "",
-            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-            "Lifecycle": "on-demand",
-            "AvailabilityZone": "us-west-2a",
-        }
-    ]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_gpu_skips_non_running(mock_find, mock_session, mock_ssh_hosts, mock_details, mock_gpu, mock_regions):
+    mock_find.return_value = (
+        [
+            {
+                "InstanceId": "i-stopped",
+                "Name": "aws-bootstrap-g4dn.xlarge",
+                "State": "stopped",
+                "InstanceType": "g4dn.xlarge",
+                "PublicIp": "",
+                "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                "Lifecycle": "on-demand",
+                "AvailabilityZone": "us-west-2a",
+                "Region": "us-west-2",
+            }
+        ],
+        [],
+    )
     runner = CliRunner()
     result = runner.invoke(main, ["status", "--gpu"])
     assert result.exit_code == 0
     mock_gpu.assert_not_called()
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.query_gpu_info")
 @patch("aws_bootstrap.cli.get_ssh_host_details")
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={"i-abc123": "aws-gpu1"})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
-@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
 def test_status_without_gpu_flag_no_gpu_query(
-    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_gpu, mock_regions
 ):
-    mock_find.return_value = [_RUNNING_INSTANCE]
+    mock_find.return_value = ([_RUNNING_INSTANCE], [])
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
     assert result.exit_code == 0
@@ -607,14 +780,17 @@ def test_status_help_shows_instructions_flag():
     assert "-I" in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.get_ssh_host_details")
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={"i-abc123": "aws-gpu1"})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_instructions_shown_by_default(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details):
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_instructions_shown_by_default(
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_regions
+):
     """Instructions are shown by default (no flag needed)."""
-    mock_find.return_value = [_RUNNING_INSTANCE]
+    mock_find.return_value = ([_RUNNING_INSTANCE], [])
     mock_details.return_value = SSHHostDetails(
         hostname="1.2.3.4", user="ubuntu", identity_file=Path("/home/user/.ssh/id_ed25519")
     )
@@ -627,14 +803,17 @@ def test_status_instructions_shown_by_default(mock_find, mock_spot, mock_session
     assert "python ~/gpu_benchmark.py" in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.get_ssh_host_details")
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={"i-abc123": "aws-gpu1"})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_no_instructions_suppresses_commands(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details):
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_no_instructions_suppresses_commands(
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_regions
+):
     """--no-instructions suppresses connection commands."""
-    mock_find.return_value = [_RUNNING_INSTANCE]
+    mock_find.return_value = ([_RUNNING_INSTANCE], [])
     mock_details.return_value = SSHHostDetails(
         hostname="1.2.3.4", user="ubuntu", identity_file=Path("/home/user/.ssh/id_ed25519")
     )
@@ -645,14 +824,17 @@ def test_status_no_instructions_suppresses_commands(mock_find, mock_spot, mock_s
     assert "Jupyter" not in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.get_ssh_host_details")
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_instructions_no_alias_skips(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details):
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_instructions_no_alias_skips(
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_regions
+):
     """Instances without an SSH alias don't get connection instructions."""
-    mock_find.return_value = [_RUNNING_INSTANCE]
+    mock_find.return_value = ([_RUNNING_INSTANCE], [])
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
     assert result.exit_code == 0
@@ -660,13 +842,16 @@ def test_status_instructions_no_alias_skips(mock_find, mock_spot, mock_session, 
     assert "vscode-remote" not in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.get_ssh_host_details")
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={"i-abc123": "aws-gpu1"})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_instructions_non_default_port(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details):
-    mock_find.return_value = [_RUNNING_INSTANCE]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_instructions_non_default_port(
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_regions
+):
+    mock_find.return_value = ([_RUNNING_INSTANCE], [])
     mock_details.return_value = SSHHostDetails(
         hostname="1.2.3.4", user="ubuntu", identity_file=Path("/home/user/.ssh/id_ed25519"), port=2222
     )
@@ -682,11 +867,11 @@ def test_status_instructions_non_default_port(mock_find, mock_spot, mock_session
 # ---------------------------------------------------------------------------
 
 
-@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.list_enabled_regions")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_no_credentials_shows_friendly_error(mock_session, mock_find):
+def test_no_credentials_shows_friendly_error(mock_session, mock_regions):
     """NoCredentialsError should show a helpful message, not a raw traceback."""
-    mock_find.side_effect = botocore.exceptions.NoCredentialsError()
+    mock_regions.side_effect = botocore.exceptions.NoCredentialsError()
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
     assert result.exit_code != 0
@@ -707,11 +892,11 @@ def test_profile_not_found_shows_friendly_error(mock_session):
     assert "aws configure list-profiles" in result.output
 
 
-@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.list_enabled_regions")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_partial_credentials_shows_friendly_error(mock_session, mock_find):
+def test_partial_credentials_shows_friendly_error(mock_session, mock_regions):
     """PartialCredentialsError should mention incomplete credentials."""
-    mock_find.side_effect = botocore.exceptions.PartialCredentialsError(
+    mock_regions.side_effect = botocore.exceptions.PartialCredentialsError(
         provider="env", cred_var="AWS_SECRET_ACCESS_KEY"
     )
     runner = CliRunner()
@@ -721,13 +906,13 @@ def test_partial_credentials_shows_friendly_error(mock_session, mock_find):
     assert "aws configure list" in result.output
 
 
-@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.list_enabled_regions")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_expired_token_shows_friendly_error(mock_session, mock_find):
+def test_expired_token_shows_friendly_error(mock_session, mock_regions):
     """ExpiredTokenException should show authorization failure with context."""
-    mock_find.side_effect = botocore.exceptions.ClientError(
+    mock_regions.side_effect = botocore.exceptions.ClientError(
         {"Error": {"Code": "ExpiredTokenException", "Message": "The security token is expired"}},
-        "DescribeInstances",
+        "DescribeRegions",
     )
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
@@ -736,13 +921,13 @@ def test_expired_token_shows_friendly_error(mock_session, mock_find):
     assert "expired" in result.output.lower()
 
 
-@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.list_enabled_regions")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_auth_failure_shows_friendly_error(mock_session, mock_find):
+def test_auth_failure_shows_friendly_error(mock_session, mock_regions):
     """AuthFailure ClientError should show authorization failure message."""
-    mock_find.side_effect = botocore.exceptions.ClientError(
+    mock_regions.side_effect = botocore.exceptions.ClientError(
         {"Error": {"Code": "AuthFailure", "Message": "credentials are invalid"}},
-        "DescribeInstances",
+        "DescribeRegions",
     )
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
@@ -750,13 +935,13 @@ def test_auth_failure_shows_friendly_error(mock_session, mock_find):
     assert "AWS authorization failed" in result.output
 
 
-@patch("aws_bootstrap.cli.find_tagged_instances")
+@patch("aws_bootstrap.cli.list_enabled_regions")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_unhandled_client_error_propagates(mock_session, mock_find):
+def test_unhandled_client_error_propagates(mock_session, mock_regions):
     """Non-auth ClientErrors should propagate without being caught."""
-    mock_find.side_effect = botocore.exceptions.ClientError(
+    mock_regions.side_effect = botocore.exceptions.ClientError(
         {"Error": {"Code": "UnknownError", "Message": "something else"}},
-        "DescribeInstances",
+        "DescribeRegions",
     )
     runner = CliRunner()
     result = runner.invoke(main, ["status"])
@@ -1178,25 +1363,32 @@ def test_terminate_keep_ebs_preserves(
     mock_delete_ebs.assert_not_called()
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.find_ebs_volumes_for_instance")
 @patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_shows_ebs_volumes(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs):
-    mock_find.return_value = [
-        {
-            "InstanceId": "i-abc123",
-            "Name": "aws-bootstrap-g4dn.xlarge",
-            "State": "running",
-            "InstanceType": "g4dn.xlarge",
-            "PublicIp": "1.2.3.4",
-            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-            "Lifecycle": "spot",
-            "AvailabilityZone": "us-west-2a",
-        }
-    ]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_shows_ebs_volumes(
+    mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs, mock_regions
+):
+    mock_find.return_value = (
+        [
+            {
+                "InstanceId": "i-abc123",
+                "Name": "aws-bootstrap-g4dn.xlarge",
+                "State": "running",
+                "InstanceType": "g4dn.xlarge",
+                "PublicIp": "1.2.3.4",
+                "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                "Lifecycle": "spot",
+                "AvailabilityZone": "us-west-2a",
+                "Region": "us-west-2",
+            }
+        ],
+        [],
+    )
     mock_spot_price.return_value = 0.15
     mock_ebs.return_value = [{"VolumeId": "vol-data1", "Size": 96, "Device": "/dev/sdf", "State": "in-use"}]
 
@@ -1369,34 +1561,43 @@ def test_help_shows_output_option():
     assert "-o" in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[])
 @patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_output_json(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs):
-    mock_find.return_value = [
-        {
-            "InstanceId": "i-abc123",
-            "Name": "aws-bootstrap-g4dn.xlarge",
-            "State": "running",
-            "InstanceType": "g4dn.xlarge",
-            "PublicIp": "1.2.3.4",
-            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-            "Lifecycle": "spot",
-            "AvailabilityZone": "us-west-2a",
-        }
-    ]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_output_json(
+    mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs, mock_regions
+):
+    mock_find.return_value = (
+        [
+            {
+                "InstanceId": "i-abc123",
+                "Name": "aws-bootstrap-g4dn.xlarge",
+                "State": "running",
+                "InstanceType": "g4dn.xlarge",
+                "PublicIp": "1.2.3.4",
+                "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                "Lifecycle": "spot",
+                "AvailabilityZone": "us-west-2a",
+                "Region": "us-west-2",
+            }
+        ],
+        [],
+    )
     mock_spot_price.return_value = 0.1578
     runner = CliRunner()
     result = runner.invoke(main, ["-o", "json", "status"])
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert "instances" in data
+    assert data["regions_queried"] == ["us-west-2"]
     assert len(data["instances"]) == 1
     inst = data["instances"][0]
     assert inst["instance_id"] == "i-abc123"
+    assert inst["region"] == "us-west-2"
     assert inst["state"] == "running"
     assert inst["instance_type"] == "g4dn.xlarge"
     assert inst["public_ip"] == "1.2.3.4"
@@ -1409,25 +1610,32 @@ def test_status_output_json(mock_find, mock_spot_price, mock_session, mock_ssh_h
     assert "Found" not in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[])
 @patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_output_yaml(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs):
-    mock_find.return_value = [
-        {
-            "InstanceId": "i-abc123",
-            "Name": "aws-bootstrap-g4dn.xlarge",
-            "State": "running",
-            "InstanceType": "g4dn.xlarge",
-            "PublicIp": "1.2.3.4",
-            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-            "Lifecycle": "spot",
-            "AvailabilityZone": "us-west-2a",
-        }
-    ]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_output_yaml(
+    mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs, mock_regions
+):
+    mock_find.return_value = (
+        [
+            {
+                "InstanceId": "i-abc123",
+                "Name": "aws-bootstrap-g4dn.xlarge",
+                "State": "running",
+                "InstanceType": "g4dn.xlarge",
+                "PublicIp": "1.2.3.4",
+                "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                "Lifecycle": "spot",
+                "AvailabilityZone": "us-west-2a",
+                "Region": "us-west-2",
+            }
+        ],
+        [],
+    )
     mock_spot_price.return_value = 0.15
     runner = CliRunner()
     result = runner.invoke(main, ["-o", "yaml", "status"])
@@ -1437,42 +1645,51 @@ def test_status_output_yaml(mock_find, mock_spot_price, mock_session, mock_ssh_h
     assert data["instances"][0]["instance_id"] == "i-abc123"
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[])
 @patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
 @patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_spot_price")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_output_table(mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs):
-    mock_find.return_value = [
-        {
-            "InstanceId": "i-abc123",
-            "Name": "aws-bootstrap-g4dn.xlarge",
-            "State": "running",
-            "InstanceType": "g4dn.xlarge",
-            "PublicIp": "1.2.3.4",
-            "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-            "Lifecycle": "spot",
-            "AvailabilityZone": "us-west-2a",
-        }
-    ]
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_output_table(
+    mock_find, mock_spot_price, mock_session, mock_ssh_hosts, mock_details, mock_ebs, mock_regions
+):
+    mock_find.return_value = (
+        [
+            {
+                "InstanceId": "i-abc123",
+                "Name": "aws-bootstrap-g4dn.xlarge",
+                "State": "running",
+                "InstanceType": "g4dn.xlarge",
+                "PublicIp": "1.2.3.4",
+                "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+                "Lifecycle": "spot",
+                "AvailabilityZone": "us-west-2a",
+                "Region": "us-west-2",
+            }
+        ],
+        [],
+    )
     mock_spot_price.return_value = 0.15
     runner = CliRunner()
     result = runner.invoke(main, ["-o", "table", "status"])
     assert result.exit_code == 0
     assert "Instance ID" in result.output
     assert "i-abc123" in result.output
+    assert "Region" in result.output
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-west-2"])
 @patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances")
-def test_status_no_instances_json(mock_find, mock_session):
-    mock_find.return_value = []
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+def test_status_no_instances_json(mock_find, mock_session, mock_regions):
+    mock_find.return_value = ([], [])
     runner = CliRunner()
     result = runner.invoke(main, ["-o", "json", "status"])
     assert result.exit_code == 0
     data = json.loads(result.output)
-    assert data == {"instances": []}
+    assert data == {"instances": [], "regions_queried": ["us-west-2"]}
 
 
 @patch("aws_bootstrap.cli.boto3.Session")

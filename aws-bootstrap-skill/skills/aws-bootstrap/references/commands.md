@@ -16,7 +16,7 @@ Per-command options `--region` and `--profile` are available on all commands:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--region` | string | `us-west-2` | AWS region |
+| `--region` | string | `us-west-2` | AWS region (except `status`, where it is repeatable and defaults to all enabled regions — see below) |
 | `--profile` | string | `AWS_PROFILE` env | AWS profile override |
 
 ---
@@ -101,8 +101,11 @@ aws-bootstrap status [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
+| `--region` / `-r` | string (repeatable) | all enabled regions | Region(s) to query. Repeat for multiple. If omitted, queries every region enabled for the account. |
 | `--gpu` | flag | false | Query GPU info (CUDA, driver) via SSH |
 | `--instructions` / `--no-instructions` / `-I` | flag | true | Show connection commands for running instances |
+
+> Note: unlike other commands, `status` `--region` is **repeatable** and defaults to *all enabled regions* (not `us-west-2`). Each instance is labelled with its `region`.
 
 ### JSON Output
 
@@ -111,6 +114,7 @@ aws-bootstrap status [OPTIONS]
   "instances": [
     {
       "instance_id": "i-0abc123def456",
+      "region": "us-west-2",
       "state": "running",
       "instance_type": "g4dn.xlarge",
       "public_ip": "54.200.1.2",
@@ -137,11 +141,15 @@ aws-bootstrap status [OPTIONS]
         }
       ]
     }
+  ],
+  "regions_queried": ["us-east-1", "us-west-2"],
+  "regions_failed": [
+    {"region": "ap-south-1", "error": "AuthFailure: ..."}
   ]
 }
 ```
 
-Fields `gpu`, `ebs_volumes`, `spot_price_per_hour`, `uptime_seconds`, and `estimated_cost` are conditional.
+Top-level `regions_queried` lists the regions actually queried. `regions_failed` is present only when one or more regions could not be queried (e.g. unauthorized). Per-instance fields `gpu`, `ebs_volumes`, `spot_price_per_hour`, `uptime_seconds`, and `estimated_cost` are conditional.
 
 ---
 

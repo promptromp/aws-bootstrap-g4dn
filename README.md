@@ -25,6 +25,7 @@ ssh aws-gpu1                  # You're in, venv activated, PyTorch works
 | 📊 | **GPU benchmark included** | CNN (MNIST) + Transformer benchmarks with FP16/FP32/BF16 precision and tqdm progress |
 | 📓 | **Jupyter ready** | Lab server auto-starts as a systemd service on port 8888 — just SSH tunnel and open |
 | 🖥️ | **`status --gpu`** | Shows CUDA toolkit version, driver max, GPU architecture, spot pricing, uptime, and estimated cost |
+| 🌍 | **Multi-region status** | `status` with no `--region` finds instances across every enabled region and labels each with its region |
 | 💾 | **EBS data volumes** | Attach persistent storage at `/data` — survives spot interruptions and termination, reattach to new instances |
 | 🗑️ | **Clean terminate** | Stops instances, removes SSH aliases, cleans up EBS volumes (or preserves with `--keep-ebs`) |
 | 🤖 | **[Agent Skill](https://agentskills.io/)** | Included Claude Code plugin lets LLM agents autonomously provision, manage, and tear down GPU instances |
@@ -261,7 +262,8 @@ aws-bootstrap list amis --region us-east-1
 ### 🖥️ Managing Instances
 
 ```bash
-# Show all aws-bootstrap instances (including shutting-down)
+# Show all aws-bootstrap instances across every enabled region (including shutting-down).
+# Each instance is labelled with its region.
 aws-bootstrap status
 
 # Include GPU info (CUDA toolkit + driver version, GPU name, architecture) via SSH
@@ -270,8 +272,12 @@ aws-bootstrap status --gpu
 # Hide connection commands (shown by default for each running instance)
 aws-bootstrap status --no-instructions
 
-# List instances in a specific region
+# Restrict the query to one region
 aws-bootstrap status --region us-east-1
+
+# Restrict to several regions (--region is repeatable, -r for short)
+aws-bootstrap status --region us-east-1 --region us-west-2
+aws-bootstrap status -r us-east-1 -r eu-west-1
 
 # Terminate all aws-bootstrap instances (with confirmation prompt)
 aws-bootstrap terminate
