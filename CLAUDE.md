@@ -148,8 +148,18 @@ The `--output` option uses a context-aware suppression pattern via `aws_bootstra
 - **`emit(data, headers=..., ctx=...)`** — dispatches structured data to JSON/YAML/table renderers. No-op in text mode.
 - **CLI helper guards** — `step()`, `info()`, `val()`, `success()`, `warn()` in `cli.py` check `is_text()` and return early in structured modes.
 - Each CLI command builds a result dict alongside existing logic, emits it via `emit()` for non-text formats, and falls through to text output for text mode.
-- **Confirmation prompts** (`terminate`, `cleanup`) require `--yes` in structured modes to avoid corrupting output.
+- **Confirmation prompts** (`terminate`, `cleanup`, `cluster terminate`) require `--yes` in structured modes to avoid corrupting output.
 - The spot-fallback `click.confirm()` in `ec2.py` auto-confirms in structured modes (via the `confirm_on_demand` callback default in `launch_with_retry`).
+
+### ALWAYS verify a new command/field against all four `--output` formats
+
+When adding or changing any CLI command (or the shape of its result), exercise it under **`text`, `json`, `yaml`, AND `table`** before considering it done — `json`/`yaml` passing does not imply `table` works. Concretely:
+
+- Guard every human-readable line behind `is_text()` (use the `step/info/val/success/warn` helpers, and `output.echo/secho`); never `print`/`click.echo` unconditionally.
+- Build one result dict and `emit()` it; surface errors via `CLIError` (goes to stderr, so stdout stays valid for parsers).
+- **`table` mode needs `headers=`** when the result's primary payload is a list of dicts (e.g. `{"nodes": [...]}`): pass `emit(data, headers={key: "Label", ...})` so it unwraps and tabulates the inner list. Without `headers`, a dict-with-list renders the list as an unreadable Python `repr` in a single key-value cell (this exact bug shipped for the `cluster` commands — see PR #35). A flat dict (no list) or a list of plain strings is fine as key-value without headers.
+- Any command with a confirmation prompt must require `--yes` in structured modes.
+- Add a test that the command renders in `json`/`yaml`/`table` (parametrize on the format), not just `json`.
 
 ## Capacity, Multi-Region & Wait Retry
 
