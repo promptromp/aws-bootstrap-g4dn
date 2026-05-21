@@ -755,6 +755,63 @@ def query_cuda_version(
 
 
 # ---------------------------------------------------------------------------
+# Generic remote execution (used by cluster orchestration)
+# ---------------------------------------------------------------------------
+
+
+def run_on_host(
+    host: str,
+    user: str,
+    key_path: Path,
+    command: str,
+    *,
+    port: int = SSH_PORT_DEFAULT,
+    timeout: int = 120,
+) -> tuple[int, str, str]:
+    """Run a command on a remote host over SSH.
+
+    Returns ``(returncode, stdout, stderr)``. A timeout yields a non-zero code
+    and an explanatory stderr rather than raising.
+    """
+    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
+    cmd = [
+        "ssh",
+        *_ssh_opts(key_path),
+        *port_opts,
+        "-o",
+        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
+        "-o",
+        "BatchMode=yes",
+        f"{user}@{host}",
+        command,
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        return 124, "", f"command timed out after {timeout}s on {host}"
+    return result.returncode, result.stdout, result.stderr
+
+
+def scp_to_host(
+    host: str,
+    user: str,
+    key_path: Path,
+    local_path: Path,
+    remote_path: str,
+    *,
+    port: int = SSH_PORT_DEFAULT,
+) -> bool:
+    """Copy a local file to a remote host via SCP. Returns True on success."""
+    port_opts = ["-P", str(port)] if port != SSH_PORT_DEFAULT else []
+    cmd = ["scp", *_ssh_opts(key_path), *port_opts, str(local_path), f"{user}@{host}:{remote_path}"]
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    if result.returncode != 0:
+        secho(f"  SCP to {host} failed: {result.stderr}", fg="red", err=True)
+        return False
+    return True
+
+
+# ---------------------------------------------------------------------------
 # EBS volume mount
 # ---------------------------------------------------------------------------
 
