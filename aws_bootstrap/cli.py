@@ -9,6 +9,7 @@ import boto3
 import botocore.exceptions
 import click
 
+from . import cluster as cluster_mod
 from .config import LaunchConfig
 from .constants import (
     DEFAULT_REGION,
@@ -18,6 +19,8 @@ from .constants import (
     JUPYTER_PORT,
     SSH_PORT_DEFAULT,
     TAG_BOOTSTRAP_INSTANCE,
+    TAG_CLUSTER_ID,
+    TAG_CLUSTER_RANK,
     TAG_CREATED_BY,
     TAG_VALUE,
 )
@@ -26,8 +29,12 @@ from .ec2 import (
     RegionContext,
     attach_ebs_volume,
     create_ebs_volume,
+    delete_cluster_placement_group,
     delete_ebs_volume,
+    ensure_cluster_placement_group,
+    ensure_cluster_security_group_rule,
     ensure_security_group,
+    find_cluster_instances,
     find_ebs_volumes_for_instance,
     find_orphan_ebs_volumes,
     find_tagged_instances,
@@ -37,6 +44,7 @@ from .ec2 import (
     instance_type_to_family,
     launch_with_retry,
     list_amis,
+    list_clusters,
     list_enabled_regions,
     list_instance_types,
     resolve_ebs_placement_az,
@@ -1692,3 +1700,238 @@ def quota_history(ctx, family, quota_type, status_filter, region, profile):
         click.echo()
 
     click.echo()
+
+
+# ---------------------------------------------------------------------------
+# cluster: multi-node training clusters (Phase 1 — launch / status / terminate)
+# ---------------------------------------------------------------------------
+
+
+@main.group(name="cluster")
+def cluster_cmd():
+    """Manage multi-node training clusters (launch, status, terminate)."""
+
+
+@cluster_cmd.command(name="launch")
+@click.option("--cluster-id", required=True, help="Cluster identifier (used as an EC2 tag).")
+@click.option("--nodes", default=2, show_default=True, type=int, help="Target number of nodes.")
+@click.option("--instance-type", default="g4dn.xlarge", show_default=True, help="EC2 instance type.")
+@click.option("--spot/--on-demand", default=True, show_default=True, help="Use spot or on-demand pricing.")
+@click.option(
+    "--key-path", default="~/.ssh/id_ed25519.pub", show_default=True, type=click.Path(), help="Local SSH public key."
+)
+@click.option("--key-name", default="aws-bootstrap-key", show_default=True, help="AWS key pair name.")
+@click.option("--region", "regions", multiple=True, metavar="REGION", help="AWS region (single AZ chosen within it).")
+@click.option("--security-group", default="aws-bootstrap-ssh", show_default=True, help="Security group name.")
+@click.option("--volume-size", default=100, show_default=True, type=int, help="Root EBS volume size in GB (gp3).")
+@click.option("--no-setup", is_flag=True, default=False, help="Skip running the remote setup script.")
+@click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port on the remote instances.")
+@click.option("--python-version", default=None, help="Python version for the remote venv.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.pass_context
+def cluster_launch(
+    ctx,
+    cluster_id,
+    nodes,
+    instance_type,
+    spot,
+    key_path,
+    key_name,
+    regions,
+    security_group,
+    volume_size,
+    no_setup,
+    ssh_port,
+    python_version,
+    profile,
+):
+    """Launch (or grow) a training cluster to N nodes in one AZ + placement group."""
+    region = resolve_single_region(regions[0] if regions else None, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=region).client("ec2")
+
+    existing = find_cluster_instances(ec2, cluster_id)
+    to_add = cluster_mod.nodes_to_add(len(existing), nodes)
+    start_rank = max((n["Rank"] for n in existing if n["Rank"] is not None), default=-1) + 1
+
+    if to_add == 0:
+        success(f"Cluster '{cluster_id}' already has {len(existing)} node(s); nothing to add.")
+        emit({"cluster_id": cluster_id, "nodes_added": 0, "node_count": len(existing)}, ctx=ctx)
+        return
+
+    key = Path(key_path).expanduser()
+    if not key.exists():
+        generate_ssh_keypair(key)
+
+    pg_name = cluster_mod.placement_group_name(cluster_id)
+    ensure_cluster_placement_group(ec2, pg_name, TAG_VALUE)
+    sg_id = ensure_security_group(ec2, security_group, TAG_VALUE, ssh_port=ssh_port)
+    ensure_cluster_security_group_rule(ec2, sg_id)
+
+    config = LaunchConfig(
+        instance_type=instance_type,
+        spot=spot,
+        key_path=key,
+        key_name=key_name,
+        regions=(region,),
+        security_group=security_group,
+        volume_size=volume_size,
+        run_setup=not no_setup,
+        ssh_port=ssh_port,
+        python_version=python_version,
+    )
+    if profile:
+        config.profile = profile
+
+    # AZ is captured from the first launched node and pinned for the rest;
+    # AMI/key are looked up once and reused across nodes.
+    shared: dict = {"az": existing[0]["AvailabilityZone"] if existing else None, "ami": None, "key": None}
+
+    def prepare_region(r: str) -> RegionContext:
+        if shared["ami"] is None:
+            shared["ami"] = get_latest_ami(ec2, config.ami_filter)
+        if shared["key"] is None:
+            shared["key"] = import_key_pair(ec2, config.key_name, config.key_path)
+        return RegionContext(
+            region=r,
+            ec2_client=ec2,
+            ami=shared["ami"],
+            sg_id=sg_id,
+            key_name=shared["key"],
+            placement_az=shared["az"],
+            placement_group=pg_name,
+        )
+
+    added: list[dict] = []
+
+    def on_node(rank: int, launch) -> None:
+        instance_id = launch.instance["InstanceId"]
+        inst = wait_instance_ready(ec2, instance_id)
+        if shared["az"] is None:
+            shared["az"] = inst["Placement"]["AvailabilityZone"]
+        ec2.create_tags(
+            Resources=[instance_id],
+            Tags=[
+                {"Key": TAG_CLUSTER_ID, "Value": cluster_id},
+                {"Key": TAG_CLUSTER_RANK, "Value": str(rank)},
+            ],
+        )
+        public_ip = inst.get("PublicIpAddress", "")
+        alias = cluster_mod.node_alias(cluster_id, rank)
+        if public_ip:
+            add_ssh_host(instance_id, public_ip, config.ssh_user, config.key_path, port=ssh_port, alias=alias)
+        added.append({"rank": rank, "instance_id": instance_id, "public_ip": public_ip, "alias": alias})
+
+    step(1, 1, f"Launching {to_add} node(s) for cluster '{cluster_id}' in {region} (placement group {pg_name})...")
+    cluster_mod.launch_cluster_nodes(
+        config, prepare_region, to_add, start_rank, launch_fn=launch_with_retry, on_node=on_node
+    )
+
+    success(f"Cluster '{cluster_id}' now has {len(existing) + to_add} node(s).")
+    if is_text(ctx):
+        info(f"Next: aws-bootstrap cluster status --cluster-id {cluster_id} --region {region}")
+    emit(
+        {
+            "cluster_id": cluster_id,
+            "region": region,
+            "availability_zone": shared["az"],
+            "placement_group": pg_name,
+            "nodes_added": to_add,
+            "node_count": len(existing) + to_add,
+            "nodes": added,
+        },
+        ctx=ctx,
+    )
+
+
+@cluster_cmd.command(name="status")
+@click.option("--cluster-id", default=None, help="Cluster id (omit to list all clusters).")
+@click.option("--region", default=None, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.pass_context
+def cluster_status(ctx, cluster_id, region, profile):
+    """Show cluster node membership and readiness."""
+    resolved = resolve_single_region(region, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
+
+    if cluster_id:
+        nodes = find_cluster_instances(ec2, cluster_id)
+        if is_text(ctx):
+            val("Cluster", cluster_id)
+            val("Region", resolved)
+            for n in nodes:
+                click.echo(
+                    f"  rank {n['Rank']}  {n['InstanceId']}  {n['State']}  "
+                    f"{n['InstanceType']}  {n['AvailabilityZone']}  {n['PublicIp']}"
+                )
+            if not nodes:
+                warn(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+        emit(
+            {
+                "cluster_id": cluster_id,
+                "region": resolved,
+                "nodes": [
+                    {
+                        "rank": n["Rank"],
+                        "instance_id": n["InstanceId"],
+                        "state": n["State"],
+                        "instance_type": n["InstanceType"],
+                        "az": n["AvailabilityZone"],
+                        "public_ip": n["PublicIp"],
+                        "private_ip": n["PrivateIp"],
+                    }
+                    for n in nodes
+                ],
+            },
+            ctx=ctx,
+        )
+        return
+
+    clusters = list_clusters(ec2, TAG_VALUE)
+    if is_text(ctx):
+        val("Region", resolved)
+        for cid, nodes in sorted(clusters.items()):
+            click.echo(f"  {cid}: {len(nodes)} node(s)")
+        if not clusters:
+            warn(f"No clusters found in {resolved}.")
+    emit(
+        {
+            "region": resolved,
+            "clusters": [{"cluster_id": cid, "node_count": len(nodes)} for cid, nodes in sorted(clusters.items())],
+        },
+        ctx=ctx,
+    )
+
+
+@cluster_cmd.command(name="terminate")
+@click.option("--cluster-id", required=True, help="Cluster id to terminate.")
+@click.option("--region", default=None, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.option("--yes", is_flag=True, default=False, help="Skip the confirmation prompt.")
+@click.option("--keep-ebs", is_flag=True, default=False, help="Preserve EBS data volumes.")
+@click.pass_context
+def cluster_terminate(ctx, cluster_id, region, profile, yes, keep_ebs):
+    """Terminate all nodes of a cluster and delete its placement group."""
+    resolved = resolve_single_region(region, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
+    nodes = find_cluster_instances(ec2, cluster_id)
+
+    if not nodes:
+        warn(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+        emit({"cluster_id": cluster_id, "terminated": []}, ctx=ctx)
+        return
+
+    if not yes:
+        if not is_text(ctx):
+            raise CLIError("Refusing to terminate without --yes in structured output mode.")
+        click.confirm(f"Terminate {len(nodes)} node(s) of cluster '{cluster_id}'?", abort=True)
+
+    instance_ids = [n["InstanceId"] for n in nodes]
+    terminate_tagged_instances(ec2, instance_ids)
+    for iid in instance_ids:
+        remove_ssh_host(iid)
+    delete_cluster_placement_group(ec2, cluster_mod.placement_group_name(cluster_id))
+
+    success(f"Terminated {len(instance_ids)} node(s) of cluster '{cluster_id}'.")
+    if keep_ebs and is_text(ctx):
+        info("EBS data volumes preserved (per-node).")
+    emit({"cluster_id": cluster_id, "region": resolved, "terminated": instance_ids}, ctx=ctx)
