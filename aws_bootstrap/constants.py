@@ -30,6 +30,8 @@ ALIAS_PREFIX = DEFAULT_ALIAS_PREFIX
 TAG_CREATED_BY = "created-by"  # value = LaunchConfig.tag_value
 TAG_NAME = "Name"
 TAG_BOOTSTRAP_INSTANCE = "aws-bootstrap-instance"  # links a data volume to its instance
+TAG_CLUSTER_ID = "aws-bootstrap-cluster"  # value = the user's --cluster-id
+TAG_CLUSTER_RANK = "aws-bootstrap-cluster-rank"  # value = stable node index "0".."N-1"
 
 # --- AWS resource types (TagSpecifications) ----------------------------------
 RES_INSTANCE = "instance"
@@ -42,6 +44,7 @@ SSH_PORT_DEFAULT = DEFAULT_SSH_PORT
 JUPYTER_PORT = 8888
 SSH_INGRESS_CIDR = "0.0.0.0/0"  # public SSH ingress (intentional for remote dev)
 SSH_CONNECT_TIMEOUT = 10  # seconds, ssh -o ConnectTimeout / socket timeout
+RDZV_PORT = 29400  # torchrun c10d rendezvous port (intra-cluster)
 
 # --- Storage -----------------------------------------------------------------
 VOLUME_TYPE = "gp3"
