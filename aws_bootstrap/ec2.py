@@ -246,6 +246,9 @@ class RegionContext:
     # to let AWS pick. EBS volumes are AZ-scoped, so an instance must launch in
     # the volume's AZ to be able to attach it.
     placement_az: str | None = None
+    # Cluster placement-group name to launch into, or None. Set for cluster
+    # nodes so they land in the same group (and AZ) for fast NCCL comms.
+    placement_group: str | None = None
 
 
 @dataclass
@@ -259,7 +262,13 @@ class RegionLaunch:
 
 
 def _build_launch_params(
-    config: LaunchConfig, ami_id: str, sg_id: str, spot: bool, key_name: str, placement_az: str | None = None
+    config: LaunchConfig,
+    ami_id: str,
+    sg_id: str,
+    spot: bool,
+    key_name: str,
+    placement_az: str | None = None,
+    placement_group: str | None = None,
 ) -> dict:
     params: dict = {
         "ImageId": ami_id,
@@ -288,8 +297,13 @@ def _build_launch_params(
             }
         ],
     }
+    placement: dict = {}
     if placement_az:
-        params["Placement"] = {"AvailabilityZone": placement_az}
+        placement["AvailabilityZone"] = placement_az
+    if placement_group:
+        placement["GroupName"] = placement_group
+    if placement:
+        params["Placement"] = placement
     if spot:
         params["InstanceMarketOptions"] = {
             "MarketType": "spot",
@@ -310,11 +324,14 @@ def _run_instances(
     spot: bool,
     key_name: str,
     placement_az: str | None = None,
+    placement_group: str | None = None,
 ) -> dict:
     """Single ``run_instances`` call.
 
     ``placement_az`` pins the instance to a specific availability zone (resolved
     once upstream from an existing ``--ebs-volume-id``); ``None`` lets AWS pick.
+    ``placement_group`` pins it into a cluster placement group (set for cluster
+    nodes).
 
     Raises :class:`CapacityError` on ``InsufficientInstanceCapacity`` (retryable
     by next-region fallthrough and ``--wait``), or :class:`RegionFatalError` on
@@ -322,7 +339,9 @@ def _run_instances(
     """
     market = "spot" if spot else "on-demand"
     try:
-        response = ec2_client.run_instances(**_build_launch_params(config, ami_id, sg_id, spot, key_name, placement_az))
+        response = ec2_client.run_instances(
+            **_build_launch_params(config, ami_id, sg_id, spot, key_name, placement_az, placement_group)
+        )
     except botocore.exceptions.ClientError as e:
         code = e.response["Error"]["Code"]
         if code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
@@ -481,7 +500,15 @@ def launch_with_retry(
                 on_attempt(region, mkt, attempt)
             try:
                 inst = _run_instances(
-                    ctx.ec2_client, config, ctx.ami["ImageId"], ctx.sg_id, region, spot, ctx.key_name, ctx.placement_az
+                    ctx.ec2_client,
+                    config,
+                    ctx.ami["ImageId"],
+                    ctx.sg_id,
+                    region,
+                    spot,
+                    ctx.key_name,
+                    ctx.placement_az,
+                    ctx.placement_group,
                 )
             except CapacityError as e:
                 failures[region] = ("capacity", str(e))

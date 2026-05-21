@@ -15,6 +15,7 @@ from aws_bootstrap.ec2 import (
     CLIError,
     RegionContext,
     RegionLaunch,
+    _build_launch_params,
     _run_instances,
     delete_cluster_placement_group,
     ensure_cluster_placement_group,
@@ -942,3 +943,62 @@ def test_list_clusters_groups_by_cluster_id():
     assert set(clusters) == {"ml1", "exp2"}
     assert len(clusters["ml1"]) == 2
     assert len(clusters["exp2"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Placement-group threading through the launch path
+# ---------------------------------------------------------------------------
+
+
+def test_build_launch_params_includes_placement_group():
+    p = _build_launch_params(
+        LaunchConfig(),
+        "ami-x",
+        "sg-x",
+        True,
+        "k",
+        placement_az="us-east-1c",
+        placement_group="aws-bootstrap-cluster-ml1",
+    )
+    assert p["Placement"] == {
+        "AvailabilityZone": "us-east-1c",
+        "GroupName": "aws-bootstrap-cluster-ml1",
+    }
+
+
+def test_build_launch_params_group_only():
+    p = _build_launch_params(LaunchConfig(), "ami-x", "sg-x", True, "k", placement_group="aws-bootstrap-cluster-ml1")
+    assert p["Placement"] == {"GroupName": "aws-bootstrap-cluster-ml1"}
+
+
+def test_run_instances_passes_placement_group():
+    ec2 = MagicMock()
+    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-1"}]}
+    _run_instances(
+        ec2,
+        LaunchConfig(),
+        "ami",
+        "sg",
+        "us-east-1",
+        True,
+        "k",
+        placement_az="us-east-1c",
+        placement_group="aws-bootstrap-cluster-ml1",
+    )
+    assert ec2.run_instances.call_args[1]["Placement"]["GroupName"] == "aws-bootstrap-cluster-ml1"
+
+
+def test_launch_with_retry_threads_placement_group():
+    client = MagicMock()
+    client.run_instances.return_value = _ok_instance("i-east")
+    ctx = RegionContext(
+        region="us-east-1",
+        ec2_client=client,
+        ami={"ImageId": "ami-east"},
+        sg_id="sg-1",
+        key_name="aws-bootstrap-key",
+        placement_az="us-east-1c",
+        placement_group="aws-bootstrap-cluster-ml1",
+    )
+    launch_with_retry(LaunchConfig(regions=("us-east-1",), spot=True), lambda r: ctx)
+    assert client.run_instances.call_args[1]["Placement"]["GroupName"] == "aws-bootstrap-cluster-ml1"
