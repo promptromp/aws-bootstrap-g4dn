@@ -50,9 +50,11 @@ aws-bootstrap launch [OPTIONS]
 | `--python-version` | string | none | Python version for remote venv (e.g. 3.13) |
 | `--ssh-port` | int | `22` | SSH port for security group and connection |
 | `--ebs-storage` | int | none | Create new EBS data volume (GB, gp3, at /data) |
-| `--ebs-volume-id` | string | none | Attach existing EBS volume (at /data) |
+| `--ebs-volume-id` | string | none | Attach existing EBS volume (at /data); pins instance to the volume's AZ |
 
 `--ebs-storage` and `--ebs-volume-id` are mutually exclusive.
+
+`--ebs-volume-id` automatically pins the instance to the volume's availability zone (EBS volumes are AZ-scoped). The launch therefore targets the volume's region, and spot capacity is limited to that one AZ — combine with `--wait` if the AZ is temporarily short on capacity. If the volume isn't found in the target region, the launch fails fast with a region-named error before provisioning anything.
 
 **`--wait` + multiple `--region`:** a region sweep is the inner loop, backoff is the outer loop. Each cycle tries spot in every `--region` in order with no delay between regions; only when *all* regions miss does it sleep (capped+jittered exponential backoff, escalating per sweep) and sweep again, until `--wait-timeout` total wall-clock, then hard-fail. So `--wait --region A --region B` = "try A then B instantly; if both dry, back off and retry both" — not "wait on A then try B." Region order wins every tie. Without `--wait`, exactly one sweep then on-demand fallback.
 
