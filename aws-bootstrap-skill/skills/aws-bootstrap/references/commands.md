@@ -555,6 +555,56 @@ Without `--cluster-id`: `{"region": "...", "clusters": [{"cluster_id": "ml1", "n
 
 ---
 
+## `aws-bootstrap cluster prepare`
+
+Verify a cluster and run a distributed canary. Checks each node is reachable and has a GPU, that CUDA versions are consistent across nodes (fails fast on skew), writes a per-node `~/.aws-bootstrap-cluster` config (the `AWSB_*` env contract), then runs the canary unless `--no-canary`.
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--cluster-id` | string | (required) | Cluster id |
+| `--region` | string | resolved | AWS region |
+| `--key-path` | path | `~/.ssh/id_ed25519.pub` | Local SSH public key |
+| `--ssh-user` | string | `ubuntu` | Remote SSH user |
+| `--ssh-port` | int | `22` | SSH port |
+| `--no-canary` | flag | false | Skip the auto-canary |
+
+### JSON Output
+
+```json
+{"cluster_id": "ml1", "verified": true, "canary_passed": true, "master_addr": "10.0.0.5", "node_count": 4}
+```
+
+Exits non-zero if a node is unreachable/GPU-less, CUDA versions are inconsistent, or the canary fails.
+
+---
+
+## `aws-bootstrap cluster test`
+
+Run the built-in distributed canary across the cluster (a re-runnable heartbeat). The canary runs the same `torchrun` command on every node (c10d rendezvous, endpoint = rank-0 private IP).
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--cluster-id` | string | (required) | Cluster id |
+| `--region` | string | resolved | AWS region |
+| `--key-path` | path | `~/.ssh/id_ed25519.pub` | Local SSH public key |
+| `--ssh-user` | string | `ubuntu` | Remote SSH user |
+| `--ssh-port` | int | `22` | SSH port |
+
+### JSON Output
+
+```json
+{"cluster_id": "ml1", "passed": true,
+ "results": [{"rank": 0, "instance_id": "i-0abc", "returncode": 0}]}
+```
+
+Exits non-zero if any node's canary returns non-zero.
+
+---
+
 ## `aws-bootstrap cluster terminate`
 
 Terminate all nodes of a cluster, remove their SSH aliases, and delete the placement group.

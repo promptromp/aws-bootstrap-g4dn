@@ -422,6 +422,12 @@ aws-bootstrap cluster launch --cluster-id ml1 --nodes 6
 # See the cluster's nodes (rank, state, AZ, IP); omit --cluster-id to list all clusters
 aws-bootstrap cluster status --cluster-id ml1
 
+# Verify the cluster (reachability, GPU, consistent CUDA) + run a distributed canary
+aws-bootstrap cluster prepare --cluster-id ml1
+
+# Re-run the canary any time as a heartbeat
+aws-bootstrap cluster test --cluster-id ml1
+
 # Tear it all down (nodes, SSH aliases, placement group)
 aws-bootstrap cluster terminate --cluster-id ml1 --yes
 ```
@@ -431,9 +437,11 @@ Key behaviors:
 - **Shared security group** — a self-referencing ingress rule lets cluster members reach each other on the NCCL/rendezvous ports (in addition to SSH).
 - **Per-node SSH aliases** — each node gets an `aws-<cluster-id>-<rank>` alias in `~/.ssh/config` (e.g. `ssh aws-ml1-0`).
 - **Stable ranks** — nodes are tagged with a stable rank (`0..N-1`); rank 0 is the rendezvous/master node (it also trains).
+- **Verify before you train** — `cluster prepare` checks every node is reachable, has a GPU, and runs a **consistent** CUDA version (it fails fast on version skew), writes a per-node cluster config, then runs a built-in distributed **canary** (a tiny DDP all-reduce + a few SGD steps across all nodes) to prove NCCL/rendezvous works end-to-end. `cluster test` re-runs that canary on demand.
+- **`torchrun` c10d rendezvous** — the canary (and, in a later phase, your training job) runs the *same* `torchrun` command on every node simultaneously, pointed at rank 0's private IP; the rendezvous assigns global ranks.
 - **EFA / AZ caveat** — `g4dn`/`g5` instances run NCCL over ordinary VPC networking (EFA is essentially P-series only), which is fine for dev/learning/modest scale. Pinning to one AZ means a spot shortage there affects the whole cluster.
 
-> Preview scope: Phase 1 ships `cluster launch` / `status` / `terminate`. Preparing the cluster, a verification canary, and running distributed jobs (`cluster prepare` / `test` / `run`) land in subsequent releases.
+> Preview scope: ships `cluster launch` / `status` / `prepare` / `test` / `terminate`. Running arbitrary distributed training jobs (`cluster run <your_train.py>`, with a data-prep convention and log streaming) lands in a subsequent release.
 
 ## EC2 vCPU Quotas
 

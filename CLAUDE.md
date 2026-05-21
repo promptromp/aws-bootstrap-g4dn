@@ -219,7 +219,7 @@ The `terminate` command discovers volumes via `find_ebs_volumes_for_instance`, w
 
 ## Multi-Node Training Clusters (`cluster` group)
 
-The `cluster` command group (`cluster.py` + the `cluster` Click group in `cli.py`) launches and manages multiple GPU instances as a coordinated cluster for multi-node distributed training (`torchrun`). **Phase 1** ships `cluster launch` / `status` / `terminate`; `prepare` / `test` / `run` are later phases.
+The `cluster` command group (`cluster.py` + the `cluster` Click group in `cli.py`) launches and manages multiple GPU instances as a coordinated cluster for multi-node distributed training (`torchrun`). Ships `cluster launch` / `status` / `prepare` / `test` / `terminate`; `cluster run` (arbitrary user training scripts + data-prep + log streaming) is a later phase.
 
 - **`cluster.py`** — composition logic only: pure helpers (`placement_group_name`, `node_alias`, `nodes_to_add`) and the launch fan-out (`launch_cluster_nodes`, which calls an injectable `launch_fn` per node and assigns sequential ranks). It imports `ec2` (one-directional: `ec2.py` does **not** import `cluster.py`, which is why the placement-group helpers take an already-derived name rather than a `cluster_id`).
 - **Identity = tags, not state.** A cluster is an arbitrary `--cluster-id` stored as the `TAG_CLUSTER_ID` (`aws-bootstrap-cluster`) tag; each node also carries `TAG_CLUSTER_RANK` (`aws-bootstrap-cluster-rank`). `find_cluster_instances` / `list_clusters` (in `ec2.py`) discover and group by these tags. No local cluster state file.
@@ -229,6 +229,15 @@ The `cluster` command group (`cluster.py` + the `cluster` Click group in `cli.py
 - **`RDZV_PORT`** (`29400`, in `constants.py`) is the reserved torchrun c10d rendezvous port for later phases.
 
 `cluster launch` reuses the single-node launch machinery (`launch_with_retry`, `ensure_security_group`, `import_key_pair`, `get_latest_ami`, `wait_instance_ready`, `remote_setup`) per node; the AMI/key are looked up once and reused across nodes. `cluster launch` is **incremental**: re-running with a higher `--nodes` adds nodes to reach the target. EFA is out of scope (P-series only; `g4dn`/`g5` use plain VPC networking).
+
+### Prepare / test (distributed execution core)
+
+- **c10d rendezvous, identical command per node.** `cluster.build_torchrun_command(...)` builds one `torchrun --rdzv-backend=c10d --rdzv-endpoint=<rank0_private_ip>:RDZV_PORT --rdzv-id=<cluster-id> ...` command that is run on **every** node; the rendezvous (hosted by rank 0) assigns global ranks, so no per-node `--node-rank` is needed. `cluster.master_addr(nodes)` returns rank 0's private IP.
+- **Parallel start.** `cluster.run_on_all_nodes(nodes, command_for, run_fn=...)` runs the command on all nodes concurrently (a `ThreadPoolExecutor`) — they must start together to rendezvous — returning a rank-ordered `list[NodeResult]`. `run_fn`/`scp_fn` are **injected** (production wraps `ssh.run_on_host` / `ssh.scp_to_host`), which keeps the orchestration unit-testable with fakes.
+- **Generic SSH primitives** live in `ssh.py`: `run_on_host(host, user, key, command, *, port, timeout) -> (rc, stdout, stderr)` and `scp_to_host(...) -> bool`.
+- **Canary.** `resources/cluster_canary.py` is a tiny DDP job (process-group init + all-reduce correctness check + a few SGD steps; exits non-zero on failure). `cluster.run_canary(...)` SCPs it to every node and runs the torchrun command in parallel (activating `~/venv` first, since non-interactive ssh doesn't source `~/.bashrc`). `cluster test` runs it standalone; `cluster prepare` runs it after verification.
+- **`cluster prepare`** queries each node's GPU/CUDA via `query_gpu_info`, fails on `cluster.detect_version_skew` (inconsistent CUDA across nodes), writes the `AWSB_*` env contract (`cluster.node_env`) to `~/.aws-bootstrap-cluster` on each node (for the later `cluster run`), then auto-runs the canary (`--no-canary` skips it).
+- **`RDZV_PORT`** (`29400`) is the c10d rendezvous port; the SG self-rule (Phase 1) makes it reachable between nodes.
 
 ## Agent Skill (Claude Code Plugin)
 
