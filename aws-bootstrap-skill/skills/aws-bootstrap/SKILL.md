@@ -38,7 +38,7 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 | `aws-bootstrap cluster prepare` | Verify nodes (reachable/GPU/consistent CUDA), write config, run a distributed canary | `--cluster-id` (required), `--key-path`, `--no-canary` |
 | `aws-bootstrap cluster test` | Re-run the distributed canary across the cluster (heartbeat) | `--cluster-id` (required), `--key-path` |
 | `aws-bootstrap cluster run` | Distribute a training script + run it across the cluster (torchrun) | `--cluster-id` (required), `SCRIPT`, `-- ARGS`, `--data-script`, `--nproc-per-node`, `--log-dir` |
-| `aws-bootstrap cluster terminate` | Terminate all cluster nodes + delete placement group | `--cluster-id` (required), `--keep-ebs`, `--yes` |
+| `aws-bootstrap cluster terminate` | Terminate all cluster nodes + delete placement group | `--cluster-id` (required), `--yes` |
 
 **Global options** (before the command): `--output json|yaml|table|text`, `--profile`, `--region`
 

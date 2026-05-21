@@ -54,16 +54,20 @@ aws_bootstrap/
         tasks.json             # VSCode CUDA build tasks template (deployed to ~/workspace/.vscode/tasks.json)
         remote_setup.sh        # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
         requirements.txt       # Python dependencies installed on the remote instance
+        cluster_canary.py      # Distributed DDP canary (all-reduce + SGD), SCP'd to cluster nodes for prepare/test
     tests/               # Unit tests (pytest)
         conftest.py            # Shared fixtures (runner, cli_session, quota/ami/instance-type rows)
         test_config.py
         test_cli.py
         test_cli_regions.py    # Region-aware quota/list CLI tests (fixtures + parametrize)
+        test_cli_cluster.py    # cluster launch/status/prepare/test/run/terminate CLI tests
+        test_cluster.py        # cluster.py composition helpers + run_distributed_job/canary orchestration
         test_ec2.py
         test_output.py
         test_gpu.py
         test_retry.py
         test_ssh_config.py
+        test_ssh_exec.py       # run_on_host / scp_to_host SSH primitives
         test_ssh_gpu.py
         test_ebs.py
         test_ssh_ebs.py

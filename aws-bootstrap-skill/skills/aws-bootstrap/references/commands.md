@@ -644,7 +644,7 @@ Exits non-zero if any node returns non-zero (or if SCP/data-prep fails).
 
 ## `aws-bootstrap cluster terminate`
 
-Terminate all nodes of a cluster, remove their SSH aliases, and delete the placement group.
+Terminate all nodes of a cluster, remove their SSH aliases, wait for full termination, then delete the placement group. (`cluster launch` does not create per-node EBS data volumes yet, so there are none to preserve — there is no `--keep-ebs` here.)
 
 ### Options
 
@@ -652,7 +652,6 @@ Terminate all nodes of a cluster, remove their SSH aliases, and delete the place
 |--------|------|---------|-------------|
 | `--cluster-id` | string | (required) | Cluster id to terminate |
 | `--region` | string | resolved | AWS region |
-| `--keep-ebs` | flag | false | Preserve per-node EBS data volumes |
 | `--yes` | flag | false | Skip confirmation (required in structured output modes) |
 
 ### JSON Output

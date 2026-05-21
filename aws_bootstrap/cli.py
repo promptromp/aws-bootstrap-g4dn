@@ -29,6 +29,7 @@ from .constants import (
 from .ec2 import (
     CLIError,
     RegionContext,
+    RegionLaunch,
     attach_ebs_volume,
     create_ebs_volume,
     delete_cluster_placement_group,
@@ -1857,28 +1858,37 @@ def cluster_launch(
             else:
                 warn(f"  rank {rank}: remote setup failed (node still running; re-run setup or check logs).")
 
+    # Never silently fall back to on-demand mid-cluster: that would create a
+    # mixed-pricing cluster (and auto-confirm silently in structured output).
+    # On spot exhaustion the user re-runs with --wait (retry) or --on-demand.
+    def launch_node(cfg: LaunchConfig, prep) -> RegionLaunch:
+        return launch_with_retry(cfg, prep, confirm_on_demand=lambda: False)
+
     step(1, 1, f"Launching {to_add} node(s) for cluster '{cluster_id}' in {region} (placement group {pg_name})...")
     try:
         cluster_mod.launch_cluster_nodes(
-            config, prepare_region, to_add, start_rank, launch_fn=launch_with_retry, on_node=on_node
+            config, prepare_region, to_add, start_rank, launch_fn=launch_node, on_node=on_node
         )
     except CLIError as e:
         # Partial progress: nodes already launched are tagged + aliased and billable.
         if added:
             warn(f"Launched {len(added)} of {to_add} requested node(s) before failing.")
             info(
-                f"  Re-run to finish:  aws-bootstrap cluster launch --cluster-id {cluster_id} "
-                f"--nodes {nodes} --region {region}"
+                "  Re-run to finish:  "
+                + _cmd(f"aws-bootstrap cluster launch --cluster-id {cluster_id} --nodes {nodes} --region {region}")
             )
-            info(f"  Or roll back:      aws-bootstrap cluster terminate --cluster-id {cluster_id} --region {region}")
+            info(
+                "  Or roll back:      "
+                + _cmd(f"aws-bootstrap cluster terminate --cluster-id {cluster_id} --region {region}")
+            )
         raise CLIError(
             f"{e.format_message()}\n\n  (cluster nodes are AZ-pinned to {shared['az'] or region}; "
-            "a fresh cluster id can target a different AZ if capacity is short.)"
+            "a fresh cluster id can target a different AZ, or re-run with --wait to ride out spot capacity.)"
         ) from None
 
     success(f"Cluster '{cluster_id}' now has {len(existing) + to_add} node(s).")
     if is_text(ctx):
-        info(f"Next: aws-bootstrap cluster status --cluster-id {cluster_id} --region {region}")
+        info("Next: " + _cmd(f"aws-bootstrap cluster status --cluster-id {cluster_id} --region {region}"))
     emit(
         {
             "cluster_id": cluster_id,
@@ -2127,7 +2137,7 @@ def cluster_prepare(ctx, cluster_id, region, profile, key_path, ssh_user, ssh_po
                 click.echo(f"  rank {r.rank} ({r.instance_id}) canary failed: {r.stderr.strip()[:200]}")
     (success if passed else warn)("Canary passed — cluster is ready." if passed else "Canary FAILED.")
     if is_text(ctx) and passed:
-        info(f"Next: aws-bootstrap cluster run --cluster-id {cluster_id} <your_train.py>  (Phase 3)")
+        info("Next: " + _cmd(f"aws-bootstrap cluster run --cluster-id {cluster_id} <your_train.py>"))
     emit(
         {
             "cluster_id": cluster_id,

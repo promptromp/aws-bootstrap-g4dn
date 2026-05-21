@@ -102,6 +102,25 @@ def test_master_addr_is_rank0_private_ip():
     assert cluster.master_addr(nodes) == "10.0.0.5"
 
 
+def test_master_addr_tolerates_unknown_rank():
+    # A node whose rank tag failed to write (Rank=None) must not crash master_addr.
+    nodes = [
+        {"Rank": None, "PrivateIp": "10.0.0.9"},
+        {"Rank": 0, "PrivateIp": "10.0.0.5"},
+    ]
+    assert cluster.master_addr(nodes) == "10.0.0.5"
+
+
+def test_build_torchrun_command_quotes_script_args():
+    # Args with spaces/special chars must be shell-quoted so the remote shell
+    # doesn't word-split them.
+    cmd = cluster.build_torchrun_command(
+        "/tmp/t.py", 1, 1, "10.0.0.5", "ml1", 29400, script_args=["--run-name", "my run", "--flag"]
+    )
+    assert "'my run'" in cmd
+    assert "/tmp/t.py --run-name 'my run' --flag" in cmd
+
+
 def test_build_torchrun_command_c10d():
     cmd = cluster.build_torchrun_command(
         script="train.py",

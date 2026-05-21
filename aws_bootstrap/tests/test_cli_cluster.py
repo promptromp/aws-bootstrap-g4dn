@@ -166,6 +166,10 @@ def test_cluster_launch_two_nodes_tags_ranks(
     assert mock_launch.call_count == 2
     aliases = {c.kwargs.get("alias") for c in mock_add_ssh.call_args_list}
     assert aliases == {"aws-ml1-0", "aws-ml1-1"}
+    # Cluster launch must NOT silently fall back to on-demand per node: it passes
+    # a confirm_on_demand callback that always declines.
+    confirm = mock_launch.call_args.kwargs.get("confirm_on_demand")
+    assert confirm is not None and confirm() is False
 
 
 @patch("aws_bootstrap.cli.run_remote_setup", return_value=True)

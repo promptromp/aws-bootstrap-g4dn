@@ -42,8 +42,13 @@ def nodes_to_add(current: int, target: int) -> int:
 
 
 def master_addr(nodes: list[dict]) -> str:
-    """Private IP of rank 0 (the rendezvous/master node)."""
-    rank0 = min(nodes, key=lambda n: n["Rank"])
+    """Private IP of rank 0 (the rendezvous/master node).
+
+    Tolerates nodes with an unknown rank (``Rank is None``, e.g. a node whose
+    rank tag failed to write) by sorting them last rather than crashing on a
+    ``None``/``int`` comparison.
+    """
+    rank0 = min(nodes, key=lambda n: (n["Rank"] is None, n["Rank"] if n["Rank"] is not None else 0))
     return rank0["PrivateIp"]
 
 
@@ -57,7 +62,7 @@ def build_torchrun_command(
     script_args: list[str] | None = None,
 ) -> str:
     """The (identical-on-every-node) torchrun command using c10d rendezvous."""
-    args = " ".join(script_args) if script_args else ""
+    args = shlex.join(script_args) if script_args else ""
     cmd = (
         f"torchrun --nnodes={num_nodes} --nproc-per-node={nproc_per_node} "
         f"--rdzv-backend=c10d --rdzv-endpoint={master_addr}:{rdzv_port} --rdzv-id={rdzv_id} "
@@ -204,7 +209,7 @@ def _job_command_for(
     if remote_script.endswith(".sh"):
         env = node_env(cluster_id, node["Rank"], len(nodes), nproc_per_node, [n["PrivateIp"] for n in nodes], addr)
         exports = " ".join(f"export {k}={shlex.quote(v)};" for k, v in env.items())
-        args = " ".join(script_args) if script_args else ""
+        args = shlex.join(script_args) if script_args else ""
         body = f"{exports} bash {remote_script} {args}".rstrip()
     else:
         body = build_torchrun_command(
