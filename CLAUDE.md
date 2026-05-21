@@ -75,6 +75,12 @@ aws_bootstrap/
 docs/
     nsight-remote-profiling.md # Nsight Compute, Nsight Systems, and Nsight VSCE remote profiling guide
     capacity-and-retry.md      # Multi-region & --wait retry model, backoff design, recommended region lists
+    multi-node-training.md     # End-to-end cluster training walkthrough (launch→prepare→test→run→terminate)
+examples/                        # Runnable user-facing example scripts (not part of the package; ruff-linted, not type-checked)
+    cluster/
+        train_ddp.py             # Minimal multi-node DDP training script (long usage header)
+        prepare_data.sh          # Idempotent per-node data-prep (S3→/data) for --data-script
+        README.md
 aws-bootstrap-skill/             # Claude Code plugin
     .claude-plugin/
         plugin.json              # Plugin manifest (identity, metadata)

@@ -29,6 +29,9 @@ repos:
   hooks:
     - id: mypy
       additional_dependencies: [types-pyyaml>=6.0.12, types-tabulate>=0.9]
+      # examples/ are illustrative scripts that import torch (not a project
+      # dependency); they are ruff-linted but not type-checked.
+      exclude: ^examples/
 - repo: local
   hooks:
   - id: pytest

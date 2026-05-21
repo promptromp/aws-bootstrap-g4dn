@@ -412,6 +412,8 @@ Key behaviors:
 
 Launch several GPU instances as a coordinated **cluster** for multi-node distributed training (e.g. PyTorch DDP via `torchrun`). A cluster is identified by an arbitrary `--cluster-id` used as an EC2 tag — AWS tags are the source of truth, so there's no local state file to keep in sync.
 
+> **Full walkthrough:** [docs/multi-node-training.md](docs/multi-node-training.md) takes you from zero to a running multi-node training job, with runnable example scripts in [examples/cluster/](examples/cluster/) (a DDP training script and a data-prep script).
+
 ```bash
 # Launch a 4-node cluster (single AZ, cluster placement group, shared SG)
 aws-bootstrap cluster launch --cluster-id ml1 --nodes 4 --instance-type g5.xlarge --region us-east-1
