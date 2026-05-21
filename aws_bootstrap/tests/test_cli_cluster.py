@@ -1,20 +1,21 @@
-"""CliRunner tests for the `cluster` command group (Phases 1-2)."""
+"""CliRunner tests for the `cluster` command group (Phases 1-3).
+
+Uses the shared ``runner`` fixture from ``conftest.py``. ``_node`` / ``_make_key``
+are kept local because they encode cluster-specific shapes (the dict
+``find_cluster_instances`` returns, and a throwaway public key).
+"""
 
 from __future__ import annotations
 import json
 from datetime import datetime
 from unittest.mock import MagicMock, patch
 
-from click.testing import CliRunner
+import pytest
 
 from aws_bootstrap.cli import main
 from aws_bootstrap.cluster import NodeResult
 from aws_bootstrap.ec2 import RegionContext, RegionLaunch
 from aws_bootstrap.gpu import GpuInfo
-
-
-def _runner():
-    return CliRunner()
 
 
 def _make_key(tmp_path):
@@ -38,31 +39,36 @@ def _node(instance_id="i-1", cluster_id="ml1", rank=0, state="running"):
     }
 
 
-def test_cluster_help_lists_subcommands():
-    result = _runner().invoke(main, ["cluster", "--help"])
+# ---------------------------------------------------------------------------
+# launch / status / terminate (Phase 1)
+# ---------------------------------------------------------------------------
+
+
+def test_cluster_help_lists_subcommands(runner):
+    result = runner.invoke(main, ["cluster", "--help"])
     assert result.exit_code == 0
-    for sub in ("launch", "status", "terminate"):
+    for sub in ("launch", "status", "prepare", "test", "run", "terminate"):
         assert sub in result.output
 
 
-def test_cluster_status_json_lists_nodes():
+def test_cluster_status_json_lists_nodes(runner):
     with (
         patch("aws_bootstrap.cli.boto3.Session"),
         patch("aws_bootstrap.cli.find_cluster_instances", return_value=[_node()]),
     ):
-        result = _runner().invoke(main, ["-o", "json", "cluster", "status", "--cluster-id", "ml1"])
+        result = runner.invoke(main, ["-o", "json", "cluster", "status", "--cluster-id", "ml1"])
     assert result.exit_code == 0
     data = json.loads(result.output)
     assert data["nodes"][0]["rank"] == 0
     assert data["nodes"][0]["instance_id"] == "i-1"
 
 
-def test_cluster_terminate_requires_yes_in_json_mode():
+def test_cluster_terminate_requires_yes_in_json_mode(runner):
     with (
         patch("aws_bootstrap.cli.boto3.Session"),
         patch("aws_bootstrap.cli.find_cluster_instances", return_value=[_node()]),
     ):
-        result = _runner().invoke(main, ["-o", "json", "cluster", "terminate", "--cluster-id", "ml1"])
+        result = runner.invoke(main, ["-o", "json", "cluster", "terminate", "--cluster-id", "ml1"])
     assert result.exit_code != 0
 
 
@@ -71,13 +77,28 @@ def test_cluster_terminate_requires_yes_in_json_mode():
 @patch("aws_bootstrap.cli.terminate_tagged_instances", return_value=[])
 @patch("aws_bootstrap.cli.find_cluster_instances")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_cluster_terminate_tears_down_nodes_and_group(mock_session, mock_find, mock_term, mock_remove, mock_delpg):
+def test_cluster_terminate_tears_down_nodes_and_group(
+    mock_session, mock_find, mock_term, mock_remove, mock_delpg, runner
+):
     mock_find.return_value = [_node()]
-    result = _runner().invoke(main, ["cluster", "terminate", "--cluster-id", "ml1", "--yes", "--keep-ebs"])
+    result = runner.invoke(main, ["cluster", "terminate", "--cluster-id", "ml1", "--yes"])
     assert result.exit_code == 0, result.output
     mock_term.assert_called_once()
     assert mock_term.call_args[0][1] == ["i-1"]
     mock_delpg.assert_called_once()
+
+
+def _launch_side_effect(config, prepare_region, **kw):
+    ctx = RegionContext(
+        region="us-east-1",
+        ec2_client=MagicMock(),
+        ami={"ImageId": "ami-1"},
+        sg_id="sg-123",
+        key_name="aws-bootstrap-key",
+        placement_az="us-east-1c",
+        placement_group="aws-bootstrap-cluster-ml1",
+    )
+    return RegionLaunch("us-east-1", ctx, {"InstanceId": "i-x"}, "spot")
 
 
 @patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-ml1-0")
@@ -101,27 +122,13 @@ def test_cluster_launch_two_nodes_tags_ranks(
     mock_launch,
     mock_wait,
     mock_add_ssh,
+    runner,
     tmp_path,
 ):
-    key = tmp_path / "id_ed25519.pub"
-    key.write_text("ssh-ed25519 AAAA test@host")
-
-    def _launch(config, prepare_region, **kw):
-        ctx = RegionContext(
-            region="us-east-1",
-            ec2_client=MagicMock(),
-            ami={"ImageId": "ami-1"},
-            sg_id="sg-123",
-            key_name="aws-bootstrap-key",
-            placement_az="us-east-1c",
-            placement_group="aws-bootstrap-cluster-ml1",
-        )
-        return RegionLaunch("us-east-1", ctx, {"InstanceId": "i-x"}, "spot")
-
-    mock_launch.side_effect = _launch
+    mock_launch.side_effect = _launch_side_effect
     mock_wait.return_value = {"PublicIpAddress": "1.2.3.4", "Placement": {"AvailabilityZone": "us-east-1c"}}
 
-    result = _runner().invoke(
+    result = runner.invoke(
         main,
         [
             "cluster",
@@ -133,7 +140,7 @@ def test_cluster_launch_two_nodes_tags_ranks(
             "--region",
             "us-east-1",
             "--key-path",
-            str(key),
+            str(_make_key(tmp_path)),
             "--no-setup",
         ],
     )
@@ -143,40 +150,79 @@ def test_cluster_launch_two_nodes_tags_ranks(
     assert aliases == {"aws-ml1-0", "aws-ml1-1"}
 
 
-# ---------------------------------------------------------------------------
-# cluster test / prepare (Phase 2)
-# ---------------------------------------------------------------------------
-
-
-@patch("aws_bootstrap.cli.cluster_mod.run_canary")
-@patch("aws_bootstrap.cli.find_cluster_instances")
+@patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
+@patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-ml1-0")
+@patch("aws_bootstrap.cli.wait_instance_ready")
+@patch("aws_bootstrap.cli.launch_with_retry")
+@patch("aws_bootstrap.cli.ensure_cluster_security_group_rule")
+@patch("aws_bootstrap.cli.ensure_cluster_placement_group", return_value="aws-bootstrap-cluster-ml1")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.get_latest_ami", return_value={"ImageId": "ami-1", "Name": "DL"})
+@patch("aws_bootstrap.cli.find_cluster_instances", return_value=[])
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_cluster_test_runs_canary(mock_session, mock_find, mock_canary, tmp_path):
-    mock_find.return_value = [_node(instance_id="i-0", rank=0), _node(instance_id="i-1", rank=1)]
-    mock_canary.return_value = [
-        NodeResult("i-0", 0, 0, "[canary] ok", ""),
-        NodeResult("i-1", 1, 0, "[canary] ok", ""),
-    ]
-    result = _runner().invoke(
-        main, ["-o", "json", "cluster", "test", "--cluster-id", "ml1", "--key-path", str(_make_key(tmp_path))]
+def test_cluster_launch_runs_remote_setup_per_node(
+    mock_session,
+    mock_find,
+    mock_ami,
+    mock_import,
+    mock_sg,
+    mock_pg,
+    mock_sgrule,
+    mock_launch,
+    mock_wait,
+    mock_add_ssh,
+    mock_wait_ssh,
+    mock_setup,
+    runner,
+    tmp_path,
+):
+    """Regression: cluster launch MUST run remote setup (so nodes get ~/venv +
+    torchrun) — without it prepare/test/run fail on real hardware."""
+    mock_launch.side_effect = _launch_side_effect
+    mock_wait.return_value = {"PublicIpAddress": "1.2.3.4", "Placement": {"AvailabilityZone": "us-east-1c"}}
+
+    result = runner.invoke(
+        main,
+        [
+            "cluster",
+            "launch",
+            "--cluster-id",
+            "ml1",
+            "--nodes",
+            "2",
+            "--region",
+            "us-east-1",
+            "--key-path",
+            str(_make_key(tmp_path)),
+        ],
     )
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
-    assert data["passed"] is True
-    mock_canary.assert_called_once()
+    assert mock_setup.call_count == 2  # remote setup ran on every node
 
 
+# ---------------------------------------------------------------------------
+# prepare / test (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("rc,passed,exits_nonzero", [(0, True, False), (1, False, True)])
 @patch("aws_bootstrap.cli.cluster_mod.run_canary")
 @patch("aws_bootstrap.cli.find_cluster_instances")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_cluster_test_nonzero_on_failure(mock_session, mock_find, mock_canary, tmp_path):
+def test_cluster_test_reports_canary_outcome(
+    mock_session, mock_find, mock_canary, runner, tmp_path, rc, passed, exits_nonzero
+):
     mock_find.return_value = [_node(instance_id="i-0", rank=0)]
-    mock_canary.return_value = [NodeResult("i-0", 0, 1, "", "boom")]
-    result = _runner().invoke(
+    mock_canary.return_value = [NodeResult("i-0", 0, rc, "[canary] out", "boom" if rc else "")]
+    result = runner.invoke(
         main, ["-o", "json", "cluster", "test", "--cluster-id", "ml1", "--key-path", str(_make_key(tmp_path))]
     )
-    assert result.exit_code != 0
-    assert json.loads(result.output)["passed"] is False
+    data = json.loads(result.output)
+    assert data["passed"] is passed
+    assert (result.exit_code != 0) is exits_nonzero
+    mock_canary.assert_called_once()
 
 
 @patch("aws_bootstrap.cli.cluster_mod.run_canary")
@@ -184,20 +230,13 @@ def test_cluster_test_nonzero_on_failure(mock_session, mock_find, mock_canary, t
 @patch("aws_bootstrap.cli.query_gpu_info")
 @patch("aws_bootstrap.cli.find_cluster_instances")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_cluster_prepare_verifies_and_runs_canary(mock_session, mock_find, mock_gpu, mock_run, mock_canary, tmp_path):
+def test_cluster_prepare_verifies_and_runs_canary(
+    mock_session, mock_find, mock_gpu, mock_run, mock_canary, runner, tmp_path
+):
     mock_find.return_value = [_node(instance_id="i-0", rank=0), _node(instance_id="i-1", rank=1)]
-    mock_gpu.return_value = GpuInfo(
-        driver_version="550",
-        cuda_driver_version="12.4",
-        cuda_toolkit_version="12.4",
-        gpu_name="T4",
-        compute_capability="7.5",
-        architecture="Turing",
-    )
+    mock_gpu.return_value = GpuInfo("550", "12.4", "12.4", "T4", "7.5", "Turing")
     mock_canary.return_value = [NodeResult("i-0", 0, 0, "ok", ""), NodeResult("i-1", 1, 0, "ok", "")]
-    result = _runner().invoke(
-        main, ["cluster", "prepare", "--cluster-id", "ml1", "--key-path", str(_make_key(tmp_path))]
-    )
+    result = runner.invoke(main, ["cluster", "prepare", "--cluster-id", "ml1", "--key-path", str(_make_key(tmp_path))])
     assert result.exit_code == 0, result.output
     assert mock_canary.called
     assert mock_run.call_count >= 2  # wrote per-node config
@@ -206,37 +245,33 @@ def test_cluster_prepare_verifies_and_runs_canary(mock_session, mock_find, mock_
 @patch("aws_bootstrap.cli.query_gpu_info")
 @patch("aws_bootstrap.cli.find_cluster_instances")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_cluster_prepare_fails_on_version_skew(mock_session, mock_find, mock_gpu, tmp_path):
+def test_cluster_prepare_fails_on_version_skew(mock_session, mock_find, mock_gpu, runner, tmp_path):
     mock_find.return_value = [_node(instance_id="i-0", rank=0), _node(instance_id="i-1", rank=1)]
     mock_gpu.side_effect = [
         GpuInfo("550", "12.4", "12.4", "T4", "7.5", "Turing"),
         GpuInfo("550", "12.1", "12.1", "T4", "7.5", "Turing"),
     ]
-    result = _runner().invoke(
-        main, ["cluster", "prepare", "--cluster-id", "ml1", "--key-path", str(_make_key(tmp_path))]
-    )
+    result = runner.invoke(main, ["cluster", "prepare", "--cluster-id", "ml1", "--key-path", str(_make_key(tmp_path))])
     assert result.exit_code != 0
     assert "mismatch" in result.output.lower()
 
 
 # ---------------------------------------------------------------------------
-# cluster run (Phase 3)
+# run (Phase 3)
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize("rc,succeeded,exits_nonzero", [(0, True, False), (1, False, True)])
 @patch("aws_bootstrap.cli.cluster_mod.run_distributed_job")
 @patch("aws_bootstrap.cli.find_cluster_instances")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_cluster_run_distributes_and_reports(mock_session, mock_find, mock_run, tmp_path):
-    mock_find.return_value = [_node(instance_id="i-0", rank=0), _node(instance_id="i-1", rank=1)]
-    mock_run.return_value = [
-        NodeResult("i-0", 0, 0, "loss 0.1", ""),
-        NodeResult("i-1", 1, 0, "loss 0.1", ""),
-    ]
+def test_cluster_run_reports_outcome(mock_session, mock_find, mock_run, runner, tmp_path, rc, succeeded, exits_nonzero):
+    mock_find.return_value = [_node(instance_id="i-0", rank=0)]
+    mock_run.return_value = [NodeResult("i-0", 0, rc, "loss 0.1", "traceback" if rc else "")]
     train = tmp_path / "train.py"
     train.write_text("print('hi')\n")
     log_dir = tmp_path / "logs"
-    result = _runner().invoke(
+    result = runner.invoke(
         main,
         [
             "-o",
@@ -252,44 +287,17 @@ def test_cluster_run_distributes_and_reports(mock_session, mock_find, mock_run, 
             str(train),
         ],
     )
-    assert result.exit_code == 0, result.output
     data = json.loads(result.output)
-    assert data["succeeded"] is True
+    assert data["succeeded"] is succeeded
+    assert (result.exit_code != 0) is exits_nonzero
     mock_run.assert_called_once()
+    # Per-node logs are written regardless of outcome.
     assert (log_dir / "ml1" / "rank0.log").exists()
 
 
-@patch("aws_bootstrap.cli.cluster_mod.run_distributed_job")
-@patch("aws_bootstrap.cli.find_cluster_instances")
-@patch("aws_bootstrap.cli.boto3.Session")
-def test_cluster_run_nonzero_on_failure(mock_session, mock_find, mock_run, tmp_path):
-    mock_find.return_value = [_node(instance_id="i-0", rank=0)]
-    mock_run.return_value = [NodeResult("i-0", 0, 1, "", "traceback")]
-    train = tmp_path / "train.py"
-    train.write_text("x\n")
-    result = _runner().invoke(
-        main,
-        [
-            "-o",
-            "json",
-            "cluster",
-            "run",
-            "--cluster-id",
-            "ml1",
-            "--key-path",
-            str(_make_key(tmp_path)),
-            "--log-dir",
-            str(tmp_path / "logs"),
-            str(train),
-        ],
-    )
-    assert result.exit_code != 0
-    assert json.loads(result.output)["succeeded"] is False
-
-
-def test_cluster_run_missing_script_errors(tmp_path):
+def test_cluster_run_missing_script_errors(runner, tmp_path):
     with patch("aws_bootstrap.cli.boto3.Session"):
-        result = _runner().invoke(
+        result = runner.invoke(
             main,
             [
                 "cluster",

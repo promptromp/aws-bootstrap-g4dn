@@ -121,6 +121,28 @@ def test_build_torchrun_command_c10d():
     assert cmd.strip().endswith("train.py --epochs 1")
 
 
+def test_build_torchrun_command_exact():
+    # Exact match: this string is the load-bearing contract with torchrun, so
+    # guard against silent flag-format drift (e.g. --nproc-per-node vs _).
+    cmd = cluster.build_torchrun_command("/tmp/t.py", 2, 1, "10.0.0.5", "ml1", 29400)
+    assert cmd == (
+        "torchrun --nnodes=2 --nproc-per-node=1 "
+        "--rdzv-backend=c10d --rdzv-endpoint=10.0.0.5:29400 --rdzv-id=ml1 /tmp/t.py"
+    )
+
+
+def test_render_node_config_is_sourceable():
+    env = cluster.node_env("ml1", 0, 2, 1, ["10.0.0.5", "10.0.0.6"], "10.0.0.5")
+    text = cluster.render_node_config(env)
+    # Each assignment is an `export` line (shell-safe scalars left unquoted).
+    assert "export AWSB_NODE_RANK=0" in text
+    assert "export AWSB_MASTER_ADDR=10.0.0.5" in text
+    # The multi-line node-IPs value stays inside ONE quoted assignment, so the
+    # second IP is not a bare standalone line the shell would execute on source.
+    assert "export AWSB_NODE_IPS='10.0.0.5\n10.0.0.6'" in text
+    assert "\n10.0.0.6\n" not in f"\n{text}\n"
+
+
 def test_node_env_contract():
     env = cluster.node_env(
         cluster_id="ml1",
@@ -186,6 +208,22 @@ def test_run_on_all_nodes_reports_failures():
     assert results[0].returncode == 0
     assert results[1].returncode == 1
     assert results[1].stderr == "boom"
+
+
+def test_run_on_all_nodes_survives_raising_run_fn():
+    nodes = [{"Rank": 0, "InstanceId": "i-0"}, {"Rank": 1, "InstanceId": "i-1"}]
+
+    def run_fn(node, command):
+        if node["Rank"] == 1:
+            raise RuntimeError("kaboom")
+        return (0, "ok", "")
+
+    results = cluster.run_on_all_nodes(nodes, lambda node: "x", run_fn=run_fn)
+    # One node raising must not abort the whole sweep; it's a rank-labeled failure.
+    assert results[0].returncode == 0
+    assert results[1].returncode == 1
+    assert "kaboom" in results[1].stderr
+    assert results[1].instance_id == "i-1"
 
 
 def test_run_canary_scps_and_runs_torchrun_on_all_nodes():

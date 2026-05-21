@@ -85,6 +85,16 @@ def node_env(
     }
 
 
+def render_node_config(env: dict[str, str]) -> str:
+    """Serialize the ``AWSB_*`` env contract as a **sourceable** shell file.
+
+    Each value is ``shlex.quote``d, so multi-line values (e.g. newline-joined
+    ``AWSB_NODE_IPS``) stay inside a single quoted assignment rather than leaking
+    a bare line that the shell would execute when the file is ``source``d.
+    """
+    return "\n".join(f"export {k}={shlex.quote(v)}" for k, v in env.items())
+
+
 def detect_version_skew(versions: dict[str, str]) -> list[str]:
     """Given ``{instance_id: version}``, return a list of mismatch descriptions.
 
@@ -164,8 +174,11 @@ def run_on_all_nodes(
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(run_fn, node, command_for(node)): i for i, node in enumerate(nodes)}
         for future, i in futures.items():
-            rc, out, err = future.result()
             node = nodes[i]
+            try:
+                rc, out, err = future.result()
+            except Exception as e:  # noqa: BLE001 — one node's crash must not abort the sweep un-attributed
+                rc, out, err = 1, "", f"run failed on {node['InstanceId']}: {e}"
             results[i] = NodeResult(node["InstanceId"], node["Rank"], rc, out, err)
     return [r for r in results if r is not None]
 

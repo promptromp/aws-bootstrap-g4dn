@@ -446,7 +446,7 @@ Key behaviors:
 - **Stable ranks** — nodes are tagged with a stable rank (`0..N-1`); rank 0 is the rendezvous/master node (it also trains).
 - **Verify before you train** — `cluster prepare` checks every node is reachable, has a GPU, and runs a **consistent** CUDA version (it fails fast on version skew), writes a per-node cluster config, then runs a built-in distributed **canary** (a tiny DDP all-reduce + a few SGD steps across all nodes) to prove NCCL/rendezvous works end-to-end. `cluster test` re-runs that canary on demand.
 - **`cluster run` — distributed training** — distributes your `SCRIPT` to every node and runs it across the cluster. A `.py` script is launched with `torchrun` (c10d rendezvous, all nodes pointed at rank 0); a `.sh` script runs as-is with the `AWSB_*` environment contract exported (`AWSB_NODE_RANK`, `AWSB_NUM_NODES`, `AWSB_NUM_GPUS_PER_NODE`, `AWSB_NODE_IPS`, `AWSB_MASTER_ADDR`) so you can wire up any launcher. Per-node stdout/stderr are saved under `--log-dir`.
-- **Data-prep convention** — pass `--data-script prep.sh` and it's copied to every node and run **once, before training** (it's a barrier — training won't start until all nodes finish prep). The recommended pattern is an idempotent S3 pull into the per-node `/data` EBS mount:
+- **Data-prep convention** — pass `--data-script prep.sh` and it's copied to every node and run **once, before training** (it's a barrier — training won't start until all nodes finish prep). Only the script's **exit code** is the success signal, so start it with `set -euo pipefail` to ensure a failed step actually fails the prep. The recommended pattern is an idempotent S3 pull into the per-node `/data` EBS mount:
   ```bash
   # prep.sh
   set -euo pipefail

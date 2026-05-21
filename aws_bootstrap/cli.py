@@ -1824,10 +1824,38 @@ def cluster_launch(
             add_ssh_host(instance_id, public_ip, config.ssh_user, config.key_path, port=ssh_port, alias=alias)
         added.append({"rank": rank, "instance_id": instance_id, "public_ip": public_ip, "alias": alias})
 
+        # Run remote setup so the node has ~/venv + CUDA-matched PyTorch + torchrun
+        # (the cluster prepare/test/run pipeline depends on it). Same flow as the
+        # single-node `launch`; setup failure is non-fatal (node stays up).
+        if public_ip and config.run_setup and SETUP_SCRIPT.exists():
+            info(f"  rank {rank}: running remote setup on {instance_id}...")
+            if not wait_for_ssh(public_ip, config.ssh_user, config.key_path, port=ssh_port):
+                warn(f"  rank {rank}: SSH did not become available; skipping setup (node still running).")
+            elif run_remote_setup(
+                public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT, config.python_version, port=ssh_port
+            ):
+                success(f"  rank {rank}: remote setup complete.")
+            else:
+                warn(f"  rank {rank}: remote setup failed (node still running; re-run setup or check logs).")
+
     step(1, 1, f"Launching {to_add} node(s) for cluster '{cluster_id}' in {region} (placement group {pg_name})...")
-    cluster_mod.launch_cluster_nodes(
-        config, prepare_region, to_add, start_rank, launch_fn=launch_with_retry, on_node=on_node
-    )
+    try:
+        cluster_mod.launch_cluster_nodes(
+            config, prepare_region, to_add, start_rank, launch_fn=launch_with_retry, on_node=on_node
+        )
+    except CLIError as e:
+        # Partial progress: nodes already launched are tagged + aliased and billable.
+        if added:
+            warn(f"Launched {len(added)} of {to_add} requested node(s) before failing.")
+            info(
+                f"  Re-run to finish:  aws-bootstrap cluster launch --cluster-id {cluster_id} "
+                f"--nodes {nodes} --region {region}"
+            )
+            info(f"  Or roll back:      aws-bootstrap cluster terminate --cluster-id {cluster_id} --region {region}")
+        raise CLIError(
+            f"{e.format_message()}\n\n  (cluster nodes are AZ-pinned to {shared['az'] or region}; "
+            "a fresh cluster id can target a different AZ if capacity is short.)"
+        ) from None
 
     success(f"Cluster '{cluster_id}' now has {len(existing) + to_add} node(s).")
     if is_text(ctx):
@@ -1910,10 +1938,15 @@ def cluster_status(ctx, cluster_id, region, profile):
 @click.option("--region", default=None, help="AWS region.")
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.option("--yes", is_flag=True, default=False, help="Skip the confirmation prompt.")
-@click.option("--keep-ebs", is_flag=True, default=False, help="Preserve EBS data volumes.")
 @click.pass_context
-def cluster_terminate(ctx, cluster_id, region, profile, yes, keep_ebs):
-    """Terminate all nodes of a cluster and delete its placement group."""
+def cluster_terminate(ctx, cluster_id, region, profile, yes):
+    """Terminate all nodes of a cluster and delete its placement group.
+
+    Note: `cluster launch` does not create per-node EBS data volumes (yet), so
+    there are none to preserve/delete here. When per-node `--ebs-storage` lands,
+    this command will gain EBS cleanup + `--keep-ebs`, mirroring single-node
+    `terminate`.
+    """
     resolved = resolve_single_region(region, profile)
     ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
     nodes = find_cluster_instances(ec2, cluster_id)
@@ -1935,8 +1968,6 @@ def cluster_terminate(ctx, cluster_id, region, profile, yes, keep_ebs):
     delete_cluster_placement_group(ec2, cluster_mod.placement_group_name(cluster_id))
 
     success(f"Terminated {len(instance_ids)} node(s) of cluster '{cluster_id}'.")
-    if keep_ebs and is_text(ctx):
-        info("EBS data volumes preserved (per-node).")
     emit({"cluster_id": cluster_id, "region": resolved, "terminated": instance_ids}, ctx=ctx)
 
 
@@ -2037,8 +2068,8 @@ def cluster_prepare(ctx, cluster_id, region, profile, key_path, ssh_user, ssh_po
     node_ips = [n["PrivateIp"] for n in nodes]
     for n in nodes:
         env = cluster_mod.node_env(cluster_id, n["Rank"], len(nodes), gpus_per_node, node_ips, addr)
-        config_body = "\n".join(f"{k}={v}" for k, v in env.items())
-        write_cmd = f"cat > ~/.aws-bootstrap-cluster <<'EOF'\n{config_body}\nEOF"
+        config_body = cluster_mod.render_node_config(env)
+        write_cmd = f"cat > ~/.aws-bootstrap-cluster <<'AWSB_EOF'\n{config_body}\nAWSB_EOF"
         rc, _, err = run_on_host(n["PublicIp"], ssh_user, key, write_cmd, port=ssh_port)
         if rc != 0:
             warn(f"Could not write cluster config on {n['InstanceId']}: {err.strip()}")
