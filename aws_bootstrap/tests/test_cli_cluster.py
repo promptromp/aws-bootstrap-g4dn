@@ -63,6 +63,22 @@ def test_cluster_status_json_lists_nodes(runner):
     assert data["nodes"][0]["instance_id"] == "i-1"
 
 
+@pytest.mark.parametrize("fmt", ["json", "yaml", "table"])
+def test_cluster_status_renders_in_each_structured_format(runner, fmt):
+    with (
+        patch("aws_bootstrap.cli.boto3.Session"),
+        patch("aws_bootstrap.cli.find_cluster_instances", return_value=[_node(instance_id="i-aaa", rank=0)]),
+    ):
+        result = runner.invoke(main, ["-o", fmt, "cluster", "status", "--cluster-id", "ml1"])
+    assert result.exit_code == 0, result.output
+    # Each format surfaces the node's instance id (table mode via real columns,
+    # not a Python repr of the list).
+    assert "i-aaa" in result.output
+    if fmt == "table":
+        assert "Instance" in result.output  # column header, not a key-value dump
+        assert "'instance_id'" not in result.output  # not a dict repr
+
+
 def test_cluster_terminate_requires_yes_in_json_mode(runner):
     with (
         patch("aws_bootstrap.cli.boto3.Session"),

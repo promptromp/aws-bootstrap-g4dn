@@ -1899,6 +1899,7 @@ def cluster_launch(
             "node_count": len(existing) + to_add,
             "nodes": added,
         },
+        headers={"rank": "Rank", "instance_id": "Instance", "public_ip": "Public IP", "alias": "SSH Alias"},
         ctx=ctx,
     )
 
@@ -1942,6 +1943,14 @@ def cluster_status(ctx, cluster_id, region, profile):
                     for n in nodes
                 ],
             },
+            headers={
+                "rank": "Rank",
+                "instance_id": "Instance",
+                "state": "State",
+                "instance_type": "Type",
+                "az": "AZ",
+                "public_ip": "Public IP",
+            },
             ctx=ctx,
         )
         return
@@ -1958,6 +1967,7 @@ def cluster_status(ctx, cluster_id, region, profile):
             "region": resolved,
             "clusters": [{"cluster_id": cid, "node_count": len(nodes)} for cid, nodes in sorted(clusters.items())],
         },
+        headers={"cluster_id": "Cluster", "node_count": "Nodes"},
         ctx=ctx,
     )
 
@@ -2064,6 +2074,7 @@ def cluster_test(ctx, cluster_id, region, profile, key_path, ssh_user, ssh_port)
             "passed": passed,
             "results": [{"rank": r.rank, "instance_id": r.instance_id, "returncode": r.returncode} for r in results],
         },
+        headers={"rank": "Rank", "instance_id": "Instance", "returncode": "Exit"},
         ctx=ctx,
     )
     if not passed:
@@ -2253,6 +2264,7 @@ def cluster_run(
             "log_dir": str(out_dir),
             "results": [{"rank": r.rank, "instance_id": r.instance_id, "returncode": r.returncode} for r in results],
         },
+        headers={"rank": "Rank", "instance_id": "Instance", "returncode": "Exit"},
         ctx=ctx,
     )
     if not succeeded:

@@ -33,7 +33,7 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 | `aws-bootstrap quota show` | Show GPU vCPU quotas (all families) | `--family`, `--region/-r` (repeatable) |
 | `aws-bootstrap quota request` | Request a quota increase (per region) | `--family`, `--type`, `--desired-value`, `--region/-r` (repeatable), `--yes` |
 | `aws-bootstrap quota history` | Show quota increase request history | `--family`, `--type`, `--status`, `--region/-r` (repeatable) |
-| `aws-bootstrap cluster launch` | Launch/grow a multi-node training cluster (1 AZ + placement group) | `--cluster-id` (required), `--nodes`, `--instance-type`, `--region`, `--spot/--on-demand` |
+| `aws-bootstrap cluster launch` | Launch/grow a multi-node training cluster (1 AZ + placement group) | `--cluster-id` (required), `--nodes`, `--instance-type`, `--region`, `--spot/--on-demand`, `--wait`, `--wait-timeout` |
 | `aws-bootstrap cluster status` | Show cluster nodes (rank/state/AZ/IP); omit `--cluster-id` to list all clusters | `--cluster-id`, `--region` |
 | `aws-bootstrap cluster prepare` | Verify nodes (reachable/GPU/consistent CUDA), write config, run a distributed canary | `--cluster-id` (required), `--key-path`, `--no-canary` |
 | `aws-bootstrap cluster test` | Re-run the distributed canary across the cluster (heartbeat) | `--cluster-id` (required), `--key-path` |
@@ -68,9 +68,19 @@ aws-bootstrap -o json launch --dry-run
 
 # Terminate with --yes (required in structured output modes)
 aws-bootstrap -o json terminate --yes
+
+# All cluster commands support -o json/yaml/table too. Run a job and read
+# per-node exit codes programmatically (top-level "succeeded" is the gate):
+aws-bootstrap -o json cluster run --cluster-id ml1 train.py -- --epochs 5
+# -> {"cluster_id": "ml1", "succeeded": true, "log_dir": "...",
+#     "results": [{"rank": 0, "instance_id": "i-0", "returncode": 0}, ...]}
+
+# For spot clusters, use --wait so launch rides out capacity instead of
+# failing (it never silently falls back to on-demand):
+aws-bootstrap -o json cluster launch --cluster-id ml1 --nodes 2 --wait
 ```
 
-Commands requiring confirmation (`terminate`, `cleanup`) **must include `--yes`** when using `--output json/yaml/table`.
+Commands requiring confirmation (`terminate`, `cleanup`, `cluster terminate`) **must include `--yes`** when using `--output json/yaml/table`.
 
 ## Common Workflows
 

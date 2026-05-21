@@ -504,6 +504,8 @@ Launch (or incrementally grow) a multi-node training cluster: N GPU instances ta
 | `--no-setup` | flag | false | Skip remote setup |
 | `--ssh-port` | int | `22` | SSH port |
 | `--python-version` | string | none | Python version for remote venv |
+| `--wait` | flag | false | On spot capacity shortfall, retry each node with backoff until `--wait-timeout` (no on-demand prompt/fallback) |
+| `--wait-timeout` | duration | `30m` | Max wait per node for spot capacity when `--wait` is set (e.g. `30m`, `1h`) |
 
 ### JSON Output
 
