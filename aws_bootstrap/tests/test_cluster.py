@@ -157,3 +157,76 @@ def test_canary_resource_is_valid_python():
     assert 'if __name__ == "__main__"' in src
     assert "init_process_group" in src
     assert "all_reduce" in src
+
+
+# ---------------------------------------------------------------------------
+# Parallel multi-node execution + canary orchestration
+# ---------------------------------------------------------------------------
+
+
+def test_run_on_all_nodes_collects_results_in_order():
+    nodes = [{"Rank": 0, "InstanceId": "i-0"}, {"Rank": 1, "InstanceId": "i-1"}]
+
+    def run_fn(node, command):
+        return (0, f"out-{node['InstanceId']}", "")
+
+    results = cluster.run_on_all_nodes(nodes, lambda node: "echo hi", run_fn=run_fn)
+    assert [r.instance_id for r in results] == ["i-0", "i-1"]
+    assert [r.returncode for r in results] == [0, 0]
+    assert results[0].stdout == "out-i-0"
+
+
+def test_run_on_all_nodes_reports_failures():
+    nodes = [{"Rank": 0, "InstanceId": "i-0"}, {"Rank": 1, "InstanceId": "i-1"}]
+
+    def run_fn(node, command):
+        return (0 if node["Rank"] == 0 else 1, "", "boom" if node["Rank"] == 1 else "")
+
+    results = cluster.run_on_all_nodes(nodes, lambda node: "x", run_fn=run_fn)
+    assert results[0].returncode == 0
+    assert results[1].returncode == 1
+    assert results[1].stderr == "boom"
+
+
+def test_run_canary_scps_and_runs_torchrun_on_all_nodes():
+    nodes = [
+        {"Rank": 0, "InstanceId": "i-0", "PrivateIp": "10.0.0.5", "PublicIp": "1.1.1.1"},
+        {"Rank": 1, "InstanceId": "i-1", "PrivateIp": "10.0.0.6", "PublicIp": "2.2.2.2"},
+    ]
+    scped: list[str] = []
+    ran: list[str] = []
+
+    def scp_fn(node, local, remote):
+        scped.append(node["InstanceId"])
+        return True
+
+    def run_fn(node, command):
+        ran.append(command)
+        return (0, f"[canary] rank ok {node['Rank']}", "")
+
+    results = cluster.run_canary(
+        nodes, cluster_id="ml1", nproc_per_node=1, rdzv_port=29400, scp_fn=scp_fn, run_fn=run_fn
+    )
+    assert scped == ["i-0", "i-1"]
+    assert all("--rdzv-endpoint=10.0.0.5:29400" in c for c in ran)
+    assert all("cluster_canary.py" in c for c in ran)
+    assert all(r.returncode == 0 for r in results)
+
+
+def test_run_canary_scp_failure_aborts():
+    nodes = [{"Rank": 0, "InstanceId": "i-0", "PrivateIp": "10.0.0.5", "PublicIp": "1.1.1.1"}]
+
+    def scp_fn(node, local, remote):
+        return False
+
+    ran: list[str] = []
+
+    def run_fn(node, command):
+        ran.append(command)
+        return (0, "", "")
+
+    results = cluster.run_canary(
+        nodes, cluster_id="ml1", nproc_per_node=1, rdzv_port=29400, scp_fn=scp_fn, run_fn=run_fn
+    )
+    assert ran == []
+    assert results[0].returncode != 0
