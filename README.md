@@ -428,6 +428,13 @@ aws-bootstrap cluster prepare --cluster-id ml1
 # Re-run the canary any time as a heartbeat
 aws-bootstrap cluster test --cluster-id ml1
 
+# Run your own training script across all nodes (torchrun, c10d rendezvous).
+# Args after `--` are passed to your script; per-node logs land under --log-dir.
+aws-bootstrap cluster run --cluster-id ml1 train.py -- --epochs 5
+
+# ...with a data-prep step that runs on each node first (e.g. pull from S3 to /data)
+aws-bootstrap cluster run --cluster-id ml1 --data-script prep.sh train.py -- --epochs 5
+
 # Tear it all down (nodes, SSH aliases, placement group)
 aws-bootstrap cluster terminate --cluster-id ml1 --yes
 ```
@@ -438,10 +445,16 @@ Key behaviors:
 - **Per-node SSH aliases** — each node gets an `aws-<cluster-id>-<rank>` alias in `~/.ssh/config` (e.g. `ssh aws-ml1-0`).
 - **Stable ranks** — nodes are tagged with a stable rank (`0..N-1`); rank 0 is the rendezvous/master node (it also trains).
 - **Verify before you train** — `cluster prepare` checks every node is reachable, has a GPU, and runs a **consistent** CUDA version (it fails fast on version skew), writes a per-node cluster config, then runs a built-in distributed **canary** (a tiny DDP all-reduce + a few SGD steps across all nodes) to prove NCCL/rendezvous works end-to-end. `cluster test` re-runs that canary on demand.
-- **`torchrun` c10d rendezvous** — the canary (and, in a later phase, your training job) runs the *same* `torchrun` command on every node simultaneously, pointed at rank 0's private IP; the rendezvous assigns global ranks.
+- **`cluster run` — distributed training** — distributes your `SCRIPT` to every node and runs it across the cluster. A `.py` script is launched with `torchrun` (c10d rendezvous, all nodes pointed at rank 0); a `.sh` script runs as-is with the `AWSB_*` environment contract exported (`AWSB_NODE_RANK`, `AWSB_NUM_NODES`, `AWSB_NUM_GPUS_PER_NODE`, `AWSB_NODE_IPS`, `AWSB_MASTER_ADDR`) so you can wire up any launcher. Per-node stdout/stderr are saved under `--log-dir`.
+- **Data-prep convention** — pass `--data-script prep.sh` and it's copied to every node and run **once, before training** (it's a barrier — training won't start until all nodes finish prep). The recommended pattern is an idempotent S3 pull into the per-node `/data` EBS mount:
+  ```bash
+  # prep.sh
+  set -euo pipefail
+  test -f /data/.prepared && exit 0
+  aws s3 sync s3://my-bucket/dataset /data/dataset
+  touch /data/.prepared
+  ```
 - **EFA / AZ caveat** — `g4dn`/`g5` instances run NCCL over ordinary VPC networking (EFA is essentially P-series only), which is fine for dev/learning/modest scale. Pinning to one AZ means a spot shortage there affects the whole cluster.
-
-> Preview scope: ships `cluster launch` / `status` / `prepare` / `test` / `terminate`. Running arbitrary distributed training jobs (`cluster run <your_train.py>`, with a data-prep convention and log streaming) lands in a subsequent release.
 
 ## EC2 vCPU Quotas
 

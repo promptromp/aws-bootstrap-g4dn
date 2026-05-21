@@ -37,19 +37,21 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 | `aws-bootstrap cluster status` | Show cluster nodes (rank/state/AZ/IP); omit `--cluster-id` to list all clusters | `--cluster-id`, `--region` |
 | `aws-bootstrap cluster prepare` | Verify nodes (reachable/GPU/consistent CUDA), write config, run a distributed canary | `--cluster-id` (required), `--key-path`, `--no-canary` |
 | `aws-bootstrap cluster test` | Re-run the distributed canary across the cluster (heartbeat) | `--cluster-id` (required), `--key-path` |
+| `aws-bootstrap cluster run` | Distribute a training script + run it across the cluster (torchrun) | `--cluster-id` (required), `SCRIPT`, `-- ARGS`, `--data-script`, `--nproc-per-node`, `--log-dir` |
 | `aws-bootstrap cluster terminate` | Terminate all cluster nodes + delete placement group | `--cluster-id` (required), `--keep-ebs`, `--yes` |
 
 **Global options** (before the command): `--output json|yaml|table|text`, `--profile`, `--region`
 
 ### Multi-node clusters (preview)
 
-`cluster launch` provisions N GPU instances tagged with a shared `--cluster-id`, all in **one AZ inside a cluster placement group**, with a self-referencing security-group rule so they can run distributed `torchrun` jobs. Tags are the source of truth (no state file); re-run `cluster launch` with a higher `--nodes` to grow incrementally. Each node gets an `aws-<cluster-id>-<rank>` SSH alias; rank 0 is the rendezvous/master node. `cluster prepare` verifies the cluster (reachable, GPU, consistent CUDA — fails fast on skew) and runs a built-in distributed **canary** (DDP all-reduce + a few SGD steps via `torchrun` c10d rendezvous on all nodes); `cluster test` re-runs that canary. Running arbitrary user training scripts (`cluster run`) is a later phase.
+`cluster launch` provisions N GPU instances tagged with a shared `--cluster-id`, all in **one AZ inside a cluster placement group**, with a self-referencing security-group rule so they can run distributed `torchrun` jobs. Tags are the source of truth (no state file); re-run `cluster launch` with a higher `--nodes` to grow incrementally. Each node gets an `aws-<cluster-id>-<rank>` SSH alias; rank 0 is the rendezvous/master node. `cluster prepare` verifies the cluster (reachable, GPU, consistent CUDA — fails fast on skew) and runs a built-in distributed **canary** (DDP all-reduce + a few SGD steps via `torchrun` c10d rendezvous on all nodes); `cluster test` re-runs that canary. `cluster run SCRIPT` distributes your training script to every node and runs it across the cluster: a `.py` is launched with `torchrun`; a `.sh` runs as-is with the `AWSB_*` env contract exported (escape hatch). `--data-script prep.sh` runs once per node (idempotent, before training — recommended: pull data from S3 to `/data`). Per-node logs land under `--log-dir`.
 
 ```bash
 aws-bootstrap cluster launch --cluster-id ml1 --nodes 4 --instance-type g5.xlarge --region us-east-1
 aws-bootstrap -o json cluster status --cluster-id ml1
-aws-bootstrap cluster prepare --cluster-id ml1   # verify + canary
-aws-bootstrap cluster test --cluster-id ml1      # re-run canary
+aws-bootstrap cluster prepare --cluster-id ml1                          # verify + canary
+aws-bootstrap cluster test --cluster-id ml1                             # re-run canary
+aws-bootstrap cluster run --cluster-id ml1 --data-script prep.sh train.py -- --epochs 5
 aws-bootstrap cluster terminate --cluster-id ml1 --yes
 ```
 

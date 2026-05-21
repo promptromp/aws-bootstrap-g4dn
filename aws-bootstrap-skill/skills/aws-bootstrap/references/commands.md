@@ -605,6 +605,43 @@ Exits non-zero if any node's canary returns non-zero.
 
 ---
 
+## `aws-bootstrap cluster run`
+
+Distribute a training `SCRIPT` to every node and run it across the cluster. A `.py` script is launched with `torchrun` (c10d rendezvous, endpoint = rank-0 private IP); a `.sh` script runs as-is with the `AWSB_*` env contract exported. With `--data-script`, a prep script runs on every node first (a barrier; training won't start until all preps succeed). Per-node logs are written under `--log-dir`.
+
+### Usage
+
+```bash
+aws-bootstrap cluster run --cluster-id ml1 [--data-script prep.sh] train.py -- --epochs 5
+```
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--cluster-id` | string | (required) | Cluster id |
+| `SCRIPT` | path (arg) | (required) | Local training script (`.py` → torchrun; `.sh` → env escape hatch) |
+| `ARGS` | passthrough | none | Args after `--` are passed to the script |
+| `--data-script` | path | none | Script copied + run on each node before training (idempotent) |
+| `--nproc-per-node` | int | `1` | Processes (GPUs) per node |
+| `--log-dir` | path | `.aws-bootstrap/clusters` | Local dir for per-node logs (`<log-dir>/<cluster-id>/rank<N>.log`) |
+| `--region` / `--profile` / `--key-path` / `--ssh-user` / `--ssh-port` | | | Standard connection options |
+
+### Env contract (`.sh` escape hatch)
+
+Each node has these exported: `AWSB_CLUSTER_ID`, `AWSB_NODE_RANK`, `AWSB_NUM_NODES`, `AWSB_NUM_GPUS_PER_NODE`, `AWSB_NODE_IPS` (newline-separated, rank order), `AWSB_MASTER_ADDR` (rank-0 private IP).
+
+### JSON Output
+
+```json
+{"cluster_id": "ml1", "succeeded": true, "log_dir": ".aws-bootstrap/clusters/ml1",
+ "results": [{"rank": 0, "instance_id": "i-0abc", "returncode": 0}]}
+```
+
+Exits non-zero if any node returns non-zero (or if SCP/data-prep fails).
+
+---
+
 ## `aws-bootstrap cluster terminate`
 
 Terminate all nodes of a cluster, remove their SSH aliases, and delete the placement group.

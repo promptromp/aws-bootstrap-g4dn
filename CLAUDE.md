@@ -219,7 +219,7 @@ The `terminate` command discovers volumes via `find_ebs_volumes_for_instance`, w
 
 ## Multi-Node Training Clusters (`cluster` group)
 
-The `cluster` command group (`cluster.py` + the `cluster` Click group in `cli.py`) launches and manages multiple GPU instances as a coordinated cluster for multi-node distributed training (`torchrun`). Ships `cluster launch` / `status` / `prepare` / `test` / `terminate`; `cluster run` (arbitrary user training scripts + data-prep + log streaming) is a later phase.
+The `cluster` command group (`cluster.py` + the `cluster` Click group in `cli.py`) launches and manages multiple GPU instances as a coordinated cluster for multi-node distributed training (`torchrun`). Ships the full MVP: `cluster launch` / `status` / `prepare` / `test` / `run` / `terminate`.
 
 - **`cluster.py`** — composition logic only: pure helpers (`placement_group_name`, `node_alias`, `nodes_to_add`) and the launch fan-out (`launch_cluster_nodes`, which calls an injectable `launch_fn` per node and assigns sequential ranks). It imports `ec2` (one-directional: `ec2.py` does **not** import `cluster.py`, which is why the placement-group helpers take an already-derived name rather than a `cluster_id`).
 - **Identity = tags, not state.** A cluster is an arbitrary `--cluster-id` stored as the `TAG_CLUSTER_ID` (`aws-bootstrap-cluster`) tag; each node also carries `TAG_CLUSTER_RANK` (`aws-bootstrap-cluster-rank`). `find_cluster_instances` / `list_clusters` (in `ec2.py`) discover and group by these tags. No local cluster state file.
@@ -238,6 +238,13 @@ The `cluster` command group (`cluster.py` + the `cluster` Click group in `cli.py
 - **Canary.** `resources/cluster_canary.py` is a tiny DDP job (process-group init + all-reduce correctness check + a few SGD steps; exits non-zero on failure). `cluster.run_canary(...)` SCPs it to every node and runs the torchrun command in parallel (activating `~/venv` first, since non-interactive ssh doesn't source `~/.bashrc`). `cluster test` runs it standalone; `cluster prepare` runs it after verification.
 - **`cluster prepare`** queries each node's GPU/CUDA via `query_gpu_info`, fails on `cluster.detect_version_skew` (inconsistent CUDA across nodes), writes the `AWSB_*` env contract (`cluster.node_env`) to `~/.aws-bootstrap-cluster` on each node (for the later `cluster run`), then auto-runs the canary (`--no-canary` skips it).
 - **`RDZV_PORT`** (`29400`) is the c10d rendezvous port; the SG self-rule (Phase 1) makes it reachable between nodes.
+
+### Run (distributed training jobs)
+
+- **`cluster.run_distributed_job(...)`** is the general runner; `run_canary` now delegates to it (DRY). Steps: SCP the script to all nodes → (optional) SCP+run a `--data-script` on every node in parallel as a **barrier** (training won't start until all preps succeed) → run the training command on all nodes in parallel.
+- **`_job_command_for(node, ...)`** picks the per-node command: a `.py` script → `build_torchrun_command` (identical on every node, c10d); a `.sh` script → the **escape hatch** (`node_env` `AWSB_*` exports + `bash script.sh`, so the user can drive any launcher). Both prepend `source ~/venv/bin/activate`.
+- **`cli.cluster_run`** resolves nodes, calls `run_distributed_job`, writes per-node logs to `<--log-dir>/<cluster-id>/rank<N>.log`, echoes rank-0 stdout, and exits non-zero if any node failed. `context_settings={"ignore_unknown_options": True}` + a trailing `script_args` (`nargs=-1`) lets training args pass through after `--`.
+- **Deferred (not yet):** `--detach`/live log streaming/`cluster logs`/`--poll-interval` (the synchronous run with per-node log files is the MVP); auto-detecting `--nproc-per-node` from `prepare`'s written config (defaults to 1).
 
 ## Agent Skill (Claude Code Plugin)
 
