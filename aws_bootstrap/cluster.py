@@ -11,6 +11,7 @@ fan-out). AWS primitives live in :mod:`aws_bootstrap.ec2`; CLI wiring lives in
 """
 
 from __future__ import annotations
+import shlex
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -22,6 +23,7 @@ from .ec2 import RegionContext, RegionLaunch, launch_with_retry
 
 CANARY_RESOURCE = Path(__file__).parent / "resources" / "cluster_canary.py"
 _REMOTE_CANARY = "/tmp/cluster_canary.py"  # noqa: S108 (well-known remote staging path)
+_REMOTE_DATA_PREP = "/tmp/data_prep.sh"  # noqa: S108
 
 
 def placement_group_name(cluster_id: str) -> str:
@@ -168,6 +170,88 @@ def run_on_all_nodes(
     return [r for r in results if r is not None]
 
 
+def _job_command_for(
+    node: dict,
+    *,
+    cluster_id: str,
+    nodes: list[dict],
+    nproc_per_node: int,
+    rdzv_port: int,
+    remote_script: str,
+    script_args: list[str] | None,
+) -> str:
+    """Remote command for one node: activate the venv, then ``torchrun`` (``.py``)
+    or an ``AWSB_*``-env-injected ``bash`` (``.sh`` escape hatch).
+
+    ``~/.bashrc`` is not sourced for non-interactive ssh, so the venv must be
+    activated explicitly to put ``torchrun``/``torch`` on PATH.
+    """
+    activate = "source ~/venv/bin/activate 2>/dev/null"
+    addr = master_addr(nodes)
+    if remote_script.endswith(".sh"):
+        env = node_env(cluster_id, node["Rank"], len(nodes), nproc_per_node, [n["PrivateIp"] for n in nodes], addr)
+        exports = " ".join(f"export {k}={shlex.quote(v)};" for k, v in env.items())
+        args = " ".join(script_args) if script_args else ""
+        body = f"{exports} bash {remote_script} {args}".rstrip()
+    else:
+        body = build_torchrun_command(
+            remote_script, len(nodes), nproc_per_node, addr, cluster_id, rdzv_port, script_args
+        )
+    return f"{activate}; {body}"
+
+
+def run_distributed_job(
+    nodes: list[dict],
+    *,
+    cluster_id: str,
+    nproc_per_node: int,
+    rdzv_port: int,
+    local_script: Path,
+    remote_script: str,
+    script_args: list[str] | None,
+    scp_fn: Callable[[dict, Path, str], bool],
+    run_fn: Callable[[dict, str], tuple[int, str, str]],
+    data_script: Path | None = None,
+) -> list[NodeResult]:
+    """Distribute ``local_script`` to every node and run it across the cluster.
+
+    Steps: (1) SCP the script to all nodes; (2) if ``data_script`` is given, SCP
+    and run it on every node in parallel (a barrier — training does not start
+    until all preps succeed); (3) run the training command on all nodes in
+    parallel (``torchrun`` for ``.py``; an ``AWSB_*``-env-injected ``bash`` for
+    ``.sh``). Any SCP/prep failure short-circuits with failed ``NodeResult``s.
+    ``scp_fn``/``run_fn`` are injected (production wraps the ``ssh`` primitives).
+    """
+    if any(not scp_fn(n, local_script, remote_script) for n in nodes):
+        return [
+            NodeResult(n["InstanceId"], n["Rank"], 1, "", f"failed to copy script to {n['InstanceId']}") for n in nodes
+        ]
+
+    if data_script is not None:
+        if any(not scp_fn(n, data_script, _REMOTE_DATA_PREP) for n in nodes):
+            return [
+                NodeResult(n["InstanceId"], n["Rank"], 1, "", f"failed to copy data-prep to {n['InstanceId']}")
+                for n in nodes
+            ]
+        prep_cmd = f"source ~/venv/bin/activate 2>/dev/null; bash {_REMOTE_DATA_PREP}"
+        prep = run_on_all_nodes(nodes, lambda node: prep_cmd, run_fn=run_fn)
+        if any(r.returncode != 0 for r in prep):
+            return prep
+
+    def command_for(node: dict) -> str:
+        return _job_command_for(
+            node,
+            cluster_id=cluster_id,
+            nodes=nodes,
+            nproc_per_node=nproc_per_node,
+            rdzv_port=rdzv_port,
+            remote_script=remote_script,
+            script_args=script_args,
+        )
+
+    return run_on_all_nodes(nodes, command_for, run_fn=run_fn)
+
+
 def run_canary(
     nodes: list[dict],
     *,
@@ -178,28 +262,15 @@ def run_canary(
     run_fn: Callable[[dict, str], tuple[int, str, str]],
     canary_path: Path = CANARY_RESOURCE,
 ) -> list[NodeResult]:
-    """SCP the canary to every node, then run torchrun on all nodes in parallel.
-
-    ``scp_fn(node, local, remote) -> bool`` and ``run_fn(node, command)`` are
-    injected (production wraps :func:`ssh.scp_to_host` / :func:`ssh.run_on_host`).
-    If SCP fails on any node, torchrun is not started and every node is reported
-    as failed.
-    """
-    if any(not scp_fn(n, canary_path, _REMOTE_CANARY) for n in nodes):
-        return [
-            NodeResult(n["InstanceId"], n["Rank"], 1, "", f"failed to copy canary to {n['InstanceId']}") for n in nodes
-        ]
-
-    addr = master_addr(nodes)
-    command = build_torchrun_command(
-        script=_REMOTE_CANARY,
-        num_nodes=len(nodes),
+    """Run the built-in canary — a distributed job with the shipped canary script."""
+    return run_distributed_job(
+        nodes,
+        cluster_id=cluster_id,
         nproc_per_node=nproc_per_node,
-        master_addr=addr,
-        rdzv_id=cluster_id,
         rdzv_port=rdzv_port,
+        local_script=canary_path,
+        remote_script=_REMOTE_CANARY,
+        script_args=None,
+        scp_fn=scp_fn,
+        run_fn=run_fn,
     )
-    # Activate the remote venv so torchrun/torch are on PATH (~/.bashrc is not
-    # sourced for non-interactive ssh).
-    wrapped = f"source ~/venv/bin/activate 2>/dev/null; {command}"
-    return run_on_all_nodes(nodes, lambda node: wrapped, run_fn=run_fn)

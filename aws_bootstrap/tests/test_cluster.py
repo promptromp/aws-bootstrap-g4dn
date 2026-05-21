@@ -230,3 +230,126 @@ def test_run_canary_scp_failure_aborts():
     )
     assert ran == []
     assert results[0].returncode != 0
+
+
+# ---------------------------------------------------------------------------
+# run_distributed_job (general runner; run_canary delegates to it)
+# ---------------------------------------------------------------------------
+
+
+def _twonode():
+    return [
+        {"Rank": 0, "InstanceId": "i-0", "PrivateIp": "10.0.0.5", "PublicIp": "1.1.1.1"},
+        {"Rank": 1, "InstanceId": "i-1", "PrivateIp": "10.0.0.6", "PublicIp": "2.2.2.2"},
+    ]
+
+
+def test_run_distributed_job_py_uses_torchrun():
+    ran: list[str] = []
+
+    def run_fn(node, command):
+        ran.append(command)
+        return (0, "done", "")
+
+    results = cluster.run_distributed_job(
+        _twonode(),
+        cluster_id="ml1",
+        nproc_per_node=1,
+        rdzv_port=29400,
+        local_script=Path("train.py"),
+        remote_script="/tmp/train.py",
+        script_args=["--epochs", "2"],
+        scp_fn=lambda n, ll, r: True,
+        run_fn=run_fn,
+    )
+    assert all(r.returncode == 0 for r in results)
+    assert all("torchrun" in c and "/tmp/train.py --epochs 2" in c for c in ran)
+    assert all("--rdzv-endpoint=10.0.0.5:29400" in c for c in ran)
+
+
+def test_run_distributed_job_sh_uses_escape_hatch_env():
+    ran: list[str] = []
+
+    def run_fn(node, command):
+        ran.append(command)
+        return (0, "", "")
+
+    cluster.run_distributed_job(
+        _twonode(),
+        cluster_id="ml1",
+        nproc_per_node=1,
+        rdzv_port=29400,
+        local_script=Path("job.sh"),
+        remote_script="/tmp/job.sh",
+        script_args=None,
+        scp_fn=lambda n, ll, r: True,
+        run_fn=run_fn,
+    )
+    assert all("bash /tmp/job.sh" in c for c in ran)
+    assert all("AWSB_MASTER_ADDR=10.0.0.5" in c for c in ran)
+    assert any("AWSB_NODE_RANK=0" in c for c in ran) and any("AWSB_NODE_RANK=1" in c for c in ran)
+    assert all("torchrun" not in c for c in ran)
+
+
+def test_run_distributed_job_runs_data_prep_before_training():
+    calls: list[str] = []
+
+    def run_fn(node, command):
+        calls.append(command)
+        return (0, "", "")
+
+    cluster.run_distributed_job(
+        _twonode(),
+        cluster_id="ml1",
+        nproc_per_node=1,
+        rdzv_port=29400,
+        local_script=Path("train.py"),
+        remote_script="/tmp/train.py",
+        script_args=None,
+        scp_fn=lambda n, ll, r: True,
+        run_fn=run_fn,
+        data_script=Path("prep.sh"),
+    )
+    assert sum("data_prep.sh" in c for c in calls) == 2
+    assert sum("torchrun" in c for c in calls) == 2
+    # Training only after every node's data-prep finished.
+    assert calls.index(next(c for c in calls if "torchrun" in c)) >= 2
+
+
+def test_run_distributed_job_aborts_if_data_prep_fails():
+    ran: list[str] = []
+
+    def run_fn(node, command):
+        ran.append(command)
+        if "data_prep.sh" in command:
+            return (1, "", "prep failed")
+        return (0, "", "")
+
+    results = cluster.run_distributed_job(
+        _twonode(),
+        cluster_id="ml1",
+        nproc_per_node=1,
+        rdzv_port=29400,
+        local_script=Path("train.py"),
+        remote_script="/tmp/train.py",
+        script_args=None,
+        scp_fn=lambda n, ll, r: True,
+        run_fn=run_fn,
+        data_script=Path("prep.sh"),
+    )
+    assert all(r.returncode != 0 for r in results)
+    assert all("torchrun" not in c for c in ran)
+
+
+def test_run_canary_still_passes_after_refactor():
+    ran: list[str] = []
+    results = cluster.run_canary(
+        _twonode(),
+        cluster_id="ml1",
+        nproc_per_node=1,
+        rdzv_port=29400,
+        scp_fn=lambda n, ll, r: True,
+        run_fn=lambda n, c: ran.append(c) or (0, "ok", ""),
+    )
+    assert all(r.returncode == 0 for r in results)
+    assert all("cluster_canary.py" in c for c in ran)
