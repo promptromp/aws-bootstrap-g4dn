@@ -11,12 +11,16 @@ import pytest
 
 from aws_bootstrap.config import LaunchConfig
 from aws_bootstrap.ec2 import (
+    CapacityError,
     CLIError,
+    RegionContext,
+    RegionLaunch,
     find_tagged_instances,
     find_tagged_instances_in_regions,
     get_latest_ami,
     get_spot_price,
     launch_instance,
+    launch_with_retry,
     list_amis,
     list_enabled_regions,
     list_instance_types,
@@ -149,6 +153,255 @@ def test_launch_instance_insufficient_capacity_on_demand_retry(_mock_is_text):
     config = LaunchConfig(spot=True, instance_type="p5.4xlarge")
     with pytest.raises(click.ClickException, match="Neither spot nor on-demand"):
         launch_instance(ec2, config, "ami-test", "sg-test")
+
+
+def _region_ctx(region: str, run_side_effect):
+    """RegionContext whose ec2 client's run_instances has the given side effect."""
+    client = MagicMock()
+    client.run_instances.side_effect = run_side_effect
+    return RegionContext(
+        region=region, ec2_client=client, ami={"ImageId": f"ami-{region}"}, sg_id="sg-1", key_name="aws-bootstrap-key"
+    )
+
+
+def _ok_instance(instance_id="i-ok"):
+    return {"Instances": [{"InstanceId": instance_id}]}
+
+
+def test_launch_with_retry_falls_through_to_second_region_on_capacity():
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
+        "us-east-1": _region_ctx("us-east-1", [_ok_instance("i-east")]),
+    }
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True)
+    calls: list[str] = []
+
+    result = launch_with_retry(
+        config,
+        lambda r: contexts[r],
+        on_attempt=lambda region, market, attempt: calls.append(f"{region}:{market}"),
+    )
+    assert isinstance(result, RegionLaunch)
+    assert result.region == "us-east-1"
+    assert result.instance["InstanceId"] == "i-east"
+    assert result.pricing == "spot"
+    assert calls == ["us-west-2:spot", "us-east-1:spot"]
+
+
+def test_launch_with_retry_quota_skips_to_next_region():
+    """A per-region quota error moves on to the next region (no longer fail-fast)."""
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("VcpuLimitExceeded")),
+        "us-east-1": _region_ctx("us-east-1", [_ok_instance("i-east")]),
+    }
+    fatal: list[tuple[str, str]] = []
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False)
+    result = launch_with_retry(
+        config,
+        lambda r: contexts[r],
+        on_region_fatal=lambda region, kind, msg: fatal.append((region, kind)),
+    )
+    assert result.region == "us-east-1"
+    contexts["us-east-1"].ec2_client.run_instances.assert_called_once()
+    assert fatal == [("us-west-2", "quota")]
+
+
+def test_launch_with_retry_all_regions_quota_aggregated_hard_fail():
+    """Every region quota-blocked -> hard fail listing each region + pinned hints."""
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("VcpuLimitExceeded")),
+        "us-east-1": _region_ctx("us-east-1", _make_client_error("VcpuLimitExceeded")),
+    }
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False, instance_type="g4dn.xlarge")
+    with pytest.raises(click.ClickException) as exc:
+        launch_with_retry(config, lambda r: contexts[r])
+    msg = exc.value.format_message()
+    assert "us-west-2: on-demand quota exceeded" in msg
+    assert "us-east-1: on-demand quota exceeded" in msg
+    assert "aws-bootstrap quota show --family gvt --region us-west-2" in msg
+    assert "aws-bootstrap quota show --family gvt --region us-east-1" in msg
+
+
+def test_launch_with_retry_spot_price_skips_to_next_region():
+    """SpotMaxPriceTooLow is region-fatal but the next region is still tried."""
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("SpotMaxPriceTooLow")),
+        "us-east-1": _region_ctx("us-east-1", [_ok_instance("i-east")]),
+    }
+    fatal: list[tuple[str, str]] = []
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True)
+    result = launch_with_retry(
+        config,
+        lambda r: contexts[r],
+        on_region_fatal=lambda region, kind, msg: fatal.append((region, kind)),
+    )
+    assert result.region == "us-east-1"
+    assert result.pricing == "spot"
+    assert fatal == [("us-west-2", "price")]
+
+
+def test_launch_with_retry_single_region_price_emits_hint_then_fails():
+    """Price-fatal single region: hint surfaced via callback, then hard fail."""
+    ctx = _region_ctx("us-west-2", _make_client_error("SpotMaxPriceTooLow"))
+    config = LaunchConfig(regions=("us-west-2",), spot=True)
+    fatal: list[tuple[str, str, str]] = []
+    with pytest.raises(click.ClickException, match="Launch cancelled"):
+        launch_with_retry(
+            config,
+            lambda r: ctx,
+            on_region_fatal=lambda region, kind, msg: fatal.append((region, kind, msg)),
+            confirm_on_demand=lambda: False,
+        )
+    assert fatal[0][0] == "us-west-2"
+    assert fatal[0][1] == "price"
+    assert "exceeds the default maximum" in fatal[0][2]
+
+
+def test_launch_with_retry_on_demand_quota_aggregated_after_spot_capacity():
+    """Spot capacity miss -> on-demand fallback hits quota -> aggregated hint."""
+    contexts = {
+        "us-west-2": _region_ctx(
+            "us-west-2",
+            [_make_client_error("InsufficientInstanceCapacity"), _make_client_error("VcpuLimitExceeded")],
+        ),
+    }
+    config = LaunchConfig(regions=("us-west-2",), spot=True, instance_type="g4dn.xlarge")
+    with pytest.raises(click.ClickException) as exc:
+        launch_with_retry(config, lambda r: contexts[r], confirm_on_demand=lambda: True)
+    msg = exc.value.format_message()
+    assert "on-demand quota exceeded" in msg
+    assert "aws-bootstrap quota show --family gvt --region us-west-2" in msg
+
+
+def test_launch_with_retry_wait_only_retries_capacity_regions():
+    """With --wait, quota-blocked regions are dropped; only capacity-limited
+    regions are re-swept, and on_wait reports retried vs skipped accurately
+    (regression: heartbeat used to list every region as if still swept)."""
+    contexts = {
+        "us-east-1": _region_ctx("us-east-1", _make_client_error("MaxSpotInstanceCountExceeded")),
+        "us-west-1": _region_ctx("us-west-1", _make_client_error("MaxSpotInstanceCountExceeded")),
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
+    }
+    config = LaunchConfig(regions=("us-east-1", "us-west-1", "us-west-2"), spot=True, wait=True, wait_timeout=100)
+    ticks = iter([0.0, 0.0, 150.0])
+    waits: list[tuple] = []
+    with pytest.raises(click.ClickException, match="within 100s"):
+        launch_with_retry(
+            config,
+            lambda r: contexts[r],
+            on_wait=lambda c, s, e, retrying, skipped: waits.append((tuple(retrying), tuple(skipped))),
+            sleeper=lambda _s: None,
+            clock=lambda: next(ticks),
+            rng=__import__("random").Random(0),
+        )
+    assert waits == [(("us-west-2",), ("us-east-1", "us-west-1"))]
+    # Quota-fatal regions attempted once only (not re-swept each cycle).
+    contexts["us-east-1"].ec2_client.run_instances.assert_called_once()
+    contexts["us-west-1"].ec2_client.run_instances.assert_called_once()
+    assert contexts["us-west-2"].ec2_client.run_instances.call_count >= 2
+
+
+def test_launch_with_retry_wait_times_out_hard_fail():
+    ctx = _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity"))
+    config = LaunchConfig(regions=("us-west-2",), spot=True, wait=True, wait_timeout=100)
+    ticks = iter([0.0, 0.0, 150.0])  # start, check#1 (<100 -> one wait), check#2 (>=100 -> timeout)
+    slept: list[float] = []
+    waits: list[tuple] = []
+
+    with pytest.raises(click.ClickException, match="within 100s"):
+        launch_with_retry(
+            config,
+            lambda r: ctx,
+            on_wait=lambda cycle, s, e, retrying, skipped: waits.append((cycle, tuple(retrying), tuple(skipped))),
+            sleeper=slept.append,
+            clock=lambda: next(ticks),
+            rng=__import__("random").Random(0),
+        )
+    assert slept, "expected at least one backoff sleep before timeout"
+    # One wait cycle; only the capacity-limited region is retried, none skipped.
+    assert waits == [(1, ("us-west-2",), ())]
+
+
+def test_launch_with_retry_no_wait_on_demand_fallback_across_regions():
+    contexts = {
+        # [spot attempt, on-demand attempt]
+        "us-west-2": _region_ctx(
+            "us-west-2",
+            [
+                _make_client_error("InsufficientInstanceCapacity"),
+                _make_client_error("InsufficientInstanceCapacity"),
+            ],
+        ),
+        "us-east-1": _region_ctx(
+            "us-east-1",
+            [_make_client_error("InsufficientInstanceCapacity"), _ok_instance("i-od")],
+        ),
+    }
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True)
+
+    result = launch_with_retry(
+        config,
+        lambda r: contexts[r],
+        confirm_on_demand=lambda: True,
+    )
+    assert result.region == "us-east-1"
+    assert result.pricing == "on-demand"
+
+
+def test_launch_with_retry_declined_on_demand_cancels():
+    ctx = _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity"))
+    config = LaunchConfig(regions=("us-west-2",), spot=True)
+    with pytest.raises(click.ClickException, match="Launch cancelled"):
+        launch_with_retry(config, lambda r: ctx, confirm_on_demand=lambda: False)
+
+
+def test_launch_with_retry_prepares_each_region_once():
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
+        "us-east-1": _region_ctx("us-east-1", [_ok_instance()]),
+    }
+    prep_calls: list[str] = []
+
+    def prepare(region):
+        prep_calls.append(region)
+        return contexts[region]
+
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True, wait=True, wait_timeout=600)
+    result = launch_with_retry(config, prepare, clock=lambda: 0.0)
+    assert result.region == "us-east-1"
+    assert sorted(prep_calls) == ["us-east-1", "us-west-2"]
+    assert len(prep_calls) == 2  # each region prepared exactly once
+
+
+def test_launch_with_retry_quota_hint_pins_failed_region():
+    """Aggregated failure pins the quota hint to the region that failed."""
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
+        "us-east-1": _region_ctx("us-east-1", _make_client_error("VcpuLimitExceeded")),
+    }
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False, instance_type="g4dn.xlarge")
+    with pytest.raises(click.ClickException) as exc:
+        launch_with_retry(config, lambda r: contexts[r])
+    msg = exc.value.format_message()
+    assert "us-east-1: on-demand quota exceeded" in msg
+    assert "aws-bootstrap quota show --family gvt --region us-east-1" in msg
+    assert "--type on-demand --desired-value <N> --region us-east-1" in msg
+
+
+def test_quota_hint_without_region_omits_flag():
+    ec2 = MagicMock()
+    ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
+    config = LaunchConfig(spot=True, instance_type="g4dn.xlarge", regions=("us-west-2",))
+    with pytest.raises(click.ClickException) as exc:
+        launch_instance(ec2, config, "ami-test", "sg-test")
+    # Single-region back-compat path still pins the region (config.region).
+    assert "--region us-west-2" in exc.value.format_message()
+
+
+def test_launch_with_retry_capacity_error_carries_region_and_market():
+    err = CapacityError("eu-west-1", "spot", "no capacity")
+    assert err.region == "eu-west-1"
+    assert err.market == "spot"
 
 
 def test_find_tagged_instances():

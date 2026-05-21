@@ -74,6 +74,18 @@ uv sync
 
 All methods install the `aws-bootstrap` CLI.
 
+#### Optional: auto-activate the venv with direnv
+
+A sample [direnv](https://direnv.net/) config is provided at [`.envrc.example`](.envrc.example). It activates the project venv (and optionally sets `AWS_PROFILE`) automatically when you `cd` into the repo:
+
+```bash
+cp .envrc.example .envrc
+# edit .envrc to uncomment/set AWS_PROFILE if desired
+direnv allow
+```
+
+`.envrc` is git-ignored, so your local copy stays out of version control.
+
 ## SSH Key Setup
 
 The CLI expects an Ed25519 SSH public key at `~/.ssh/id_ed25519.pub` by default. If you don't have one, generate it:
@@ -82,13 +94,19 @@ The CLI expects an Ed25519 SSH public key at `~/.ssh/id_ed25519.pub` by default.
 ssh-keygen -t ed25519
 ```
 
-Accept the default path (`~/.ssh/id_ed25519`) and optionally set a passphrase. The key pair will be imported into AWS automatically on first launch.
+Accept the default path (`~/.ssh/id_ed25519`) and optionally set a passphrase. The key pair is imported into AWS automatically on first launch.
 
 To use a different key, pass `--key-path`:
 
 ```bash
 aws-bootstrap launch --key-path ~/.ssh/my_other_key.pub
 ```
+
+**Robust key handling** (so you never end up with an instance you can't reach):
+
+- **Missing local key** — if `--key-path` doesn't exist, `launch` auto-generates an Ed25519 key pair there (instead of aborting).
+- **Name collision with a different key** — if an AWS key pair already exists with the target `--key-name` but its public key differs from your local key (e.g. created from another machine), the existing AWS key pair is **left untouched** and your local key is imported under a deterministic derived name `aws-bootstrap-key-<fp8>`, which the instance is launched with. You always hold the matching private key.
+- **Unreachable instance** — if SSH still fails with an authentication/host-key error, `launch` **stops immediately** and prints the real `ssh` error (no more silent 5-minute "SSH not ready" loop masking a `Permission denied (publickey)`).
 
 ## Usage
 
@@ -106,6 +124,13 @@ aws-bootstrap launch
 
 # Launch on-demand in a specific region with a custom instance type
 aws-bootstrap launch --on-demand --instance-type g5.xlarge --region us-east-1
+
+# Try multiple regions in order until one has spot capacity
+aws-bootstrap launch --region us-west-2 --region us-east-1 --region eu-west-1
+
+# Keep retrying (bounded exponential backoff) until spot capacity frees up
+aws-bootstrap launch --wait --wait-timeout 30m
+aws-bootstrap launch --region us-west-2 --region us-east-1 --wait --wait-timeout 1h
 
 # Launch without running the remote setup script
 aws-bootstrap launch --no-setup
@@ -139,6 +164,30 @@ After launch, the CLI:
 ssh aws-gpu1                  # venv auto-activates on login
 ```
 
+### 🌍 Finding Capacity (regions & `--wait`)
+
+Spot `InsufficientInstanceCapacity` is scoped to a **region and availability zone** — a type that's unavailable in `us-west-2` right now may be plentiful in `us-east-1`, and capacity for a given AZ frees up continuously as other instances terminate. Two options help you get a GPU without babysitting the prompt:
+
+- **Multiple regions** — pass `--region` more than once. Each launch attempt tries the regions **in the order given**, spot-first, and uses the first one with capacity:
+
+  ```bash
+  aws-bootstrap launch --region us-west-2 --region us-east-1 --region eu-west-1
+  ```
+
+- **`--wait`** — on insufficient spot capacity, keep retrying with **capped, jittered exponential backoff** until `--wait-timeout` (default `30m`; accepts `90s`, `30m`, `1h`, or bare seconds). On timeout it **hard-fails** (it does not silently fall back to on-demand):
+
+  ```bash
+  aws-bootstrap launch --region us-west-2 --region us-east-1 --wait --wait-timeout 1h
+  ```
+
+**How `--wait` + multiple `--region` combine:** a **region sweep is the inner loop, backoff is the outer loop**. Each cycle tries spot in every `--region` in order *with no delay between regions*; only when **all** regions miss does it sleep (backoff) and sweep again. So `--wait --region A --region B` means "try A then B instantly; if both dry, back off and retry A then B" — repeating until timeout — *not* "wait on A, then try B." Backoff escalates per sweep (not per region), region order wins every tie, and `--wait-timeout` is total wall-clock. See [docs/capacity-and-retry.md](docs/capacity-and-retry.md#how---wait-and-multiple---region-combine) for the full model.
+
+Quota errors (`VcpuLimitExceeded`, `MaxSpotInstanceCountExceeded`) and `SpotMaxPriceTooLow` are **never retried by `--wait`** (waiting can't fix them). In multi-region mode they are *not* fatal on their own: the launcher prints a `WARNING` for that region (with a region-pinned `aws-bootstrap quota …` hint), skips it, and tries the next `--region` — failing hard only once **every** region is blocked, with an aggregated message listing each region's reason and hint. Without `--wait`, a fully-exhausted spot pass still offers the interactive on-demand fallback (across all regions).
+
+**Region default precedence** (a behavior change — previously hardcoded to `us-west-2`): explicit `--region` flags → `AWS_DEFAULT_REGION` / active profile region → `us-west-2`. This applies to every command, so a profile configured for `us-east-1` now operates in `us-east-1` by default. The active region is shown in command output.
+
+See [docs/capacity-and-retry.md](docs/capacity-and-retry.md) for the backoff design and recommended region lists per instance family.
+
 ### 🔧 What Remote Setup Does
 
 The setup script runs automatically on the instance after SSH becomes available:
@@ -162,19 +211,19 @@ A GPU throughput benchmark is pre-installed at `~/gpu_benchmark.py` on every ins
 
 ```bash
 # Run both CNN and Transformer benchmarks (default)
-ssh aws-gpu1 'python ~/gpu_benchmark.py'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py'
 
 # CNN only, quick run
-ssh aws-gpu1 'python ~/gpu_benchmark.py --mode cnn --benchmark-batches 20'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py --mode cnn --benchmark-batches 20'
 
 # Transformer only with custom batch size
-ssh aws-gpu1 'python ~/gpu_benchmark.py --mode transformer --transformer-batch-size 16'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py --mode transformer --transformer-batch-size 16'
 
 # Run CUDA diagnostics first (tests FP16/FP32 matmul, autocast, etc.)
-ssh aws-gpu1 'python ~/gpu_benchmark.py --diagnose'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py --diagnose'
 
 # Force FP32 precision (if FP16 has issues on your GPU)
-ssh aws-gpu1 'python ~/gpu_benchmark.py --precision fp32'
+ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py --precision fp32'
 ```
 
 Reports: iterations/sec, samples/sec, peak GPU memory, and avg batch time for each model.
@@ -376,20 +425,24 @@ aws service-quotas get-service-quota \
 Request increases:
 
 ```bash
-# Built-in: request a G/VT spot quota increase (default family)
-aws-bootstrap quota request --type spot --desired-value 4
+# `aws-bootstrap quota show` prints a ready-to-run `quota request` command
+# with a --desired-value above your current quota and pinned to --region.
+# The desired value must EXCEED the current quota (AWS rejects <= current),
+# so pick a value accordingly (8 shown as an example):
+aws-bootstrap quota show --family gvt --region us-west-2
+aws-bootstrap quota request --type spot --desired-value 8 --region us-west-2
 
 # Request a P family spot quota increase
-aws-bootstrap quota request --family p --type spot --desired-value 192
+aws-bootstrap quota request --family p --type spot --desired-value 192 --region us-west-2
 
 # Check request status
-aws-bootstrap quota history
+aws-bootstrap quota history --region us-west-2
 
 # Or use the AWS CLI directly:
 aws service-quotas request-service-quota-increase \
   --service-code ec2 \
   --quota-code L-3819A6DF \
-  --desired-value 4 \
+  --desired-value 8 \
   --region us-west-2
 ```
 

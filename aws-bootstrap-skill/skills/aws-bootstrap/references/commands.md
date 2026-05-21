@@ -16,8 +16,10 @@ Per-command options `--region` and `--profile` are available on all commands:
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--region` | string | `us-west-2` | AWS region (except `status`, where it is repeatable and defaults to all enabled regions — see below) |
+| `--region` | string | `AWS_DEFAULT_REGION`/profile region, then `us-west-2` | AWS region. Precedence: explicit flag → env/profile region → `us-west-2`. On `launch` it is **repeatable** (tried in order). On `status` it is **repeatable** and, when omitted, defaults to *all enabled regions* (see below) rather than a single region. |
 | `--profile` | string | `AWS_PROFILE` env | AWS profile override |
+
+The resolved/active region is included in `launch`, `status`, `terminate`, and `cleanup` output.
 
 ---
 
@@ -36,6 +38,9 @@ aws-bootstrap launch [OPTIONS]
 | `--instance-type` | string | `g4dn.xlarge` | EC2 instance type |
 | `--ami-filter` | string | auto-detected | AMI name pattern filter |
 | `--spot` / `--on-demand` | flag | `--spot` | Pricing model |
+| `--region` | string (repeatable) | env/profile, then `us-west-2` | Repeat to try regions in order, spot-first, on capacity shortfall |
+| `--wait` | flag | false | On insufficient spot capacity, retry with bounded exponential backoff until `--wait-timeout`, then hard-fail |
+| `--wait-timeout` | duration | `30m` | Max wait when `--wait` set; accepts `90s`, `30m`, `1h`, or bare seconds |
 | `--key-path` | path | `~/.ssh/id_ed25519.pub` | SSH public key path |
 | `--key-name` | string | `aws-bootstrap-key` | AWS key pair name |
 | `--security-group` | string | `aws-bootstrap-ssh` | Security group name |
@@ -49,6 +54,8 @@ aws-bootstrap launch [OPTIONS]
 
 `--ebs-storage` and `--ebs-volume-id` are mutually exclusive.
 
+**`--wait` + multiple `--region`:** a region sweep is the inner loop, backoff is the outer loop. Each cycle tries spot in every `--region` in order with no delay between regions; only when *all* regions miss does it sleep (capped+jittered exponential backoff, escalating per sweep) and sweep again, until `--wait-timeout` total wall-clock, then hard-fail. So `--wait --region A --region B` = "try A then B instantly; if both dry, back off and retry both" — not "wait on A then try B." Region order wins every tie. Without `--wait`, exactly one sweep then on-demand fallback.
+
 ### JSON Output
 
 **Normal launch:**
@@ -61,7 +68,9 @@ aws-bootstrap launch [OPTIONS]
   "ami_id": "ami-0abc123",
   "pricing": "spot",
   "region": "us-west-2",
+  "regions_tried": ["us-west-2", "us-east-1"],
   "ssh_alias": "aws-gpu1",
+  "cuda_version": "13.2",
   "ebs_volume": {
     "volume_id": "vol-0abc123",
     "mount_point": "/data",
@@ -70,7 +79,7 @@ aws-bootstrap launch [OPTIONS]
 }
 ```
 
-The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id` is used.
+The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id` is used. `cuda_version` is present only when remote setup ran and a CUDA version was detected (omitted with `--no-setup` or on non-CUDA/smoke-test instances). `region` is the region the instance actually launched in; `regions_tried` lists all regions attempted in order.
 
 **Dry run:**
 ```json
@@ -83,9 +92,13 @@ The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id`
   "key_name": "aws-bootstrap-key",
   "security_group": "sg-0abc123",
   "volume_size_gb": 100,
-  "region": "us-west-2"
+  "regions": ["us-west-2"],
+  "wait": false,
+  "wait_timeout_seconds": 1800
 }
 ```
+
+On capacity timeout (`--wait` exhausted) or all regions exhausted, `launch` exits non-zero with an aggregated `CLIError` (per-region reasons + region-pinned quota hints). Quota / `SpotMaxPriceTooLow` are never *waited* on, but in multi-region mode the launcher warns and moves on to the next `--region`; it only fails hard once every region is blocked.
 
 ---
 
@@ -444,6 +457,6 @@ Requests are sorted newest-first. Field `case_id` is included when a support cas
 
 - **SSH aliases** use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and are managed in `~/.ssh/config`
 - **EBS volumes** are tagged with `created-by=aws-bootstrap-g4dn` for automatic discovery
-- **Spot pricing** auto-falls back to on-demand on `InsufficientInstanceCapacity` or `SpotMaxPriceTooLow` errors
+- **Spot capacity**: on a fully-exhausted spot sweep (`InsufficientInstanceCapacity` in every `--region`) **without `--wait`**, the launcher offers the on-demand fallback (auto-confirmed in structured modes). With `--wait` it retries with backoff and hard-fails on timeout (never auto-buys on-demand). Quota errors and `SpotMaxPriceTooLow` are **not** auto-fallback triggers — in multi-region mode they warn and skip to the next region, hard-failing only when every region is blocked.
 - **Remote setup** installs CUDA-matched PyTorch, Jupyter, GPU benchmark, and VSCode CUDA debug configs
 - The default AMI filter targets Ubuntu 24.04 Deep Learning AMIs with the OSS NVIDIA driver

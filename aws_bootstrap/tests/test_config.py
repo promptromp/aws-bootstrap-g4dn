@@ -3,7 +3,7 @@
 from __future__ import annotations
 from pathlib import Path
 
-from aws_bootstrap.config import LaunchConfig
+from aws_bootstrap.config import DEFAULT_REGION, LaunchConfig
 
 
 def test_defaults():
@@ -29,7 +29,7 @@ def test_ebs_fields_default_none():
 def test_overrides():
     config = LaunchConfig(
         instance_type="g5.xlarge",
-        region="us-east-1",
+        regions=("us-east-1",),
         spot=False,
         volume_size=200,
         key_path=Path("/tmp/test.pub"),
@@ -39,6 +39,24 @@ def test_overrides():
     assert config.spot is False
     assert config.volume_size == 200
     assert config.key_path == Path("/tmp/test.pub")
+
+
+def test_region_property_returns_first_of_regions():
+    config = LaunchConfig(regions=("us-east-1", "us-west-2", "eu-west-1"))
+    assert config.region == "us-east-1"
+    assert config.regions == ("us-east-1", "us-west-2", "eu-west-1")
+
+
+def test_region_property_falls_back_when_regions_empty():
+    # Latent-invariant guard: never raise an opaque IndexError.
+    config = LaunchConfig(regions=())
+    assert config.region == DEFAULT_REGION
+
+
+def test_wait_defaults():
+    config = LaunchConfig()
+    assert config.wait is False
+    assert config.wait_timeout == 1800
 
 
 def test_ebs_storage_override():

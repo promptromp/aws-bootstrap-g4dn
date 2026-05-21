@@ -107,6 +107,10 @@ install_pytorch_cuda() {
     local cuda_ver
     cuda_ver=$(detect_cuda_version)
 
+    # Sentinel the CLI reads back over SSH to report the CUDA version in the
+    # final "Instance ready!" summary.
+    echo "${cuda_ver:-none}" > "$HOME/.aws-bootstrap-cuda"
+
     if [ -z "$cuda_ver" ]; then
         echo "  WARNING: No CUDA detected — installing PyTorch from PyPI (CPU or default CUDA)"
         uv pip install --python ~/venv/bin/python torch torchvision

@@ -1,6 +1,7 @@
 """SSH key pair management and SSH config management for EC2 instances."""
 
 from __future__ import annotations
+import hashlib
 import os
 import re
 import socket
@@ -12,8 +13,68 @@ from pathlib import Path
 
 import click
 
+from .constants import (
+    ALIAS_PREFIX,
+    EBS_MOUNT_POINT,
+    RES_KEY_PAIR,
+    SSH_CONNECT_TIMEOUT,
+    SSH_PORT_DEFAULT,
+    TAG_CREATED_BY,
+    TAG_VALUE,
+)
+from .ec2 import CLIError
 from .gpu import _GPU_ARCHITECTURES, GpuInfo
 from .output import echo, secho
+
+
+def _pubkey_blob(pub_text: str) -> str:
+    """The base64 key material from an OpenSSH public key line.
+
+    Identity of the key independent of the trailing comment, so two keys
+    compare equal iff they are the same key regardless of host/user comment.
+    """
+    parts = pub_text.split()
+    return parts[1] if len(parts) >= 2 else pub_text.strip()
+
+
+def _derived_key_name(base: str, pub_blob: str) -> str:
+    """Deterministic, collision-free key-pair name for a given local key."""
+    fp8 = hashlib.sha256(pub_blob.encode()).hexdigest()[:8]
+    return f"{base}-{fp8}"
+
+
+def _aws_key_pub_blob(ec2_client, key_name: str) -> str | None:
+    """Public-key blob of an existing AWS key pair, or None if AWS has no
+    public key on record for it (older imported pairs). Raises ClientError
+    (InvalidKeyPair.NotFound) if the key pair does not exist."""
+    resp = ec2_client.describe_key_pairs(KeyNames=[key_name], IncludePublicKey=True)
+    pub = resp["KeyPairs"][0].get("PublicKey")
+    return _pubkey_blob(pub) if pub else None
+
+
+def generate_ssh_keypair(pub_path: Path) -> None:
+    """Ensure an SSH key pair exists at ``pub_path`` (and its private
+    counterpart). If the private key already exists (only the ``.pub`` is
+    missing), re-derive the public key from it rather than overwriting the
+    private key. Raises OSError / CalledProcessError on failure."""
+    priv = private_key_path(pub_path)
+    priv.parent.mkdir(parents=True, exist_ok=True)
+    if priv.exists():
+        # Private key present, public key missing: regenerate the .pub only.
+        result = subprocess.run(
+            ["ssh-keygen", "-y", "-f", str(priv)],
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+        pub_path.write_text(result.stdout)
+        return
+    subprocess.run(
+        ["ssh-keygen", "-t", "ed25519", "-N", "", "-f", str(priv)],
+        check=True,
+        capture_output=True,
+        text=True,
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -50,45 +111,103 @@ def import_key_pair(ec2_client, key_name: str, key_path: Path) -> str:
 
     Returns the key pair name.
     """
-    pub_key = key_path.read_bytes()
+    local_blob = _pubkey_blob(key_path.read_text())
 
-    # Check if key pair already exists
-    try:
-        existing = ec2_client.describe_key_pairs(KeyNames=[key_name])
+    def _import(name: str) -> str:
+        ec2_client.import_key_pair(
+            KeyName=name,
+            PublicKeyMaterial=key_path.read_bytes(),
+            TagSpecifications=[
+                {
+                    "ResourceType": RES_KEY_PAIR,
+                    "Tags": [{"Key": TAG_CREATED_BY, "Value": TAG_VALUE}],
+                }
+            ],
+        )
+        secho(f"  Imported key pair '{name}' from {key_path}", fg="green")
+        return name
+
+    def _lookup(name: str) -> str | None | bool:
+        """Returns the pub blob (str), None (exists but AWS has no pubkey),
+        or False (does not exist)."""
+        try:
+            return _aws_key_pub_blob(ec2_client, name)
+        except ec2_client.exceptions.ClientError as e:
+            if "InvalidKeyPair.NotFound" not in str(e):
+                raise
+            return False
+
+    existing = _lookup(key_name)
+    if existing is False:
+        return _import(key_name)
+    if existing is None or existing == local_blob:
+        # Matches our local key (or AWS has no pubkey on record for an older
+        # pair created from this same material) -> safe to reuse.
         echo("  Key pair " + click.style(f"'{key_name}'", fg="bright_white") + " already exists, reusing.")
-        return existing["KeyPairs"][0]["KeyName"]
-    except ec2_client.exceptions.ClientError as e:
-        if "InvalidKeyPair.NotFound" not in str(e):
-            raise
+        return key_name
 
-    ec2_client.import_key_pair(
-        KeyName=key_name,
-        PublicKeyMaterial=pub_key,
-        TagSpecifications=[
-            {
-                "ResourceType": "key-pair",
-                "Tags": [{"Key": "created-by", "Value": "aws-bootstrap-g4dn"}],
-            }
-        ],
+    # MISMATCH: a different key already owns this name. Never modify/delete it
+    # (another machine may rely on it). Use a deterministic, collision-free
+    # name derived from *our* local key so the launched instance is reachable.
+    derived = _derived_key_name(key_name, local_blob)
+    secho(
+        f"  WARNING: AWS key pair '{key_name}' is a different key than {key_path};",
+        fg="yellow",
+        err=True,
     )
-    secho(f"  Imported key pair '{key_name}' from {key_path}", fg="green")
-    return key_name
+    secho(
+        f"  leaving it untouched and using '{derived}' (your local key) instead.",
+        fg="yellow",
+        err=True,
+    )
+    derived_existing = _lookup(derived)
+    if derived_existing is False:
+        return _import(derived)
+    if derived_existing is None or derived_existing == local_blob:
+        echo("  Key pair " + click.style(f"'{derived}'", fg="bright_white") + " already exists, reusing.")
+        return derived
+    raise CLIError(
+        f"Key pair '{derived}' already exists in this region with a different key. Pass a distinct --key-name."
+    )
 
 
-def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay: int = 10, port: int = 22) -> bool:
+def _classify_ssh_failure(stderr: str) -> str:
+    """Classify an ``ssh`` failure as ``"auth"`` (fatal — retrying can never
+    help: wrong key, host-key change, too many auth failures) or
+    ``"transient"`` (sshd not up yet, timeout, connection reset)."""
+    s = stderr or ""
+    fatal_markers = (
+        "Permission denied",
+        "Too many authentication failures",
+        "REMOTE HOST IDENTIFICATION HAS CHANGED",
+        "no matching host key",
+        "Host key verification failed",
+    )
+    return "auth" if any(m in s for m in fatal_markers) else "transient"
+
+
+def wait_for_ssh(
+    host: str, user: str, key_path: Path, retries: int = 30, delay: int = 10, port: int = SSH_PORT_DEFAULT
+) -> bool:
     """Wait for SSH to become available on the instance.
 
     Tries a TCP connection to the SSH port first, then an actual SSH command.
+    Fails fast (no further retries) on a fatal authentication / host-key
+    error — retrying a wrong-key instance for the full budget only hides the
+    real cause — and always surfaces the underlying ``ssh`` stderr instead of
+    an opaque "not ready".
     """
     base_opts = _ssh_opts(key_path)
-    port_opts = ["-p", str(port)] if port != 22 else []
+    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
+    last_err = ""
 
     for attempt in range(1, retries + 1):
         # First check if the SSH port is open
         try:
             sock = socket.create_connection((host, port), timeout=5)
             sock.close()
-        except (TimeoutError, ConnectionRefusedError, OSError):
+        except (TimeoutError, ConnectionRefusedError, OSError) as e:
+            last_err = f"port {port} unreachable: {e}"
             echo("  SSH not ready " + click.style(f"(attempt {attempt}/{retries})", dim=True) + ", waiting...")
             time.sleep(delay)
             continue
@@ -99,7 +218,7 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
             *base_opts,
             *port_opts,
             "-o",
-            "ConnectTimeout=10",
+            f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
             "-o",
             "BatchMode=yes",
             f"{user}@{host}",
@@ -110,19 +229,43 @@ def wait_for_ssh(host: str, user: str, key_path: Path, retries: int = 30, delay:
             secho("  SSH connection established.", fg="green")
             return True
 
-        echo("  SSH not ready " + click.style(f"(attempt {attempt}/{retries})", dim=True) + ", waiting...")
+        err = (result.stderr or "").strip()
+        if err:
+            last_err = err
+        detail = err.splitlines()[-1] if err else "ssh exited non-zero"
+
+        if _classify_ssh_failure(err) == "auth":
+            # Not retryable — the instance's key pair does not match the
+            # local private key. Surface the real error immediately.
+            secho(f"  SSH authentication failed (not retrying): {detail}", fg="red", err=True)
+            secho(
+                f"  The instance's key pair does not match {private_key_path(key_path)}. "
+                "Re-run with the matching --key-name/--key-path, or terminate and relaunch.",
+                fg="red",
+                err=True,
+            )
+            return False
+
+        echo("  SSH not ready " + click.style(f"(attempt {attempt}/{retries}: {detail})", dim=True) + ", waiting...")
         time.sleep(delay)
 
+    if last_err:
+        secho(f"  SSH never became available. Last error: {last_err.splitlines()[-1]}", fg="yellow", err=True)
     return False
 
 
 def run_remote_setup(
-    host: str, user: str, key_path: Path, script_path: Path, python_version: str | None = None, port: int = 22
+    host: str,
+    user: str,
+    key_path: Path,
+    script_path: Path,
+    python_version: str | None = None,
+    port: int = SSH_PORT_DEFAULT,
 ) -> bool:
     """SCP the setup script and requirements.txt to the instance and execute."""
     ssh_opts = _ssh_opts(key_path)
-    scp_port_opts = ["-P", str(port)] if port != 22 else []
-    ssh_port_opts = ["-p", str(port)] if port != 22 else []
+    scp_port_opts = ["-P", str(port)] if port != SSH_PORT_DEFAULT else []
+    ssh_port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
     requirements_path = script_path.parent / "requirements.txt"
 
     # SCP the requirements file
@@ -265,7 +408,7 @@ def _write_ssh_config(config_path: Path, content: str) -> None:
         raise
 
 
-def _next_alias(content: str, prefix: str = "aws-gpu") -> str:
+def _next_alias(content: str, prefix: str = ALIAS_PREFIX) -> str:
     """Return the next sequential alias like ``aws-gpu3``.
 
     Only considers aliases inside aws-bootstrap marker blocks so that
@@ -289,10 +432,12 @@ def _next_alias(content: str, prefix: str = "aws-gpu") -> str:
     return f"{prefix}{max_n + 1}"
 
 
-def _build_stanza(instance_id: str, alias: str, hostname: str, user: str, key_path: Path, port: int = 22) -> str:
+def _build_stanza(
+    instance_id: str, alias: str, hostname: str, user: str, key_path: Path, port: int = SSH_PORT_DEFAULT
+) -> str:
     """Build a complete SSH config stanza with markers."""
     priv_key = private_key_path(key_path)
-    port_line = f"    Port {port}\n" if port != 22 else ""
+    port_line = f"    Port {port}\n" if port != SSH_PORT_DEFAULT else ""
     return (
         f"{_BEGIN_MARKER.format(instance_id=instance_id)}\n"
         f"Host {alias}\n"
@@ -312,8 +457,8 @@ def add_ssh_host(
     user: str,
     key_path: Path,
     config_path: Path | None = None,
-    alias_prefix: str = "aws-gpu",
-    port: int = 22,
+    alias_prefix: str = ALIAS_PREFIX,
+    port: int = SSH_PORT_DEFAULT,
 ) -> str:
     """Add (or update) an SSH host stanza for *instance_id*.
 
@@ -462,7 +607,7 @@ class SSHHostDetails:
     hostname: str
     user: str
     identity_file: Path
-    port: int = 22
+    port: int = SSH_PORT_DEFAULT
 
 
 def get_ssh_host_details(instance_id: str, config_path: Path | None = None) -> SSHHostDetails | None:
@@ -483,7 +628,7 @@ def get_ssh_host_details(instance_id: str, config_path: Path | None = None) -> S
     hostname: str | None = None
     user: str | None = None
     identity_file: str | None = None
-    port: int = 22
+    port: int = SSH_PORT_DEFAULT
 
     for line in content.splitlines():
         if line == begin_marker:
@@ -507,14 +652,16 @@ def get_ssh_host_details(instance_id: str, config_path: Path | None = None) -> S
     return None
 
 
-def query_gpu_info(host: str, user: str, key_path: Path, timeout: int = 10, port: int = 22) -> GpuInfo | None:
+def query_gpu_info(
+    host: str, user: str, key_path: Path, timeout: int = SSH_CONNECT_TIMEOUT, port: int = SSH_PORT_DEFAULT
+) -> GpuInfo | None:
     """SSH into a host and query GPU info via ``nvidia-smi``.
 
     Returns ``GpuInfo`` on success, or ``None`` if the SSH connection fails,
     ``nvidia-smi`` is unavailable, or the output is malformed.
     """
     ssh_opts = _ssh_opts(key_path)
-    port_opts = ["-p", str(port)] if port != 22 else []
+    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
     remote_cmd = (
         "nvidia-smi --query-gpu=driver_version,name,compute_cap --format=csv,noheader,nounits"
         " && nvidia-smi | grep -oP 'CUDA Version: \\K[\\d.]+'"
@@ -535,9 +682,15 @@ def query_gpu_info(host: str, user: str, key_path: Path, timeout: int = 10, port
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
     except subprocess.TimeoutExpired:
+        secho(f"  GPU query timed out after {timeout + 5}s ({host})", fg="yellow", dim=True, err=True)
         return None
 
     if result.returncode != 0:
+        # Surface the reason instead of a bare "unavailable" (text-mode only;
+        # secho is silent in structured output).
+        err = (result.stderr or "").strip().splitlines()
+        if err:
+            secho(f"  GPU query failed ({host}): {err[-1]}", fg="yellow", dim=True, err=True)
         return None
 
     lines = result.stdout.strip().splitlines()
@@ -568,6 +721,36 @@ def query_gpu_info(host: str, user: str, key_path: Path, timeout: int = 10, port
         return None
 
 
+def query_cuda_version(
+    host: str, user: str, key_path: Path, timeout: int = 10, port: int = SSH_PORT_DEFAULT
+) -> str | None:
+    """Read the CUDA version remote_setup.sh recorded (~/.aws-bootstrap-cuda).
+
+    Returns a version string like ``13.2``, or None if absent/unknown (e.g.
+    ``--no-setup``, no CUDA detected, or the file isn't there yet).
+    """
+    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
+    cmd = [
+        "ssh",
+        *_ssh_opts(key_path),
+        *port_opts,
+        "-o",
+        f"ConnectTimeout={timeout}",
+        "-o",
+        "BatchMode=yes",
+        f"{user}@{host}",
+        "cat ~/.aws-bootstrap-cuda 2>/dev/null",
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout + 5)
+    except subprocess.TimeoutExpired:
+        return None
+    if result.returncode != 0:
+        return None
+    value = result.stdout.strip()
+    return value if re.fullmatch(r"\d+\.\d+", value) else None
+
+
 # ---------------------------------------------------------------------------
 # EBS volume mount
 # ---------------------------------------------------------------------------
@@ -578,9 +761,9 @@ def mount_ebs_volume(
     user: str,
     key_path: Path,
     volume_id: str,
-    mount_point: str = "/data",
+    mount_point: str = EBS_MOUNT_POINT,
     format_volume: bool = True,
-    port: int = 22,
+    port: int = SSH_PORT_DEFAULT,
 ) -> bool:
     """Mount an EBS volume on the remote instance via SSH.
 
@@ -590,7 +773,7 @@ def mount_ebs_volume(
     Returns True on success, False on failure.
     """
     ssh_opts = _ssh_opts(key_path)
-    port_opts = ["-p", str(port)] if port != 22 else []
+    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
 
     # Strip the vol- prefix and hyphen for NVMe serial matching
     vol_serial = volume_id.replace("-", "")
@@ -640,7 +823,7 @@ def mount_ebs_volume(
         *ssh_opts,
         *port_opts,
         "-o",
-        "ConnectTimeout=10",
+        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
         f"{user}@{host}",
         remote_script,
     ]
