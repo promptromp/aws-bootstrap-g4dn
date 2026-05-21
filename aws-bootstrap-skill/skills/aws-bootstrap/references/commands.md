@@ -149,7 +149,7 @@ aws-bootstrap status [OPTIONS]
 }
 ```
 
-Top-level `regions_queried` lists the regions actually queried. `regions_failed` is present only when one or more regions could not be queried (e.g. unauthorized). Per-instance fields `gpu`, `ebs_volumes`, `spot_price_per_hour`, `uptime_seconds`, and `estimated_cost` are conditional.
+Top-level `regions_queried` lists every region the query was attempted against (including any that subsequently failed). `regions_failed` is present only when one or more regions could not be queried (e.g. unauthorized); those regions appear in both lists. Per-instance fields `gpu`, `ebs_volumes`, `spot_price_per_hour`, `uptime_seconds`, and `estimated_cost` are conditional.
 
 ---
 
