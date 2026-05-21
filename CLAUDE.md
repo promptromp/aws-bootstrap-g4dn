@@ -35,9 +35,10 @@ direnv allow  # or manually: source .venv/bin/activate
 ```
 aws_bootstrap/
     __init__.py          # Package init
-    cli.py               # Click CLI entry point (launch, status, terminate commands)
+    cli.py               # Click CLI entry point (launch, status, terminate, list, quota, cluster commands)
+    cluster.py           # Multi-node cluster composition: naming/rank helpers + launch fan-out (launch_cluster_nodes)
     config.py            # LaunchConfig dataclass with defaults
-    ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing, EBS volume ops, multi-region discovery/query
+    ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing, EBS volume ops, multi-region discovery/query, cluster placement-group + tag discovery
     gpu.py               # GPU architecture mapping and GpuInfo dataclass
     output.py            # Output formatting: OutputFormat enum, emit(), echo/secho wrappers for structured output
     quota.py             # Service Quotas API: get/request GPU vCPU quotas (G/VT, P, DL families)
@@ -53,16 +54,20 @@ aws_bootstrap/
         tasks.json             # VSCode CUDA build tasks template (deployed to ~/workspace/.vscode/tasks.json)
         remote_setup.sh        # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
         requirements.txt       # Python dependencies installed on the remote instance
+        cluster_canary.py      # Distributed DDP canary (all-reduce + SGD), SCP'd to cluster nodes for prepare/test
     tests/               # Unit tests (pytest)
         conftest.py            # Shared fixtures (runner, cli_session, quota/ami/instance-type rows)
         test_config.py
         test_cli.py
         test_cli_regions.py    # Region-aware quota/list CLI tests (fixtures + parametrize)
+        test_cli_cluster.py    # cluster launch/status/prepare/test/run/terminate CLI tests
+        test_cluster.py        # cluster.py composition helpers + run_distributed_job/canary orchestration
         test_ec2.py
         test_output.py
         test_gpu.py
         test_retry.py
         test_ssh_config.py
+        test_ssh_exec.py       # run_on_host / scp_to_host SSH primitives
         test_ssh_gpu.py
         test_ebs.py
         test_ssh_ebs.py
@@ -70,6 +75,12 @@ aws_bootstrap/
 docs/
     nsight-remote-profiling.md # Nsight Compute, Nsight Systems, and Nsight VSCE remote profiling guide
     capacity-and-retry.md      # Multi-region & --wait retry model, backoff design, recommended region lists
+    multi-node-training.md     # End-to-end cluster training walkthrough (launch→prepare→test→run→terminate)
+examples/                        # Runnable user-facing example scripts (not part of the package; ruff-linted, not type-checked)
+    cluster/
+        train_ddp.py             # Minimal multi-node DDP training script (long usage header)
+        prepare_data.sh          # Idempotent per-node data-prep (S3→/data) for --data-script
+        README.md
 aws-bootstrap-skill/             # Claude Code plugin
     .claude-plugin/
         plugin.json              # Plugin manifest (identity, metadata)
@@ -215,6 +226,37 @@ On Nitro instances (g4dn), `/dev/sdf` is remapped to `/dev/nvmeXn1`. The mount s
 Non-root EBS volumes attached via API have `DeleteOnTermination=False` by default. This means data volumes **survive spot interruptions** — when AWS reclaims the instance, the volume detaches and becomes `available`, preserving all data. The user can reattach it to a new instance with `--ebs-volume-id`.
 
 The `terminate` command discovers volumes via `find_ebs_volumes_for_instance`, waits for them to detach (becomes `available`), then deletes them. `--keep-ebs` skips deletion and prints the volume ID with a reattach command.
+
+## Multi-Node Training Clusters (`cluster` group)
+
+The `cluster` command group (`cluster.py` + the `cluster` Click group in `cli.py`) launches and manages multiple GPU instances as a coordinated cluster for multi-node distributed training (`torchrun`). Ships the full MVP: `cluster launch` / `status` / `prepare` / `test` / `run` / `terminate`.
+
+- **`cluster.py`** — composition logic only: pure helpers (`placement_group_name`, `node_alias`, `nodes_to_add`) and the launch fan-out (`launch_cluster_nodes`, which calls an injectable `launch_fn` per node and assigns sequential ranks). It imports `ec2` (one-directional: `ec2.py` does **not** import `cluster.py`, which is why the placement-group helpers take an already-derived name rather than a `cluster_id`).
+- **Identity = tags, not state.** A cluster is an arbitrary `--cluster-id` stored as the `TAG_CLUSTER_ID` (`aws-bootstrap-cluster`) tag; each node also carries `TAG_CLUSTER_RANK` (`aws-bootstrap-cluster-rank`). `find_cluster_instances` / `list_clusters` (in `ec2.py`) discover and group by these tags. No local cluster state file.
+- **Single AZ + cluster placement group.** `ensure_cluster_placement_group(ec2, name, tag_value)` creates/reuses a `cluster`-strategy group; `cli.cluster_launch` captures the first node's AZ and pins the rest via `RegionContext.placement_az` + `RegionContext.placement_group` (both threaded through `_build_launch_params`/`_run_instances`/`launch_with_retry` alongside the existing `placement_az`).
+- **Intra-cluster SG rule.** `ensure_cluster_security_group_rule(ec2, sg_id)` adds an idempotent self-referencing (`-1`/all-protocol) ingress rule so members can reach each other on NCCL/rendezvous ports.
+- **SSH aliases.** Each node gets a deterministic `aws-<cluster-id>-<rank>` alias via `add_ssh_host(..., alias=...)` (the explicit-alias parameter added for clusters).
+- **`RDZV_PORT`** (`29400`, in `constants.py`) is the reserved torchrun c10d rendezvous port for later phases.
+
+`cluster launch` reuses the single-node launch machinery (`launch_with_retry`, `ensure_security_group`, `import_key_pair`, `get_latest_ami`, `wait_instance_ready`, `remote_setup`) per node; the AMI/key are looked up once and reused across nodes. `cluster launch` is **incremental**: re-running with a higher `--nodes` adds nodes to reach the target. EFA is out of scope (P-series only; `g4dn`/`g5` use plain VPC networking).
+
+### Prepare / test (distributed execution core)
+
+- **c10d rendezvous, identical command per node.** `cluster.build_torchrun_command(...)` builds one `torchrun --rdzv-backend=c10d --rdzv-endpoint=<rank0_private_ip>:RDZV_PORT --rdzv-id=<cluster-id> ...` command that is run on **every** node; the rendezvous (hosted by rank 0) assigns global ranks, so no per-node `--node-rank` is needed. `cluster.master_addr(nodes)` returns rank 0's private IP.
+- **Parallel start.** `cluster.run_on_all_nodes(nodes, command_for, run_fn=...)` runs the command on all nodes concurrently (a `ThreadPoolExecutor`) — they must start together to rendezvous — returning a rank-ordered `list[NodeResult]`. `run_fn`/`scp_fn` are **injected** (production wraps `ssh.run_on_host` / `ssh.scp_to_host`), which keeps the orchestration unit-testable with fakes.
+- **Generic SSH primitives** live in `ssh.py`: `run_on_host(host, user, key, command, *, port, timeout) -> (rc, stdout, stderr)` and `scp_to_host(...) -> bool`.
+- **Canary.** `resources/cluster_canary.py` is a tiny DDP job (process-group init + all-reduce correctness check + a few SGD steps; exits non-zero on failure). `cluster.run_canary(...)` SCPs it to every node and runs the torchrun command in parallel (activating `~/venv` first, since non-interactive ssh doesn't source `~/.bashrc`). `cluster test` runs it standalone; `cluster prepare` runs it after verification.
+- **`cluster prepare`** queries each node's GPU/CUDA via `query_gpu_info`, fails on `cluster.detect_version_skew` (inconsistent CUDA across nodes), writes the `AWSB_*` env contract to `~/.aws-bootstrap-cluster` on each node as a **sourceable** file (`cluster.render_node_config` → `export K=<shlex.quote(v)>` lines, so the newline-joined `AWSB_NODE_IPS` doesn't leak a bare line), then auto-runs the canary (`--no-canary` skips it).
+- **`RDZV_PORT`** (`29400`) is the c10d rendezvous port; the SG self-rule (Phase 1) makes it reachable between nodes.
+
+### Run (distributed training jobs)
+
+- **`cluster.run_distributed_job(...)`** is the general runner; `run_canary` now delegates to it (DRY). Steps: SCP the script to all nodes → (optional) SCP+run a `--data-script` on every node in parallel as a **barrier** (training won't start until all preps succeed) → run the training command on all nodes in parallel.
+- **`_job_command_for(node, ...)`** picks the per-node command: a `.py` script → `build_torchrun_command` (identical on every node, c10d); a `.sh` script → the **escape hatch** (`node_env` `AWSB_*` exports + `bash script.sh`, so the user can drive any launcher). Both prepend `source ~/venv/bin/activate`.
+- **`cli.cluster_run`** resolves nodes, calls `run_distributed_job`, writes per-node logs to `<--log-dir>/<cluster-id>/rank<N>.log`, echoes stdout from **every** node that produced output (under c10d rendezvous torch's global rank 0 is NOT necessarily node rank 0, so we can't single out one node), and exits non-zero if any node failed. `context_settings={"ignore_unknown_options": True}` + a trailing `script_args` (`nargs=-1`) lets training args pass through after `--`.
+- **`--wait`/`--wait-timeout`** on `cluster launch` thread into `LaunchConfig`, so `launch_with_retry`'s backoff loop retries each node on spot capacity shortfall and hard-fails on timeout (no on-demand prompt) — important for non-interactive/cluster use.
+- **`cluster terminate`** terminates the nodes, removes SSH aliases, then **waits** (`instance_terminated` waiter) for full termination before deleting the placement group — a placement group can't be deleted while instances are still `shutting-down` (`delete_cluster_placement_group` returns `False` on `InvalidPlacementGroup.InUse`, and the command warns rather than crashing).
+- **Deferred (not yet):** `--detach`/live log streaming/`cluster logs`/`--poll-interval` (the synchronous run with per-node log files is the MVP); auto-detecting `--nproc-per-node` from `prepare`'s written config (defaults to 1).
 
 ## Agent Skill (Claude Code Plugin)
 

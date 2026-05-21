@@ -483,3 +483,10 @@ def test_cleanup_stale_ssh_hosts_no_stale(tmp_path):
     add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
     results = cleanup_stale_ssh_hosts({"i-111aaaa1"}, config_path=cfg)
     assert results == []
+
+
+def test_add_ssh_host_explicit_alias(tmp_path):
+    cfg = _config_path(tmp_path)
+    alias = add_ssh_host("i-123abcde", "1.2.3.4", "ubuntu", KEY_PATH, config_path=cfg, alias="aws-ml1-0")
+    assert alias == "aws-ml1-0"
+    assert "Host aws-ml1-0" in cfg.read_text()

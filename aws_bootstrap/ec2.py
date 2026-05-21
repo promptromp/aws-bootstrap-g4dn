@@ -26,6 +26,8 @@ from .constants import (
     SSH_INGRESS_CIDR,
     SSH_PORT_DEFAULT,
     TAG_BOOTSTRAP_INSTANCE,
+    TAG_CLUSTER_ID,
+    TAG_CLUSTER_RANK,
     TAG_CREATED_BY,
     TAG_NAME,
     VOLUME_TYPE,
@@ -138,6 +140,76 @@ def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int =
     return sg_id
 
 
+def ensure_cluster_placement_group(ec2_client, name: str, tag_value: str) -> str:
+    """Create (or reuse) a *cluster*-strategy placement group by name.
+
+    ``name`` is the already-derived group name (see
+    ``cluster.placement_group_name``); keeping naming out of this AWS-primitive
+    layer avoids an ec2→cluster import cycle. Returns the name. Idempotent.
+    """
+    existing = ec2_client.describe_placement_groups(Filters=[{"Name": "group-name", "Values": [name]}])
+    if existing.get("PlacementGroups"):
+        echo(f"  Placement group '{name}' already exists, reusing.")
+        return name
+    ec2_client.create_placement_group(
+        GroupName=name,
+        Strategy="cluster",
+        TagSpecifications=[
+            {
+                "ResourceType": "placement-group",
+                "Tags": [
+                    {"Key": TAG_CREATED_BY, "Value": tag_value},
+                    {"Key": TAG_NAME, "Value": name},
+                ],
+            }
+        ],
+    )
+    secho(f"  Created cluster placement group '{name}'.", fg="green")
+    return name
+
+
+def delete_cluster_placement_group(ec2_client, name: str) -> bool:
+    """Delete a placement group by name.
+
+    Returns ``True`` if the group is gone (deleted, or already absent), ``False``
+    if it can't be deleted yet because it is still ``InUse`` (instances not fully
+    terminated). Other errors propagate.
+    """
+    try:
+        ec2_client.delete_placement_group(GroupName=name)
+        return True
+    except botocore.exceptions.ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code == "InvalidPlacementGroup.Unknown":
+            return True  # already gone
+        if code == "InvalidPlacementGroup.InUse":
+            return False  # instances still terminating; caller decides
+        raise
+
+
+def ensure_cluster_security_group_rule(ec2_client, sg_id: str) -> None:
+    """Allow all traffic between members of the same security group.
+
+    Cluster nodes need to reach each other on the NCCL/rendezvous ports; a
+    self-referencing ingress rule is the simplest correct grant. Idempotent —
+    a pre-existing identical rule is treated as success.
+    """
+    try:
+        ec2_client.authorize_security_group_ingress(
+            GroupId=sg_id,
+            IpPermissions=[
+                {
+                    "IpProtocol": "-1",
+                    "UserIdGroupPairs": [{"GroupId": sg_id, "Description": "aws-bootstrap intra-cluster"}],
+                }
+            ],
+        )
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "InvalidPermission.Duplicate":
+            return
+        raise
+
+
 class CapacityError(Exception):
     """Retryable: AWS has no capacity for the requested type in this region/AZ.
 
@@ -183,6 +255,9 @@ class RegionContext:
     # to let AWS pick. EBS volumes are AZ-scoped, so an instance must launch in
     # the volume's AZ to be able to attach it.
     placement_az: str | None = None
+    # Cluster placement-group name to launch into, or None. Set for cluster
+    # nodes so they land in the same group (and AZ) for fast NCCL comms.
+    placement_group: str | None = None
 
 
 @dataclass
@@ -196,7 +271,13 @@ class RegionLaunch:
 
 
 def _build_launch_params(
-    config: LaunchConfig, ami_id: str, sg_id: str, spot: bool, key_name: str, placement_az: str | None = None
+    config: LaunchConfig,
+    ami_id: str,
+    sg_id: str,
+    spot: bool,
+    key_name: str,
+    placement_az: str | None = None,
+    placement_group: str | None = None,
 ) -> dict:
     params: dict = {
         "ImageId": ami_id,
@@ -225,8 +306,13 @@ def _build_launch_params(
             }
         ],
     }
+    placement: dict = {}
     if placement_az:
-        params["Placement"] = {"AvailabilityZone": placement_az}
+        placement["AvailabilityZone"] = placement_az
+    if placement_group:
+        placement["GroupName"] = placement_group
+    if placement:
+        params["Placement"] = placement
     if spot:
         params["InstanceMarketOptions"] = {
             "MarketType": "spot",
@@ -247,11 +333,14 @@ def _run_instances(
     spot: bool,
     key_name: str,
     placement_az: str | None = None,
+    placement_group: str | None = None,
 ) -> dict:
     """Single ``run_instances`` call.
 
     ``placement_az`` pins the instance to a specific availability zone (resolved
     once upstream from an existing ``--ebs-volume-id``); ``None`` lets AWS pick.
+    ``placement_group`` pins it into a cluster placement group (set for cluster
+    nodes).
 
     Raises :class:`CapacityError` on ``InsufficientInstanceCapacity`` (retryable
     by next-region fallthrough and ``--wait``), or :class:`RegionFatalError` on
@@ -259,7 +348,9 @@ def _run_instances(
     """
     market = "spot" if spot else "on-demand"
     try:
-        response = ec2_client.run_instances(**_build_launch_params(config, ami_id, sg_id, spot, key_name, placement_az))
+        response = ec2_client.run_instances(
+            **_build_launch_params(config, ami_id, sg_id, spot, key_name, placement_az, placement_group)
+        )
     except botocore.exceptions.ClientError as e:
         code = e.response["Error"]["Code"]
         if code in ("MaxSpotInstanceCountExceeded", "VcpuLimitExceeded"):
@@ -418,7 +509,15 @@ def launch_with_retry(
                 on_attempt(region, mkt, attempt)
             try:
                 inst = _run_instances(
-                    ctx.ec2_client, config, ctx.ami["ImageId"], ctx.sg_id, region, spot, ctx.key_name, ctx.placement_az
+                    ctx.ec2_client,
+                    config,
+                    ctx.ami["ImageId"],
+                    ctx.sg_id,
+                    region,
+                    spot,
+                    ctx.key_name,
+                    ctx.placement_az,
+                    ctx.placement_group,
                 )
             except CapacityError as e:
                 failures[region] = ("capacity", str(e))
@@ -575,6 +674,64 @@ def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
                 }
             )
     return instances
+
+
+_CLUSTER_STATES = ["pending", "running", "stopping", "stopped", "shutting-down"]
+
+
+def _cluster_node_dict(inst: dict) -> dict:
+    tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+    rank_raw = tags.get(TAG_CLUSTER_RANK)
+    return {
+        "InstanceId": inst["InstanceId"],
+        "ClusterId": tags.get(TAG_CLUSTER_ID, ""),
+        "Rank": int(rank_raw) if rank_raw is not None and rank_raw.isdigit() else None,
+        "State": inst["State"]["Name"],
+        "InstanceType": inst["InstanceType"],
+        "PublicIp": inst.get("PublicIpAddress", ""),
+        "PrivateIp": inst.get("PrivateIpAddress", ""),
+        "LaunchTime": inst["LaunchTime"],
+        "Lifecycle": inst.get("InstanceLifecycle", "on-demand"),
+        "AvailabilityZone": inst["Placement"]["AvailabilityZone"],
+    }
+
+
+def _rank_sort_key(node: dict) -> tuple[bool, int]:
+    # Unranked nodes (rank None) sort last, in a stable order.
+    return (node["Rank"] is None, node["Rank"] if node["Rank"] is not None else 0)
+
+
+def find_cluster_instances(ec2_client, cluster_id: str) -> list[dict]:
+    """Return non-terminated instances tagged with this cluster id, rank-sorted."""
+    response = ec2_client.describe_instances(
+        Filters=[
+            {"Name": f"tag:{TAG_CLUSTER_ID}", "Values": [cluster_id]},
+            {"Name": "instance-state-name", "Values": _CLUSTER_STATES},
+        ]
+    )
+    nodes = [_cluster_node_dict(inst) for reservation in response["Reservations"] for inst in reservation["Instances"]]
+    nodes.sort(key=_rank_sort_key)
+    return nodes
+
+
+def list_clusters(ec2_client, tag_value: str) -> dict[str, list[dict]]:
+    """Group all tool-tagged cluster instances by cluster id."""
+    response = ec2_client.describe_instances(
+        Filters=[
+            {"Name": f"tag:{TAG_CREATED_BY}", "Values": [tag_value]},
+            {"Name": "tag-key", "Values": [TAG_CLUSTER_ID]},
+            {"Name": "instance-state-name", "Values": _CLUSTER_STATES},
+        ]
+    )
+    clusters: dict[str, list[dict]] = {}
+    for reservation in response["Reservations"]:
+        for inst in reservation["Instances"]:
+            node = _cluster_node_dict(inst)
+            if node["ClusterId"]:
+                clusters.setdefault(node["ClusterId"], []).append(node)
+    for nodes in clusters.values():
+        nodes.sort(key=_rank_sort_key)
+    return clusters
 
 
 def list_enabled_regions(ec2_client) -> list[str]:

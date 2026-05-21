@@ -15,7 +15,12 @@ from aws_bootstrap.ec2 import (
     CLIError,
     RegionContext,
     RegionLaunch,
+    _build_launch_params,
     _run_instances,
+    delete_cluster_placement_group,
+    ensure_cluster_placement_group,
+    ensure_cluster_security_group_rule,
+    find_cluster_instances,
     find_tagged_instances,
     find_tagged_instances_in_regions,
     get_latest_ami,
@@ -23,6 +28,7 @@ from aws_bootstrap.ec2 import (
     launch_instance,
     launch_with_retry,
     list_amis,
+    list_clusters,
     list_enabled_regions,
     list_instance_types,
     resolve_ebs_placement_az,
@@ -818,3 +824,196 @@ def test_launch_with_retry_passes_placement_az_to_run_instances():
 
     assert result.region == "us-east-1"
     assert client.run_instances.call_args[1]["Placement"] == {"AvailabilityZone": "us-east-1c"}
+
+
+# ---------------------------------------------------------------------------
+# Cluster placement-group lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_cluster_placement_group_creates_when_absent():
+    ec2 = MagicMock()
+    ec2.describe_placement_groups.return_value = {"PlacementGroups": []}
+    name = ensure_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1", "aws-bootstrap-g4dn")
+    assert name == "aws-bootstrap-cluster-ml1"
+    create_kwargs = ec2.create_placement_group.call_args[1]
+    assert create_kwargs["GroupName"] == "aws-bootstrap-cluster-ml1"
+    assert create_kwargs["Strategy"] == "cluster"
+
+
+def test_ensure_cluster_placement_group_reuses_existing():
+    ec2 = MagicMock()
+    ec2.describe_placement_groups.return_value = {
+        "PlacementGroups": [{"GroupName": "aws-bootstrap-cluster-ml1", "State": "available"}]
+    }
+    name = ensure_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1", "aws-bootstrap-g4dn")
+    assert name == "aws-bootstrap-cluster-ml1"
+    ec2.create_placement_group.assert_not_called()
+
+
+def test_delete_cluster_placement_group_ignores_unknown():
+    ec2 = MagicMock()
+    ec2.delete_placement_group.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "InvalidPlacementGroup.Unknown", "Message": "nope"}},
+        "DeletePlacementGroup",
+    )
+    # Must not raise; already-gone counts as deleted.
+    assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is True
+    ec2.delete_placement_group.assert_called_once_with(GroupName="aws-bootstrap-cluster-ml1")
+
+
+def test_delete_cluster_placement_group_success_returns_true():
+    ec2 = MagicMock()
+    assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is True
+
+
+def test_delete_cluster_placement_group_in_use_returns_false():
+    ec2 = MagicMock()
+    ec2.delete_placement_group.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "InvalidPlacementGroup.InUse", "Message": "in use"}},
+        "DeletePlacementGroup",
+    )
+    # Instances still terminating -> not deletable yet, but no raise.
+    assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is False
+
+
+# ---------------------------------------------------------------------------
+# Intra-cluster security-group rule
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_cluster_sg_rule_authorizes_self_reference():
+    ec2 = MagicMock()
+    ensure_cluster_security_group_rule(ec2, "sg-123")
+    kwargs = ec2.authorize_security_group_ingress.call_args[1]
+    assert kwargs["GroupId"] == "sg-123"
+    perm = kwargs["IpPermissions"][0]
+    assert perm["IpProtocol"] == "-1"
+    assert perm["UserIdGroupPairs"][0]["GroupId"] == "sg-123"
+
+
+def test_ensure_cluster_sg_rule_idempotent_on_duplicate():
+    ec2 = MagicMock()
+    ec2.authorize_security_group_ingress.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "InvalidPermission.Duplicate", "Message": "exists"}},
+        "AuthorizeSecurityGroupIngress",
+    )
+    # Must not raise.
+    ensure_cluster_security_group_rule(ec2, "sg-123")
+
+
+# ---------------------------------------------------------------------------
+# Cluster instance discovery
+# ---------------------------------------------------------------------------
+
+
+def _cluster_reservation(instance_id, cluster_id, rank, az="us-east-1c", private="10.0.0.5"):
+    return {
+        "Instances": [
+            {
+                "InstanceId": instance_id,
+                "State": {"Name": "running"},
+                "InstanceType": "g5.xlarge",
+                "PublicIpAddress": "1.2.3.4",
+                "PrivateIpAddress": private,
+                "LaunchTime": datetime(2026, 5, 21, tzinfo=UTC),
+                "Placement": {"AvailabilityZone": az},
+                "InstanceLifecycle": "spot",
+                "Tags": [
+                    {"Key": "aws-bootstrap-cluster", "Value": cluster_id},
+                    {"Key": "aws-bootstrap-cluster-rank", "Value": str(rank)},
+                ],
+            }
+        ]
+    }
+
+
+def test_find_cluster_instances_sorted_by_rank():
+    ec2 = MagicMock()
+    ec2.describe_instances.return_value = {
+        "Reservations": [
+            _cluster_reservation("i-2", "ml1", 1, private="10.0.0.6"),
+            _cluster_reservation("i-1", "ml1", 0, private="10.0.0.5"),
+        ]
+    }
+    nodes = find_cluster_instances(ec2, "ml1")
+    assert [n["Rank"] for n in nodes] == [0, 1]
+    assert nodes[0]["InstanceId"] == "i-1"
+    assert nodes[0]["PrivateIp"] == "10.0.0.5"
+    assert nodes[0]["AvailabilityZone"] == "us-east-1c"
+    filters = ec2.describe_instances.call_args[1]["Filters"]
+    assert {"Name": "tag:aws-bootstrap-cluster", "Values": ["ml1"]} in filters
+
+
+def test_list_clusters_groups_by_cluster_id():
+    ec2 = MagicMock()
+    ec2.describe_instances.return_value = {
+        "Reservations": [
+            _cluster_reservation("i-1", "ml1", 0),
+            _cluster_reservation("i-2", "ml1", 1),
+            _cluster_reservation("i-3", "exp2", 0),
+        ]
+    }
+    clusters = list_clusters(ec2, "aws-bootstrap-g4dn")
+    assert set(clusters) == {"ml1", "exp2"}
+    assert len(clusters["ml1"]) == 2
+    assert len(clusters["exp2"]) == 1
+
+
+# ---------------------------------------------------------------------------
+# Placement-group threading through the launch path
+# ---------------------------------------------------------------------------
+
+
+def test_build_launch_params_includes_placement_group():
+    p = _build_launch_params(
+        LaunchConfig(),
+        "ami-x",
+        "sg-x",
+        True,
+        "k",
+        placement_az="us-east-1c",
+        placement_group="aws-bootstrap-cluster-ml1",
+    )
+    assert p["Placement"] == {
+        "AvailabilityZone": "us-east-1c",
+        "GroupName": "aws-bootstrap-cluster-ml1",
+    }
+
+
+def test_build_launch_params_group_only():
+    p = _build_launch_params(LaunchConfig(), "ami-x", "sg-x", True, "k", placement_group="aws-bootstrap-cluster-ml1")
+    assert p["Placement"] == {"GroupName": "aws-bootstrap-cluster-ml1"}
+
+
+def test_run_instances_passes_placement_group():
+    ec2 = MagicMock()
+    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-1"}]}
+    _run_instances(
+        ec2,
+        LaunchConfig(),
+        "ami",
+        "sg",
+        "us-east-1",
+        True,
+        "k",
+        placement_az="us-east-1c",
+        placement_group="aws-bootstrap-cluster-ml1",
+    )
+    assert ec2.run_instances.call_args[1]["Placement"]["GroupName"] == "aws-bootstrap-cluster-ml1"
+
+
+def test_launch_with_retry_threads_placement_group():
+    client = MagicMock()
+    client.run_instances.return_value = _ok_instance("i-east")
+    ctx = RegionContext(
+        region="us-east-1",
+        ec2_client=client,
+        ami={"ImageId": "ami-east"},
+        sg_id="sg-1",
+        key_name="aws-bootstrap-key",
+        placement_az="us-east-1c",
+        placement_group="aws-bootstrap-cluster-ml1",
+    )
+    launch_with_retry(LaunchConfig(regions=("us-east-1",), spot=True), lambda r: ctx)
+    assert client.run_instances.call_args[1]["Placement"]["GroupName"] == "aws-bootstrap-cluster-ml1"

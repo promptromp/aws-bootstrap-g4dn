@@ -1,6 +1,7 @@
 """CLI entry point for aws-bootstrap-g4dn."""
 
 from __future__ import annotations
+import contextlib
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -9,6 +10,7 @@ import boto3
 import botocore.exceptions
 import click
 
+from . import cluster as cluster_mod
 from .config import LaunchConfig
 from .constants import (
     DEFAULT_REGION,
@@ -16,18 +18,26 @@ from .constants import (
     EBS_DETACH_WAITER,
     EBS_MOUNT_POINT,
     JUPYTER_PORT,
+    RDZV_PORT,
     SSH_PORT_DEFAULT,
     TAG_BOOTSTRAP_INSTANCE,
+    TAG_CLUSTER_ID,
+    TAG_CLUSTER_RANK,
     TAG_CREATED_BY,
     TAG_VALUE,
 )
 from .ec2 import (
     CLIError,
     RegionContext,
+    RegionLaunch,
     attach_ebs_volume,
     create_ebs_volume,
+    delete_cluster_placement_group,
     delete_ebs_volume,
+    ensure_cluster_placement_group,
+    ensure_cluster_security_group_rule,
     ensure_security_group,
+    find_cluster_instances,
     find_ebs_volumes_for_instance,
     find_orphan_ebs_volumes,
     find_tagged_instances,
@@ -37,6 +47,7 @@ from .ec2 import (
     instance_type_to_family,
     launch_with_retry,
     list_amis,
+    list_clusters,
     list_enabled_regions,
     list_instance_types,
     resolve_ebs_placement_az,
@@ -68,7 +79,9 @@ from .ssh import (
     query_gpu_info,
     remove_ssh_host,
     resolve_instance_id,
+    run_on_host,
     run_remote_setup,
+    scp_to_host,
     wait_for_ssh,
 )
 
@@ -1692,3 +1705,555 @@ def quota_history(ctx, family, quota_type, status_filter, region, profile):
         click.echo()
 
     click.echo()
+
+
+# ---------------------------------------------------------------------------
+# cluster: multi-node training clusters (Phase 1 — launch / status / terminate)
+# ---------------------------------------------------------------------------
+
+
+@main.group(name="cluster")
+def cluster_cmd():
+    """Manage multi-node training clusters (launch, status, terminate)."""
+
+
+@cluster_cmd.command(name="launch")
+@click.option("--cluster-id", required=True, help="Cluster identifier (used as an EC2 tag).")
+@click.option("--nodes", default=2, show_default=True, type=int, help="Target number of nodes.")
+@click.option("--instance-type", default="g4dn.xlarge", show_default=True, help="EC2 instance type.")
+@click.option("--spot/--on-demand", default=True, show_default=True, help="Use spot or on-demand pricing.")
+@click.option(
+    "--key-path", default="~/.ssh/id_ed25519.pub", show_default=True, type=click.Path(), help="Local SSH public key."
+)
+@click.option("--key-name", default="aws-bootstrap-key", show_default=True, help="AWS key pair name.")
+@click.option("--region", "regions", multiple=True, metavar="REGION", help="AWS region (single AZ chosen within it).")
+@click.option("--security-group", default="aws-bootstrap-ssh", show_default=True, help="Security group name.")
+@click.option("--volume-size", default=100, show_default=True, type=int, help="Root EBS volume size in GB (gp3).")
+@click.option("--no-setup", is_flag=True, default=False, help="Skip running the remote setup script.")
+@click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port on the remote instances.")
+@click.option("--python-version", default=None, help="Python version for the remote venv.")
+@click.option(
+    "--wait",
+    is_flag=True,
+    default=False,
+    help="On insufficient spot capacity, retry each node with bounded backoff until --wait-timeout "
+    "(no on-demand prompt).",
+)
+@click.option(
+    "--wait-timeout",
+    type=DURATION,
+    default=DEFAULT_WAIT_TIMEOUT,
+    show_default="30m",
+    help="Max time to wait per node for spot capacity when --wait is set (e.g. 30m, 90s, 1h).",
+)
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.pass_context
+def cluster_launch(
+    ctx,
+    cluster_id,
+    nodes,
+    instance_type,
+    spot,
+    key_path,
+    key_name,
+    regions,
+    security_group,
+    volume_size,
+    no_setup,
+    ssh_port,
+    python_version,
+    wait,
+    wait_timeout,
+    profile,
+):
+    """Launch (or grow) a training cluster to N nodes in one AZ + placement group."""
+    region = resolve_single_region(regions[0] if regions else None, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=region).client("ec2")
+
+    existing = find_cluster_instances(ec2, cluster_id)
+    to_add = cluster_mod.nodes_to_add(len(existing), nodes)
+    start_rank = max((n["Rank"] for n in existing if n["Rank"] is not None), default=-1) + 1
+
+    if to_add == 0:
+        success(f"Cluster '{cluster_id}' already has {len(existing)} node(s); nothing to add.")
+        emit({"cluster_id": cluster_id, "nodes_added": 0, "node_count": len(existing)}, ctx=ctx)
+        return
+
+    key = Path(key_path).expanduser()
+    if not key.exists():
+        generate_ssh_keypair(key)
+
+    pg_name = cluster_mod.placement_group_name(cluster_id)
+    ensure_cluster_placement_group(ec2, pg_name, TAG_VALUE)
+    sg_id = ensure_security_group(ec2, security_group, TAG_VALUE, ssh_port=ssh_port)
+    ensure_cluster_security_group_rule(ec2, sg_id)
+
+    config = LaunchConfig(
+        instance_type=instance_type,
+        spot=spot,
+        key_path=key,
+        key_name=key_name,
+        regions=(region,),
+        security_group=security_group,
+        volume_size=volume_size,
+        run_setup=not no_setup,
+        ssh_port=ssh_port,
+        python_version=python_version,
+        wait=wait,
+        wait_timeout=wait_timeout,
+    )
+    if profile:
+        config.profile = profile
+
+    # AZ is captured from the first launched node and pinned for the rest;
+    # AMI/key are looked up once and reused across nodes.
+    shared: dict = {"az": existing[0]["AvailabilityZone"] if existing else None, "ami": None, "key": None}
+
+    def prepare_region(r: str) -> RegionContext:
+        if shared["ami"] is None:
+            shared["ami"] = get_latest_ami(ec2, config.ami_filter)
+        if shared["key"] is None:
+            shared["key"] = import_key_pair(ec2, config.key_name, config.key_path)
+        return RegionContext(
+            region=r,
+            ec2_client=ec2,
+            ami=shared["ami"],
+            sg_id=sg_id,
+            key_name=shared["key"],
+            placement_az=shared["az"],
+            placement_group=pg_name,
+        )
+
+    added: list[dict] = []
+
+    def on_node(rank: int, launch) -> None:
+        instance_id = launch.instance["InstanceId"]
+        inst = wait_instance_ready(ec2, instance_id)
+        if shared["az"] is None:
+            shared["az"] = inst["Placement"]["AvailabilityZone"]
+        ec2.create_tags(
+            Resources=[instance_id],
+            Tags=[
+                {"Key": TAG_CLUSTER_ID, "Value": cluster_id},
+                {"Key": TAG_CLUSTER_RANK, "Value": str(rank)},
+            ],
+        )
+        public_ip = inst.get("PublicIpAddress", "")
+        alias = cluster_mod.node_alias(cluster_id, rank)
+        if public_ip:
+            add_ssh_host(instance_id, public_ip, config.ssh_user, config.key_path, port=ssh_port, alias=alias)
+        added.append({"rank": rank, "instance_id": instance_id, "public_ip": public_ip, "alias": alias})
+
+        # Run remote setup so the node has ~/venv + CUDA-matched PyTorch + torchrun
+        # (the cluster prepare/test/run pipeline depends on it). Same flow as the
+        # single-node `launch`; setup failure is non-fatal (node stays up).
+        if public_ip and config.run_setup and SETUP_SCRIPT.exists():
+            info(f"  rank {rank}: running remote setup on {instance_id}...")
+            if not wait_for_ssh(public_ip, config.ssh_user, config.key_path, port=ssh_port):
+                warn(f"  rank {rank}: SSH did not become available; skipping setup (node still running).")
+            elif run_remote_setup(
+                public_ip, config.ssh_user, config.key_path, SETUP_SCRIPT, config.python_version, port=ssh_port
+            ):
+                success(f"  rank {rank}: remote setup complete.")
+            else:
+                warn(f"  rank {rank}: remote setup failed (node still running; re-run setup or check logs).")
+
+    # Never silently fall back to on-demand mid-cluster: that would create a
+    # mixed-pricing cluster (and auto-confirm silently in structured output).
+    # On spot exhaustion the user re-runs with --wait (retry) or --on-demand.
+    def launch_node(cfg: LaunchConfig, prep) -> RegionLaunch:
+        return launch_with_retry(cfg, prep, confirm_on_demand=lambda: False)
+
+    step(1, 1, f"Launching {to_add} node(s) for cluster '{cluster_id}' in {region} (placement group {pg_name})...")
+    try:
+        cluster_mod.launch_cluster_nodes(
+            config, prepare_region, to_add, start_rank, launch_fn=launch_node, on_node=on_node
+        )
+    except CLIError as e:
+        # Partial progress: nodes already launched are tagged + aliased and billable.
+        if added:
+            warn(f"Launched {len(added)} of {to_add} requested node(s) before failing.")
+            info(
+                "  Re-run to finish:  "
+                + _cmd(f"aws-bootstrap cluster launch --cluster-id {cluster_id} --nodes {nodes} --region {region}")
+            )
+            info(
+                "  Or roll back:      "
+                + _cmd(f"aws-bootstrap cluster terminate --cluster-id {cluster_id} --region {region}")
+            )
+        raise CLIError(
+            f"{e.format_message()}\n\n  (cluster nodes are AZ-pinned to {shared['az'] or region}; "
+            "a fresh cluster id can target a different AZ, or re-run with --wait to ride out spot capacity.)"
+        ) from None
+
+    success(f"Cluster '{cluster_id}' now has {len(existing) + to_add} node(s).")
+    if is_text(ctx):
+        info("Next: " + _cmd(f"aws-bootstrap cluster status --cluster-id {cluster_id} --region {region}"))
+    emit(
+        {
+            "cluster_id": cluster_id,
+            "region": region,
+            "availability_zone": shared["az"],
+            "placement_group": pg_name,
+            "nodes_added": to_add,
+            "node_count": len(existing) + to_add,
+            "nodes": added,
+        },
+        ctx=ctx,
+    )
+
+
+@cluster_cmd.command(name="status")
+@click.option("--cluster-id", default=None, help="Cluster id (omit to list all clusters).")
+@click.option("--region", default=None, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.pass_context
+def cluster_status(ctx, cluster_id, region, profile):
+    """Show cluster node membership and readiness."""
+    resolved = resolve_single_region(region, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
+
+    if cluster_id:
+        nodes = find_cluster_instances(ec2, cluster_id)
+        if is_text(ctx):
+            val("Cluster", cluster_id)
+            val("Region", resolved)
+            for n in nodes:
+                click.echo(
+                    f"  rank {n['Rank']}  {n['InstanceId']}  {n['State']}  "
+                    f"{n['InstanceType']}  {n['AvailabilityZone']}  {n['PublicIp']}"
+                )
+            if not nodes:
+                warn(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+        emit(
+            {
+                "cluster_id": cluster_id,
+                "region": resolved,
+                "nodes": [
+                    {
+                        "rank": n["Rank"],
+                        "instance_id": n["InstanceId"],
+                        "state": n["State"],
+                        "instance_type": n["InstanceType"],
+                        "az": n["AvailabilityZone"],
+                        "public_ip": n["PublicIp"],
+                        "private_ip": n["PrivateIp"],
+                    }
+                    for n in nodes
+                ],
+            },
+            ctx=ctx,
+        )
+        return
+
+    clusters = list_clusters(ec2, TAG_VALUE)
+    if is_text(ctx):
+        val("Region", resolved)
+        for cid, nodes in sorted(clusters.items()):
+            click.echo(f"  {cid}: {len(nodes)} node(s)")
+        if not clusters:
+            warn(f"No clusters found in {resolved}.")
+    emit(
+        {
+            "region": resolved,
+            "clusters": [{"cluster_id": cid, "node_count": len(nodes)} for cid, nodes in sorted(clusters.items())],
+        },
+        ctx=ctx,
+    )
+
+
+@cluster_cmd.command(name="terminate")
+@click.option("--cluster-id", required=True, help="Cluster id to terminate.")
+@click.option("--region", default=None, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.option("--yes", is_flag=True, default=False, help="Skip the confirmation prompt.")
+@click.pass_context
+def cluster_terminate(ctx, cluster_id, region, profile, yes):
+    """Terminate all nodes of a cluster and delete its placement group.
+
+    Note: `cluster launch` does not create per-node EBS data volumes (yet), so
+    there are none to preserve/delete here. When per-node `--ebs-storage` lands,
+    this command will gain EBS cleanup + `--keep-ebs`, mirroring single-node
+    `terminate`.
+    """
+    resolved = resolve_single_region(region, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
+    nodes = find_cluster_instances(ec2, cluster_id)
+
+    if not nodes:
+        warn(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+        emit({"cluster_id": cluster_id, "terminated": []}, ctx=ctx)
+        return
+
+    if not yes:
+        if not is_text(ctx):
+            raise CLIError("Refusing to terminate without --yes in structured output mode.")
+        click.confirm(f"Terminate {len(nodes)} node(s) of cluster '{cluster_id}'?", abort=True)
+
+    instance_ids = [n["InstanceId"] for n in nodes]
+    terminate_tagged_instances(ec2, instance_ids)
+    for iid in instance_ids:
+        remove_ssh_host(iid)
+
+    # The placement group can't be deleted while instances are still
+    # shutting down, so wait for full termination first (best-effort).
+    info("Waiting for instances to terminate before deleting the placement group...")
+    with contextlib.suppress(botocore.exceptions.WaiterError):
+        ec2.get_waiter("instance_terminated").wait(
+            InstanceIds=instance_ids, WaiterConfig={"Delay": 10, "MaxAttempts": 30}
+        )
+    pg_name = cluster_mod.placement_group_name(cluster_id)
+    if not delete_cluster_placement_group(ec2, pg_name):
+        warn(
+            f"Placement group '{pg_name}' is still in use; re-run `cluster terminate` "
+            "once the instances finish terminating to remove it."
+        )
+
+    success(f"Terminated {len(instance_ids)} node(s) of cluster '{cluster_id}'.")
+    emit({"cluster_id": cluster_id, "region": resolved, "terminated": instance_ids}, ctx=ctx)
+
+
+def _canary_runners(user, key_path, ssh_port):
+    """Build (scp_fn, run_fn) closures over the ssh primitives for cluster nodes."""
+
+    def scp_fn(node, local, remote):
+        return scp_to_host(node["PublicIp"], user, key_path, local, remote, port=ssh_port)
+
+    def run_fn(node, command):
+        return run_on_host(node["PublicIp"], user, key_path, command, port=ssh_port, timeout=600)
+
+    return scp_fn, run_fn
+
+
+@cluster_cmd.command(name="test")
+@click.option("--cluster-id", required=True, help="Cluster id.")
+@click.option("--region", default=None, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.option(
+    "--key-path", default="~/.ssh/id_ed25519.pub", show_default=True, type=click.Path(), help="Local SSH public key."
+)
+@click.option("--ssh-user", default="ubuntu", show_default=True, help="Remote SSH user.")
+@click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port.")
+@click.pass_context
+def cluster_test(ctx, cluster_id, region, profile, key_path, ssh_user, ssh_port):
+    """Run the built-in distributed canary across the cluster (verify it works)."""
+    resolved = resolve_single_region(region, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
+    nodes = find_cluster_instances(ec2, cluster_id)
+    if not nodes:
+        raise CLIError(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+
+    key = Path(key_path).expanduser()
+    scp_fn, run_fn = _canary_runners(ssh_user, key, ssh_port)
+
+    step(1, 1, f"Running canary across {len(nodes)} node(s) of cluster '{cluster_id}'...")
+    results = cluster_mod.run_canary(
+        nodes, cluster_id=cluster_id, nproc_per_node=1, rdzv_port=RDZV_PORT, scp_fn=scp_fn, run_fn=run_fn
+    )
+    passed = all(r.returncode == 0 for r in results)
+    if is_text(ctx):
+        for r in results:
+            tag = "OK" if r.returncode == 0 else "FAIL"
+            click.echo(f"  [{tag}] rank {r.rank} ({r.instance_id})")
+            if r.returncode != 0 and r.stderr.strip():
+                click.echo(f"        {r.stderr.strip().splitlines()[-1]}")
+        (success if passed else warn)("Canary passed." if passed else "Canary FAILED.")
+    emit(
+        {
+            "cluster_id": cluster_id,
+            "passed": passed,
+            "results": [{"rank": r.rank, "instance_id": r.instance_id, "returncode": r.returncode} for r in results],
+        },
+        ctx=ctx,
+    )
+    if not passed:
+        ctx.exit(1)
+
+
+@cluster_cmd.command(name="prepare")
+@click.option("--cluster-id", required=True, help="Cluster id.")
+@click.option("--region", default=None, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.option(
+    "--key-path", default="~/.ssh/id_ed25519.pub", show_default=True, type=click.Path(), help="Local SSH public key."
+)
+@click.option("--ssh-user", default="ubuntu", show_default=True, help="Remote SSH user.")
+@click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port.")
+@click.option("--no-canary", is_flag=True, default=False, help="Skip the auto-canary at the end.")
+@click.pass_context
+def cluster_prepare(ctx, cluster_id, region, profile, key_path, ssh_user, ssh_port, no_canary):
+    """Verify a cluster (reachability, GPU, version consistency) and run a canary."""
+    resolved = resolve_single_region(region, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
+    nodes = find_cluster_instances(ec2, cluster_id)
+    if not nodes:
+        raise CLIError(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+    key = Path(key_path).expanduser()
+    total = 2 if not no_canary else 1
+
+    step(1, total, f"Verifying {len(nodes)} node(s) of cluster '{cluster_id}'...")
+    cuda_versions: dict[str, str] = {}
+    gpus_per_node = 1
+    for n in nodes:
+        gpu = query_gpu_info(n["PublicIp"], ssh_user, key, port=ssh_port)
+        if gpu is None:
+            raise CLIError(f"Node {n['InstanceId']} (rank {n['Rank']}) is unreachable or has no GPU.")
+        cuda_versions[n["InstanceId"]] = gpu.cuda_toolkit_version or gpu.cuda_driver_version or ""
+        val(f"  rank {n['Rank']} {n['InstanceId']}", f"{gpu.gpu_name} CUDA {cuda_versions[n['InstanceId']]}")
+
+    skew = cluster_mod.detect_version_skew(cuda_versions)
+    if skew:
+        raise CLIError("Cluster nodes are inconsistent:\n  " + "\n  ".join(skew))
+
+    # Write a per-node cluster config (used by later `cluster run`).
+    addr = cluster_mod.master_addr(nodes)
+    node_ips = [n["PrivateIp"] for n in nodes]
+    for n in nodes:
+        env = cluster_mod.node_env(cluster_id, n["Rank"], len(nodes), gpus_per_node, node_ips, addr)
+        config_body = cluster_mod.render_node_config(env)
+        write_cmd = f"cat > ~/.aws-bootstrap-cluster <<'AWSB_EOF'\n{config_body}\nAWSB_EOF"
+        rc, _, err = run_on_host(n["PublicIp"], ssh_user, key, write_cmd, port=ssh_port)
+        if rc != 0:
+            warn(f"Could not write cluster config on {n['InstanceId']}: {err.strip()}")
+
+    success(f"Cluster '{cluster_id}' verified: {len(nodes)} node(s), CUDA consistent, master {addr}.")
+
+    if no_canary:
+        emit(
+            {"cluster_id": cluster_id, "verified": True, "master_addr": addr, "node_count": len(nodes)},
+            ctx=ctx,
+        )
+        return
+
+    step(2, total, "Running verification canary...")
+    scp_fn, run_fn = _canary_runners(ssh_user, key, ssh_port)
+    results = cluster_mod.run_canary(
+        nodes, cluster_id=cluster_id, nproc_per_node=gpus_per_node, rdzv_port=RDZV_PORT, scp_fn=scp_fn, run_fn=run_fn
+    )
+    passed = all(r.returncode == 0 for r in results)
+    if not passed and is_text(ctx):
+        for r in results:
+            if r.returncode != 0:
+                click.echo(f"  rank {r.rank} ({r.instance_id}) canary failed: {r.stderr.strip()[:200]}")
+    (success if passed else warn)("Canary passed — cluster is ready." if passed else "Canary FAILED.")
+    if is_text(ctx) and passed:
+        info("Next: " + _cmd(f"aws-bootstrap cluster run --cluster-id {cluster_id} <your_train.py>"))
+    emit(
+        {
+            "cluster_id": cluster_id,
+            "verified": True,
+            "canary_passed": passed,
+            "master_addr": addr,
+            "node_count": len(nodes),
+        },
+        ctx=ctx,
+    )
+    if not passed:
+        ctx.exit(1)
+
+
+@cluster_cmd.command(name="run", context_settings={"ignore_unknown_options": True})
+@click.option("--cluster-id", required=True, help="Cluster id.")
+@click.option("--region", default=None, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.option(
+    "--key-path", default="~/.ssh/id_ed25519.pub", show_default=True, type=click.Path(), help="Local SSH public key."
+)
+@click.option("--ssh-user", default="ubuntu", show_default=True, help="Remote SSH user.")
+@click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port.")
+@click.option("--nproc-per-node", default=1, show_default=True, type=int, help="Processes (GPUs) per node.")
+@click.option(
+    "--data-script", default=None, type=click.Path(), help="Optional data-prep script run on each node first."
+)
+@click.option(
+    "--log-dir",
+    default=".aws-bootstrap/clusters",
+    show_default=True,
+    type=click.Path(),
+    help="Local dir for per-node logs.",
+)
+@click.argument("script", type=click.Path())
+@click.argument("script_args", nargs=-1, type=click.UNPROCESSED)
+@click.pass_context
+def cluster_run(
+    ctx,
+    cluster_id,
+    region,
+    profile,
+    key_path,
+    ssh_user,
+    ssh_port,
+    nproc_per_node,
+    data_script,
+    log_dir,
+    script,
+    script_args,
+):
+    """Distribute SCRIPT to all nodes and run it across the cluster via torchrun.
+
+    A .py SCRIPT is launched with torchrun (c10d rendezvous); a .sh SCRIPT runs
+    as-is with the AWSB_* env contract exported. Pass training args after ``--``.
+    """
+    local_script = Path(script).expanduser()
+    if not local_script.exists():
+        raise CLIError(f"Script not found: {local_script}")
+    data_path = Path(data_script).expanduser() if data_script else None
+    if data_path is not None and not data_path.exists():
+        raise CLIError(f"Data-prep script not found: {data_path}")
+
+    resolved = resolve_single_region(region, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
+    nodes = find_cluster_instances(ec2, cluster_id)
+    if not nodes:
+        raise CLIError(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+
+    key = Path(key_path).expanduser()
+    scp_fn, run_fn = _canary_runners(ssh_user, key, ssh_port)
+    remote_script = f"/tmp/{local_script.name}"  # noqa: S108
+
+    step(1, 1, f"Running {local_script.name} across {len(nodes)} node(s) of cluster '{cluster_id}'...")
+    results = cluster_mod.run_distributed_job(
+        nodes,
+        cluster_id=cluster_id,
+        nproc_per_node=nproc_per_node,
+        rdzv_port=RDZV_PORT,
+        local_script=local_script,
+        remote_script=remote_script,
+        script_args=list(script_args),
+        scp_fn=scp_fn,
+        run_fn=run_fn,
+        data_script=data_path,
+    )
+
+    # Persist per-node logs.
+    out_dir = Path(log_dir).expanduser() / cluster_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for r in results:
+        (out_dir / f"rank{r.rank}.log").write_text(
+            f"# exit={r.returncode}\n## stdout\n{r.stdout}\n## stderr\n{r.stderr}\n"
+        )
+
+    succeeded = all(r.returncode == 0 for r in results)
+    if is_text(ctx):
+        # Echo every node that produced output. Under c10d rendezvous the
+        # torch global rank 0 (which usually does the printing) is NOT
+        # necessarily our node rank 0, so we can't single out one node.
+        for r in results:
+            if r.stdout.strip():
+                click.echo(f"  --- rank {r.rank} ({r.instance_id}) stdout ---")
+                click.echo(r.stdout.rstrip())
+        for r in results:
+            tag = "OK" if r.returncode == 0 else f"FAIL({r.returncode})"
+            click.echo(f"  [{tag}] rank {r.rank} ({r.instance_id})  log: {out_dir / f'rank{r.rank}.log'}")
+        (success if succeeded else warn)("Job complete." if succeeded else "Job FAILED on one or more nodes.")
+    emit(
+        {
+            "cluster_id": cluster_id,
+            "succeeded": succeeded,
+            "log_dir": str(out_dir),
+            "results": [{"rank": r.rank, "instance_id": r.instance_id, "returncode": r.returncode} for r in results],
+        },
+        ctx=ctx,
+    )
+    if not succeeded:
+        ctx.exit(1)

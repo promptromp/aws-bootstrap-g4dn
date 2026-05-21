@@ -408,6 +408,56 @@ Key behaviors:
 - **Automatic AZ matching** — EBS volumes are tied to a single availability zone, and an instance can only attach a volume in its own AZ. When you reattach with `--ebs-volume-id`, the launch automatically pins the new instance to the volume's AZ, so you never hit a "wrong AZ" attach failure. (One consequence: spot capacity is then constrained to that single AZ, so a launch may need `--wait` to ride out a temporary shortage. A `--ebs-volume-id` launch targets the volume's region.)
 - Mount failures are non-fatal — the instance remains usable
 
+## Multi-node training clusters (preview)
+
+Launch several GPU instances as a coordinated **cluster** for multi-node distributed training (e.g. PyTorch DDP via `torchrun`). A cluster is identified by an arbitrary `--cluster-id` used as an EC2 tag — AWS tags are the source of truth, so there's no local state file to keep in sync.
+
+> **Full walkthrough:** [docs/multi-node-training.md](docs/multi-node-training.md) takes you from zero to a running multi-node training job, with runnable example scripts in [examples/cluster/](examples/cluster/) (a DDP training script and a data-prep script).
+
+```bash
+# Launch a 4-node cluster (single AZ, cluster placement group, shared SG)
+aws-bootstrap cluster launch --cluster-id ml1 --nodes 4 --instance-type g5.xlarge --region us-east-1
+
+# Re-run with a higher --nodes to grow the cluster incrementally
+aws-bootstrap cluster launch --cluster-id ml1 --nodes 6
+
+# See the cluster's nodes (rank, state, AZ, IP); omit --cluster-id to list all clusters
+aws-bootstrap cluster status --cluster-id ml1
+
+# Verify the cluster (reachability, GPU, consistent CUDA) + run a distributed canary
+aws-bootstrap cluster prepare --cluster-id ml1
+
+# Re-run the canary any time as a heartbeat
+aws-bootstrap cluster test --cluster-id ml1
+
+# Run your own training script across all nodes (torchrun, c10d rendezvous).
+# Args after `--` are passed to your script; per-node logs land under --log-dir.
+aws-bootstrap cluster run --cluster-id ml1 train.py -- --epochs 5
+
+# ...with a data-prep step that runs on each node first (e.g. pull from S3 to /data)
+aws-bootstrap cluster run --cluster-id ml1 --data-script prep.sh train.py -- --epochs 5
+
+# Tear it all down (nodes, SSH aliases, placement group)
+aws-bootstrap cluster terminate --cluster-id ml1 --yes
+```
+
+Key behaviors:
+- **One AZ + cluster placement group** — all nodes land in the same availability zone inside a cluster placement group for low-latency NCCL communication. Incremental adds reuse that AZ.
+- **Shared security group** — a self-referencing ingress rule lets cluster members reach each other on the NCCL/rendezvous ports (in addition to SSH).
+- **Per-node SSH aliases** — each node gets an `aws-<cluster-id>-<rank>` alias in `~/.ssh/config` (e.g. `ssh aws-ml1-0`).
+- **Stable ranks** — nodes are tagged with a stable rank (`0..N-1`); rank 0 is the rendezvous/master node (it also trains).
+- **Verify before you train** — `cluster prepare` checks every node is reachable, has a GPU, and runs a **consistent** CUDA version (it fails fast on version skew), writes a per-node cluster config, then runs a built-in distributed **canary** (a tiny DDP all-reduce + a few SGD steps across all nodes) to prove NCCL/rendezvous works end-to-end. `cluster test` re-runs that canary on demand.
+- **`cluster run` — distributed training** — distributes your `SCRIPT` to every node and runs it across the cluster. A `.py` script is launched with `torchrun` (c10d rendezvous, all nodes pointed at rank 0); a `.sh` script runs as-is with the `AWSB_*` environment contract exported (`AWSB_NODE_RANK`, `AWSB_NUM_NODES`, `AWSB_NUM_GPUS_PER_NODE`, `AWSB_NODE_IPS`, `AWSB_MASTER_ADDR`) so you can wire up any launcher. Per-node stdout/stderr are saved under `--log-dir`.
+- **Data-prep convention** — pass `--data-script prep.sh` and it's copied to every node and run **once, before training** (it's a barrier — training won't start until all nodes finish prep). Only the script's **exit code** is the success signal, so start it with `set -euo pipefail` to ensure a failed step actually fails the prep. The recommended pattern is an idempotent S3 pull into the per-node `/data` EBS mount:
+  ```bash
+  # prep.sh
+  set -euo pipefail
+  test -f /data/.prepared && exit 0
+  aws s3 sync s3://my-bucket/dataset /data/dataset
+  touch /data/.prepared
+  ```
+- **EFA / AZ caveat** — `g4dn`/`g5` instances run NCCL over ordinary VPC networking (EFA is essentially P-series only), which is fine for dev/learning/modest scale. Pinning to one AZ means a spot shortage there affects the whole cluster.
+
 ## EC2 vCPU Quotas
 
 AWS accounts have [service quotas](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-resource-limits.html) that limit how many vCPUs you can run per instance family. New or lightly-used accounts often have a **default quota of 0 vCPUs** for GPU instance families (G and VT), which will cause errors on launch:
