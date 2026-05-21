@@ -2186,8 +2186,10 @@ def test_quota_request_json(mock_session, mock_get, mock_request):
     result = runner.invoke(main, ["-o", "json", "quota", "request", "--type", "spot", "--desired-value", "4", "--yes"])
     assert result.exit_code == 0
     data = json.loads(result.output)
-    assert data["request_id"] == "req-123"
-    assert data["status"] == "PENDING"
+    assert len(data["requests"]) == 1
+    assert data["requests"][0]["request_id"] == "req-123"
+    assert data["requests"][0]["status"] == "PENDING"
+    assert data["requests"][0]["region"] == "us-west-2"
 
 
 @patch("aws_bootstrap.cli.get_quota")

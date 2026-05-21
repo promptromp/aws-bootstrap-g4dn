@@ -54,8 +54,10 @@ aws_bootstrap/
         remote_setup.sh        # Uploaded & run on instance post-boot (GPU verify, Jupyter, etc.)
         requirements.txt       # Python dependencies installed on the remote instance
     tests/               # Unit tests (pytest)
+        conftest.py            # Shared fixtures (runner, cli_session, quota/ami/instance-type rows)
         test_config.py
         test_cli.py
+        test_cli_regions.py    # Region-aware quota/list CLI tests (fixtures + parametrize)
         test_ec2.py
         test_output.py
         test_gpu.py
@@ -93,11 +95,13 @@ Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`
 - **`status`** — lists all non-terminated instances (including `shutting-down`) with region, type, IP, SSH alias, EBS data volumes, pricing (spot price/hr or on-demand), uptime, and estimated cost for running spot instances. With no `--region`, queries **all enabled regions** (discovered via `describe_regions(AllRegions=False)`) in parallel and labels each instance with its region; pass one or more `--region`/`-r` values (repeatable) to restrict the query to those regions. Per-region query failures (e.g. an unauthorized region) emit a stderr warning and are skipped rather than aborting the command (and are surfaced as `regions_failed` in structured output). `--gpu` flag queries GPU info via SSH, reporting both CUDA toolkit version (from `nvcc`) and driver-supported max (from `nvidia-smi`); `--instructions` (default: on) prints connection commands (SSH, Jupyter tunnel, VSCode Remote SSH, GPU benchmark) for each running instance; suppress with `--no-instructions`
 - **`terminate`** — terminates instances by ID or SSH alias (e.g. `aws-gpu1`, resolved via `~/.ssh/config`), or all aws-bootstrap instances in the region if no arguments given; removes SSH config aliases; deletes associated EBS data volumes by default; `--keep-ebs` preserves volumes and prints reattach commands
 - **`cleanup`** — removes stale `~/.ssh/config` entries for terminated/non-existent instances; compares managed SSH config blocks against live EC2 instances; `--include-ebs` also finds and deletes orphan EBS data volumes (volumes in `available` state whose linked instance no longer exists); `--dry-run` previews removals without modifying config; `--yes` skips the confirmation prompt
-- **`list instance-types`** — lists EC2 instance types matching a family prefix (default: `g4dn`), showing vCPUs, memory, and GPU info
-- **`list amis`** — lists available AMIs matching a name pattern (default: Deep Learning Base OSS Nvidia Driver GPU AMIs), sorted newest-first
+- **`list instance-types`** — lists EC2 instance types matching a family prefix (default: `g4dn`), showing vCPUs, memory, **Quota Family** (the `gvt`/`p`/`dl` vCPU quota family each type draws from, via `instance_type_to_family`; `quota_family` in structured output, `null` for non-GPU), and GPU info; output tail prints copy-paste "Next steps" (region-pinned `quota show` / `quota request` for the family derived from `--prefix`, with a header stating the prefix→family mapping), suppressed for non-GPU families
+- **`list amis`** — lists available AMIs matching a name pattern (default: Deep Learning Base OSS Nvidia Driver GPU AMIs), sorted newest-first; each AMI is labelled with its region (AMI IDs are region-specific)
 - **`quota show`** — displays current spot and on-demand vCPU quota values via AWS Service Quotas API; `--family` filters by instance family (gvt, p, dl; default: all)
-- **`quota request`** — requests a quota increase; `--type` (spot/on-demand) and `--desired-value` are required; `--family` selects instance family (default: gvt); confirms in text mode, requires `--yes` in structured modes
+- **`quota request`** — requests a quota increase; `--type` (spot/on-demand) and `--desired-value` are required; `--family` selects instance family (default: gvt); validates every target region's current value up front (aborting without submitting if any region's current ≥ desired); confirms in text mode, requires `--yes` in structured modes; structured output is `{"requests": [...]}` (one entry per region)
 - **`quota history`** — shows history of quota increase requests; optional `--family`, `--type`, and `--status` filters
+
+**Region handling for `list` / `quota` (show/request/history):** like other non-`status` commands, `--region`/`-r` follows the explicit → `AWS_DEFAULT_REGION`/profile → `us-west-2` precedence (via `resolve_region_list`), but is **repeatable**: pass several to query/submit across multiple regions. The active region(s) are always labelled in output (single region → `Region: <r>` line; multiple → a per-region block via the `_region_block_header` helper), and every structured record carries a `region` field. (`status` differs: no `--region` means *all enabled regions* — see its bullet.)
 
 ## Coding Conventions
 

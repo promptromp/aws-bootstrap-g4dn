@@ -34,6 +34,7 @@ from .ec2 import (
     find_tagged_instances_in_regions,
     get_latest_ami,
     get_spot_price,
+    instance_type_to_family,
     launch_with_retry,
     list_amis,
     list_enabled_regions,
@@ -162,6 +163,21 @@ def resolve_single_region(region: str | None, profile: str | None) -> str:
     """Single region for non-launch commands, honoring the same precedence."""
     explicit = (region,) if region else ()
     return resolve_region_list(explicit, profile)[0]
+
+
+def _region_block_header(region: str, multi: bool, summary: str) -> None:
+    """Print a per-region section header in text mode.
+
+    For a single region, labels the active region then the summary; for multiple
+    regions, prefixes the summary with the region so blocks are distinguishable.
+    """
+    if not is_text():
+        return
+    if multi:
+        click.secho(f"\n  {region} — {summary}", bold=True, fg="cyan")
+    else:
+        val("Region", region)
+        click.secho(f"\n  {summary}", bold=True, fg="cyan")
 
 
 class _Duration(click.ParamType):
@@ -1207,59 +1223,71 @@ def list_cmd():
 @click.option("--prefix", default="g4dn", show_default=True, help="Instance type family prefix to filter on.")
 @click.option(
     "--region",
-    default=None,
+    "-r",
+    multiple=True,
     metavar="REGION",
-    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+    help="AWS region(s) to query (repeatable). Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
 )
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def list_instance_types_cmd(ctx, prefix, region, profile):
     """List EC2 instance types matching a family prefix (e.g. g4dn, p3, g5)."""
-    region = resolve_single_region(region, profile)
-    session = boto3.Session(profile_name=profile, region_name=region)
-    ec2 = session.client("ec2")
+    regions = resolve_region_list(region, profile)
+    session = boto3.Session(profile_name=profile)
 
-    types = list_instance_types(ec2, prefix)
-    if not types:
-        if is_text(ctx):
-            click.secho(f"No instance types found matching '{prefix}.*' in {region}", fg="yellow")
-        else:
-            emit([], ctx=ctx)
-        return
+    per_region = [(r, list_instance_types(session.client("ec2", region_name=r), prefix)) for r in regions]
 
     if not is_text(ctx):
         structured = [
             {
+                "region": r,
                 "instance_type": t["InstanceType"],
                 "vcpus": t["VCpuCount"],
                 "memory_mib": t["MemoryMiB"],
+                # vCPU quota family this type draws from (gvt/p/dl), or None for non-GPU.
+                "quota_family": instance_type_to_family(t["InstanceType"]),
                 "gpu": t["GpuSummary"] or None,
             }
+            for r, types in per_region
             for t in types
         ]
         emit(
             structured,
             headers={
+                "region": "Region",
                 "instance_type": "Instance Type",
                 "vcpus": "vCPUs",
                 "memory_mib": "Memory (MiB)",
+                "quota_family": "Quota Family",
                 "gpu": "GPU",
             },
             ctx=ctx,
         )
         return
 
-    click.secho(f"\n  {len(types)} instance type(s) matching '{prefix}.*':\n", bold=True, fg="cyan")
+    if not any(types for _, types in per_region):
+        click.secho(f"No instance types found matching '{prefix}.*' in {', '.join(regions)}", fg="yellow")
+        return
 
-    # Header
-    click.echo(
-        "  " + click.style(f"{'Instance Type':<24}{'vCPUs':>6}{'Memory (MiB)':>14}  GPU", fg="bright_white", bold=True)
-    )
-    click.echo("  " + "-" * 72)
-
-    for t in types:
-        gpu_str = t["GpuSummary"] or "-"
-        click.echo(f"  {t['InstanceType']:<24}{t['VCpuCount']:>6}{t['MemoryMiB']:>14}  {gpu_str}")
+    multi = len(regions) > 1
+    for r, types in per_region:
+        _region_block_header(r, multi, f"{len(types)} instance type(s) matching '{prefix}.*':")
+        if not types:
+            click.echo("  " + click.style("(none)", dim=True))
+            continue
+        click.echo(
+            "  "
+            + click.style(
+                f"{'Instance Type':<20}{'vCPUs':>6}{'Memory (MiB)':>14}{'Quota Family':>14}  GPU",
+                fg="bright_white",
+                bold=True,
+            )
+        )
+        click.echo("  " + "-" * 80)
+        for t in types:
+            gpu_str = t["GpuSummary"] or "-"
+            fam_str = instance_type_to_family(t["InstanceType"]) or "-"
+            click.echo(f"  {t['InstanceType']:<20}{t['VCpuCount']:>6}{t['MemoryMiB']:>14}{fam_str:>14}  {gpu_str}")
 
     click.echo()
     click.echo(
@@ -1267,6 +1295,23 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
         + click.style("Tip: ", fg="bright_black")
         + click.style("use --prefix to list other families (e.g. --prefix p5, --prefix g5)", fg="bright_black")
     )
+
+    # Suggested next steps: check/raise the GPU vCPU quota for this family. AWS
+    # groups instance types into vCPU quota families (e.g. all G/VT types share
+    # the "gvt" quota), which is why the suggested --family may not look like the
+    # --prefix. The "Quota Family" column above makes the mapping explicit.
+    fam = instance_type_to_family(prefix)
+    if fam:
+        hint_region = regions[0]
+        click.echo()
+        click.secho(f"  Next steps — {prefix}.* draws from the '{fam}' vCPU quota family:", bold=True, fg="cyan")
+        click.echo("    Check your vCPU quota:")
+        click.echo("      " + _cmd(f"aws-bootstrap quota show --family {fam} --region {hint_region}"))
+        click.echo("    Request a quota increase (adjust --desired-value to your needs):")
+        click.echo(
+            "      "
+            + _cmd(f"aws-bootstrap quota request --family {fam} --type spot --desired-value 8 --region {hint_region}")
+        )
     click.echo()
 
 
@@ -1274,39 +1319,39 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
 @click.option("--filter", "ami_filter", default=DEFAULT_AMI_PREFIX, show_default=True, help="AMI name pattern.")
 @click.option(
     "--region",
-    default=None,
+    "-r",
+    multiple=True,
     metavar="REGION",
-    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+    help="AWS region(s) to query (repeatable). Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
 )
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def list_amis_cmd(ctx, ami_filter, region, profile):
-    """List available AMIs matching a name pattern."""
-    region = resolve_single_region(region, profile)
-    session = boto3.Session(profile_name=profile, region_name=region)
-    ec2 = session.client("ec2")
+    """List available AMIs matching a name pattern.
 
-    amis = list_amis(ec2, ami_filter)
-    if not amis:
-        if is_text(ctx):
-            click.secho(f"No AMIs found matching '{ami_filter}' in {region}", fg="yellow")
-        else:
-            emit([], ctx=ctx)
-        return
+    AMI IDs are region-specific, so each result is labelled with its region.
+    """
+    regions = resolve_region_list(region, profile)
+    session = boto3.Session(profile_name=profile)
+
+    per_region = [(r, list_amis(session.client("ec2", region_name=r), ami_filter)) for r in regions]
 
     if not is_text(ctx):
         structured = [
             {
+                "region": r,
                 "image_id": ami["ImageId"],
                 "name": ami["Name"],
                 "creation_date": ami["CreationDate"][:10],
                 "architecture": ami["Architecture"],
             }
+            for r, amis in per_region
             for ami in amis
         ]
         emit(
             structured,
             headers={
+                "region": "Region",
                 "image_id": "Image ID",
                 "name": "Name",
                 "creation_date": "Created",
@@ -1316,11 +1361,19 @@ def list_amis_cmd(ctx, ami_filter, region, profile):
         )
         return
 
-    click.secho(f"\n  {len(amis)} AMI(s) matching '{ami_filter}' (newest first):\n", bold=True, fg="cyan")
+    if not any(amis for _, amis in per_region):
+        click.secho(f"No AMIs found matching '{ami_filter}' in {', '.join(regions)}", fg="yellow")
+        return
 
-    for ami in amis:
-        click.echo("  " + click.style(ami["ImageId"], fg="bright_white") + "  " + ami["CreationDate"][:10])
-        click.echo(f"    {ami['Name']}")
+    multi = len(regions) > 1
+    for r, amis in per_region:
+        _region_block_header(r, multi, f"{len(amis)} AMI(s) matching '{ami_filter}' (newest first):")
+        if not amis:
+            click.echo("  " + click.style("(none)", dim=True))
+            continue
+        for ami in amis:
+            click.echo("  " + click.style(ami["ImageId"], fg="bright_white") + "  " + ami["CreationDate"][:10])
+            click.echo(f"    {ami['Name']}")
 
     click.echo()
 
@@ -1344,27 +1397,34 @@ def quota():
 )
 @click.option(
     "--region",
-    default=None,
+    "-r",
+    multiple=True,
     metavar="REGION",
-    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+    help="AWS region(s) to query (repeatable). Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
 )
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def quota_show(ctx, family, region, profile):
     """Show current spot and on-demand vCPU quota values."""
-    region = resolve_single_region(region, profile)
-    session = boto3.Session(profile_name=profile, region_name=region)
-    sq = session.client("service-quotas")
-
+    regions = resolve_region_list(region, profile)
+    session = boto3.Session(profile_name=profile)
     families = [family] if family else list(QUOTA_FAMILIES.keys())
+
     all_quotas: list[dict] = []
-    for fam in families:
-        all_quotas.extend(get_family_quotas(sq, fam))
+    per_region: list[tuple[str, list[dict]]] = []
+    for r in regions:
+        sq = session.client("service-quotas", region_name=r)
+        region_quotas: list[dict] = []
+        for fam in families:
+            region_quotas.extend(get_family_quotas(sq, fam))
+        per_region.append((r, region_quotas))
+        all_quotas.extend({"region": r, **q} for q in region_quotas)
 
     if not is_text(ctx):
         emit(
             {"quotas": all_quotas},
             headers={
+                "region": "Region",
                 "family": "Family",
                 "quota_type": "Type",
                 "quota_code": "Quota Code",
@@ -1375,43 +1435,48 @@ def quota_show(ctx, family, region, profile):
         )
         return
 
-    click.secho("\n  EC2 GPU vCPU Quotas:\n", bold=True, fg="cyan")
-    for fam in families:
-        fam_quotas = [q for q in all_quotas if q["family"] == fam]
-        if len(families) > 1:
-            click.secho(f"  {QUOTA_FAMILY_LABELS[fam]}:", bold=True)
-        for q in fam_quotas:
-            label = q["quota_type"].capitalize()
-            click.echo(
-                "  "
-                + click.style(f"{label:<12}", fg="bright_white")
-                + click.style(f"{q['value']:.0f}", fg="green", bold=True)
-                + " vCPUs"
-            )
-            click.echo(f"    {q['quota_name']}")
-            click.echo(f"    Code: {q['quota_code']}")
-            click.echo()
+    multi = len(regions) > 1
+    for r, region_quotas in per_region:
+        _region_block_header(r, multi, "EC2 GPU vCPU Quotas:")
+        click.echo()
+        for fam in families:
+            fam_quotas = [q for q in region_quotas if q["family"] == fam]
+            if len(families) > 1:
+                click.secho(f"  {QUOTA_FAMILY_LABELS[fam]}:", bold=True)
+            for q in fam_quotas:
+                label = q["quota_type"].capitalize()
+                click.echo(
+                    "  "
+                    + click.style(f"{label:<12}", fg="bright_white")
+                    + click.style(f"{q['value']:.0f}", fg="green", bold=True)
+                    + " vCPUs"
+                )
+                click.echo(f"    {q['quota_name']}")
+                click.echo(f"    Code: {q['quota_code']}")
+                click.echo()
 
-    example_family = family or "gvt"
-    # AWS rejects a desired value that is not strictly greater than the current
-    # quota, so base the suggestion on the family's current spot value rather
-    # than a fixed 4 (which fails outright when the quota is already >= 4).
-    current_spot = next(
-        (q["value"] for q in all_quotas if q["family"] == example_family and q["quota_type"] == "spot"),
-        0.0,
-    )
-    suggested = max(8, int(current_spot) + 4)
-    click.echo(
-        "  " + click.style("Tip: ", fg="bright_black") + click.style("g4dn.xlarge requires 4 vCPUs", fg="bright_black")
-    )
-    click.echo(
-        "  "
-        + click.style("To request an increase: ", fg="bright_black")
-        + _cmd(
-            f"aws-bootstrap quota request --family {example_family} --type spot "
-            f"--desired-value {suggested} --region {region}"
+        example_family = family or "gvt"
+        # AWS rejects a desired value that is not strictly greater than the current
+        # quota, so base the suggestion on the family's current spot value rather
+        # than a fixed 4 (which fails outright when the quota is already >= 4).
+        current_spot = next(
+            (q["value"] for q in region_quotas if q["family"] == example_family and q["quota_type"] == "spot"),
+            0.0,
         )
-    )
+        suggested = max(8, int(current_spot) + 4)
+        click.echo(
+            "  "
+            + click.style("Tip: ", fg="bright_black")
+            + click.style("g4dn.xlarge requires 4 vCPUs", fg="bright_black")
+        )
+        click.echo(
+            "  "
+            + click.style("To request an increase: ", fg="bright_black")
+            + _cmd(
+                f"aws-bootstrap quota request --family {example_family} --type spot "
+                f"--desired-value {suggested} --region {r}"
+            )
+        )
     click.echo()
 
 
@@ -1433,62 +1498,80 @@ def quota_show(ctx, family, region, profile):
 @click.option("--desired-value", required=True, type=float, help="Desired quota value (vCPUs).")
 @click.option(
     "--region",
-    default=None,
+    "-r",
+    multiple=True,
     metavar="REGION",
-    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+    help="AWS region(s) to submit the request in (repeatable). "
+    "Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
 )
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.pass_context
 def quota_request(ctx, family, quota_type, desired_value, region, profile, yes):
-    """Request a vCPU quota increase."""
+    """Request a vCPU quota increase (in one or more regions)."""
     # In structured output modes, require --yes
     if not is_text(ctx) and not yes:
         raise CLIError("--yes is required when using structured output (--output json/yaml/table).")
 
-    region = resolve_single_region(region, profile)
-    session = boto3.Session(profile_name=profile, region_name=region)
-    sq = session.client("service-quotas")
-
+    regions = resolve_region_list(region, profile)
+    session = boto3.Session(profile_name=profile)
     quota_code = QUOTA_FAMILIES[family][quota_type]
 
-    # Show current value
-    current = get_quota(sq, quota_code)
+    # Fetch the current value in every target region first so we can validate the
+    # whole request up front and never submit a partial set.
+    clients: dict[str, object] = {}
+    current_by_region: dict[str, dict] = {}
+    for r in regions:
+        sq = session.client("service-quotas", region_name=r)
+        clients[r] = sq
+        current_by_region[r] = get_quota(sq, quota_code)
 
-    if desired_value <= current["value"]:
+    too_low = [r for r in regions if desired_value <= current_by_region[r]["value"]]
+    if too_low:
+        details = ", ".join(f"{r} (current {current_by_region[r]['value']:.0f})" for r in too_low)
         raise CLIError(
-            f"Desired value ({desired_value:.0f}) must be greater than current value ({current['value']:.0f})."
+            f"Desired value ({desired_value:.0f}) must be greater than the current value in: {details}.\n"
+            "  No requests were submitted."
         )
 
+    quota_name = next(iter(current_by_region.values()))["quota_name"]
     if is_text(ctx):
         click.echo()
-        val("Quota", current["quota_name"])
+        val("Quota", quota_name)
         val("Family", QUOTA_FAMILY_LABELS[family])
-        val("Current value", f"{current['value']:.0f} vCPUs")
+        val("Region(s)", ", ".join(regions))
         val("Requested value", f"{desired_value:.0f} vCPUs")
         click.echo()
 
-    if not yes and not click.confirm(f"  Request increase from {current['value']:.0f} to {desired_value:.0f} vCPUs?"):
+    if not yes and not click.confirm(
+        f"  Request increase to {desired_value:.0f} vCPUs in {len(regions)} region(s) ({', '.join(regions)})?"
+    ):
         click.secho("  Cancelled.", fg="yellow")
         return
 
-    result = request_quota_increase(sq, quota_code, desired_value)
-    result["quota_type"] = quota_type
-    result["family"] = family
+    results = []
+    for r in regions:
+        result = request_quota_increase(clients[r], quota_code, desired_value)
+        result["region"] = r
+        result["quota_type"] = quota_type
+        result["family"] = family
+        results.append(result)
 
     if not is_text(ctx):
-        emit(result, ctx=ctx)
+        emit({"requests": results}, ctx=ctx)
         return
 
     click.echo()
-    success("Quota increase request submitted.")
-    val("Request ID", result["request_id"])
-    val("Status", result["status"])
-    if result.get("case_id"):
-        val("Support case", result["case_id"])
+    success(f"{len(results)} quota increase request(s) submitted.")
+    for result in results:
+        click.echo()
+        val("Region", result["region"])
+        val("  Request ID", result["request_id"])
+        val("  Status", result["status"])
+        if result.get("case_id"):
+            val("  Support case", result["case_id"])
     click.echo()
-    if is_text(ctx):
-        click.echo("  Track status with: " + _cmd(f"aws-bootstrap quota history --region {region}"))
+    click.echo("  Track status with: " + _cmd(f"aws-bootstrap quota history --region {' --region '.join(regions)}"))
     click.echo()
 
 
@@ -1518,17 +1601,17 @@ def quota_request(ctx, family, quota_type, desired_value, region, profile, yes):
 )
 @click.option(
     "--region",
-    default=None,
+    "-r",
+    multiple=True,
     metavar="REGION",
-    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+    help="AWS region(s) to query (repeatable). Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
 )
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def quota_history(ctx, family, quota_type, status_filter, region, profile):
     """Show history of vCPU quota increase requests."""
-    region = resolve_single_region(region, profile)
-    session = boto3.Session(profile_name=profile, region_name=region)
-    sq = session.client("service-quotas")
+    regions = resolve_region_list(region, profile)
+    session = boto3.Session(profile_name=profile)
 
     # Normalize status filter to uppercase for the API
     resolved_status = status_filter.upper() if status_filter else None
@@ -1537,16 +1620,19 @@ def quota_history(ctx, family, quota_type, status_filter, region, profile):
     families = [family] if family else list(QUOTA_FAMILIES.keys())
 
     all_requests: list[dict] = []
-    for fam in families:
-        codes = QUOTA_FAMILIES[fam]
-        for qt, qc in codes.items():
-            if quota_type and qt != quota_type:
-                continue
-            requests = get_quota_request_history(sq, qc, status_filter=resolved_status)
-            for r in requests:
-                r["quota_type"] = qt
-                r["family"] = fam
-            all_requests.extend(requests)
+    for region_name in regions:
+        sq = session.client("service-quotas", region_name=region_name)
+        for fam in families:
+            codes = QUOTA_FAMILIES[fam]
+            for qt, qc in codes.items():
+                if quota_type and qt != quota_type:
+                    continue
+                requests = get_quota_request_history(sq, qc, status_filter=resolved_status)
+                for r in requests:
+                    r["region"] = region_name
+                    r["quota_type"] = qt
+                    r["family"] = fam
+                all_requests.extend(requests)
 
     # Sort merged results newest-first
     all_requests.sort(key=lambda r: r["created"], reverse=True)
@@ -1556,6 +1642,7 @@ def quota_history(ctx, family, quota_type, status_filter, region, profile):
             {"requests": all_requests},
             headers={
                 "request_id": "Request ID",
+                "region": "Region",
                 "family": "Family",
                 "quota_type": "Type",
                 "status": "Status",
@@ -1565,6 +1652,9 @@ def quota_history(ctx, family, quota_type, status_filter, region, profile):
             ctx=ctx,
         )
         return
+
+    if is_text(ctx):
+        val("Region(s)", ", ".join(regions))
 
     if not all_requests:
         click.secho("No quota increase requests found.", fg="yellow")
@@ -1585,6 +1675,7 @@ def quota_history(ctx, family, quota_type, status_filter, region, profile):
         click.echo(
             "  " + click.style(r["request_id"], fg="bright_white") + "  " + click.style(r["status"], fg=status_color)
         )
+        val("    Region", r["region"])
         val("    Family", r["family"])
         val("    Type", r["quota_type"])
         val("    Requested", f"{r['desired_value']:.0f} vCPUs")

@@ -297,16 +297,28 @@ aws-bootstrap list instance-types
 # List a different instance family
 aws-bootstrap list instance-types --prefix p3
 
-# List Deep Learning AMIs (default filter)
+# List Deep Learning AMIs (default filter) — each AMI is labelled with its region
 aws-bootstrap list amis
 
 # List AMIs with a custom filter
 aws-bootstrap list amis --filter "ubuntu/images/hvm-ssd-gp3/ubuntu-noble*"
 
-# Use a specific region
+# Use a specific region (the active region is shown in the output header)
 aws-bootstrap list instance-types --region us-east-1
 aws-bootstrap list amis --region us-east-1
+
+# --region is repeatable (-r for short) to compare across regions
+aws-bootstrap list amis -r us-east-1 -r us-west-2
+aws-bootstrap list instance-types --prefix g5 -r us-east-1 -r eu-west-1
 ```
+
+`list instance-types` shows a **Quota Family** column (`gvt`/`p`/`dl`) — the AWS
+vCPU quota family each type draws from. These group multiple prefixes (e.g. all
+G/VT types, including `g5`, share `gvt`), so the suggested `--family` may not
+look like your `--prefix`. The output then ends with copy-paste **Next steps**
+for that family — a `quota show` and a `quota request` command pinned to the
+queried region — so you can go straight from "is this type available?" to
+checking and raising your vCPU quota.
 
 ### 🖥️ Managing Instances
 
@@ -415,6 +427,10 @@ aws-bootstrap quota show --family gvt
 # Show P family quotas (P2 through P6)
 aws-bootstrap quota show --family p
 
+# The active region is shown in the output header. --region is repeatable
+# (-r) to compare quotas across regions:
+aws-bootstrap quota show --family gvt -r us-east-1 -r us-west-2
+
 # Or use the AWS CLI directly:
 aws service-quotas get-service-quota \
   --service-code ec2 \
@@ -435,8 +451,14 @@ aws-bootstrap quota request --type spot --desired-value 8 --region us-west-2
 # Request a P family spot quota increase
 aws-bootstrap quota request --family p --type spot --desired-value 192 --region us-west-2
 
-# Check request status
+# --region is repeatable: submit the same increase in several regions at once.
+# All target regions are validated up front — if any region's current quota is
+# already >= the desired value, nothing is submitted.
+aws-bootstrap quota request --type spot --desired-value 8 -r us-east-1 -r us-west-2
+
+# Check request status (also repeatable across regions)
 aws-bootstrap quota history --region us-west-2
+aws-bootstrap quota history -r us-east-1 -r us-west-2
 
 # Or use the AWS CLI directly:
 aws service-quotas request-service-quota-increase \
