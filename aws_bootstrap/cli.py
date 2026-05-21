@@ -1,6 +1,7 @@
 """CLI entry point for aws-bootstrap-g4dn."""
 
 from __future__ import annotations
+import contextlib
 import subprocess
 from datetime import UTC, datetime
 from pathlib import Path
@@ -1983,7 +1984,20 @@ def cluster_terminate(ctx, cluster_id, region, profile, yes):
     terminate_tagged_instances(ec2, instance_ids)
     for iid in instance_ids:
         remove_ssh_host(iid)
-    delete_cluster_placement_group(ec2, cluster_mod.placement_group_name(cluster_id))
+
+    # The placement group can't be deleted while instances are still
+    # shutting down, so wait for full termination first (best-effort).
+    info("Waiting for instances to terminate before deleting the placement group...")
+    with contextlib.suppress(botocore.exceptions.WaiterError):
+        ec2.get_waiter("instance_terminated").wait(
+            InstanceIds=instance_ids, WaiterConfig={"Delay": 10, "MaxAttempts": 30}
+        )
+    pg_name = cluster_mod.placement_group_name(cluster_id)
+    if not delete_cluster_placement_group(ec2, pg_name):
+        warn(
+            f"Placement group '{pg_name}' is still in use; re-run `cluster terminate` "
+            "once the instances finish terminating to remove it."
+        )
 
     success(f"Terminated {len(instance_ids)} node(s) of cluster '{cluster_id}'.")
     emit({"cluster_id": cluster_id, "region": resolved, "terminated": instance_ids}, ctx=ctx)
@@ -2211,9 +2225,13 @@ def cluster_run(
 
     succeeded = all(r.returncode == 0 for r in results)
     if is_text(ctx):
-        rank0 = next((r for r in results if r.rank == 0), None)
-        if rank0 and rank0.stdout.strip():
-            click.echo(rank0.stdout.rstrip())
+        # Echo every node that produced output. Under c10d rendezvous the
+        # torch global rank 0 (which usually does the printing) is NOT
+        # necessarily our node rank 0, so we can't single out one node.
+        for r in results:
+            if r.stdout.strip():
+                click.echo(f"  --- rank {r.rank} ({r.instance_id}) stdout ---")
+                click.echo(r.stdout.rstrip())
         for r in results:
             tag = "OK" if r.returncode == 0 else f"FAIL({r.returncode})"
             click.echo(f"  [{tag}] rank {r.rank} ({r.instance_id})  log: {out_dir / f'rank{r.rank}.log'}")

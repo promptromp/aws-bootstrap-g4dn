@@ -168,13 +168,22 @@ def ensure_cluster_placement_group(ec2_client, name: str, tag_value: str) -> str
     return name
 
 
-def delete_cluster_placement_group(ec2_client, name: str) -> None:
-    """Delete a placement group by name; no-op if it no longer exists."""
+def delete_cluster_placement_group(ec2_client, name: str) -> bool:
+    """Delete a placement group by name.
+
+    Returns ``True`` if the group is gone (deleted, or already absent), ``False``
+    if it can't be deleted yet because it is still ``InUse`` (instances not fully
+    terminated). Other errors propagate.
+    """
     try:
         ec2_client.delete_placement_group(GroupName=name)
+        return True
     except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "InvalidPlacementGroup.Unknown":
-            return
+        code = e.response["Error"]["Code"]
+        if code == "InvalidPlacementGroup.Unknown":
+            return True  # already gone
+        if code == "InvalidPlacementGroup.InUse":
+            return False  # instances still terminating; caller decides
         raise
 
 

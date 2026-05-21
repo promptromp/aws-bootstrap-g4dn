@@ -857,9 +857,24 @@ def test_delete_cluster_placement_group_ignores_unknown():
         {"Error": {"Code": "InvalidPlacementGroup.Unknown", "Message": "nope"}},
         "DeletePlacementGroup",
     )
-    # Must not raise.
-    delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1")
+    # Must not raise; already-gone counts as deleted.
+    assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is True
     ec2.delete_placement_group.assert_called_once_with(GroupName="aws-bootstrap-cluster-ml1")
+
+
+def test_delete_cluster_placement_group_success_returns_true():
+    ec2 = MagicMock()
+    assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is True
+
+
+def test_delete_cluster_placement_group_in_use_returns_false():
+    ec2 = MagicMock()
+    ec2.delete_placement_group.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "InvalidPlacementGroup.InUse", "Message": "in use"}},
+        "DeletePlacementGroup",
+    )
+    # Instances still terminating -> not deletable yet, but no raise.
+    assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is False
 
 
 # ---------------------------------------------------------------------------

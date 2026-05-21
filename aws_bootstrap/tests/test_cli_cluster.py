@@ -72,20 +72,38 @@ def test_cluster_terminate_requires_yes_in_json_mode(runner):
     assert result.exit_code != 0
 
 
-@patch("aws_bootstrap.cli.delete_cluster_placement_group")
+@patch("aws_bootstrap.cli.delete_cluster_placement_group", return_value=True)
 @patch("aws_bootstrap.cli.remove_ssh_host", return_value="aws-ml1-0")
 @patch("aws_bootstrap.cli.terminate_tagged_instances", return_value=[])
 @patch("aws_bootstrap.cli.find_cluster_instances")
 @patch("aws_bootstrap.cli.boto3.Session")
-def test_cluster_terminate_tears_down_nodes_and_group(
+def test_cluster_terminate_waits_then_deletes_group(
     mock_session, mock_find, mock_term, mock_remove, mock_delpg, runner
 ):
     mock_find.return_value = [_node()]
+    ec2 = mock_session.return_value.client.return_value
     result = runner.invoke(main, ["cluster", "terminate", "--cluster-id", "ml1", "--yes"])
     assert result.exit_code == 0, result.output
     mock_term.assert_called_once()
     assert mock_term.call_args[0][1] == ["i-1"]
+    # Waits for instances to fully terminate before deleting the placement group.
+    ec2.get_waiter.assert_called_with("instance_terminated")
     mock_delpg.assert_called_once()
+
+
+@patch("aws_bootstrap.cli.delete_cluster_placement_group", return_value=False)
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value="aws-ml1-0")
+@patch("aws_bootstrap.cli.terminate_tagged_instances", return_value=[])
+@patch("aws_bootstrap.cli.find_cluster_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cluster_terminate_warns_when_group_still_in_use(
+    mock_session, mock_find, mock_term, mock_remove, mock_delpg, runner
+):
+    mock_find.return_value = [_node()]
+    result = runner.invoke(main, ["cluster", "terminate", "--cluster-id", "ml1", "--yes"])
+    # Instances still terminate; the in-use placement group is a warning, not a crash.
+    assert result.exit_code == 0, result.output
+    assert "still in use" in result.output.lower()
 
 
 def _launch_side_effect(config, prepare_region, **kw):
@@ -352,6 +370,37 @@ def test_cluster_run_reports_outcome(mock_session, mock_find, mock_run, runner, 
     mock_run.assert_called_once()
     # Per-node logs are written regardless of outcome.
     assert (log_dir / "ml1" / "rank0.log").exists()
+
+
+@patch("aws_bootstrap.cli.cluster_mod.run_distributed_job")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cluster_run_echoes_output_from_any_node(mock_session, mock_find, mock_run, runner, tmp_path):
+    # Under c10d rendezvous, torch global rank 0 (which prints) can land on a
+    # node that is NOT our node rank 0 — so output from any node must surface.
+    mock_find.return_value = [_node(instance_id="i-0", rank=0), _node(instance_id="i-1", rank=1)]
+    mock_run.return_value = [
+        NodeResult("i-0", 0, 0, "", ""),  # node rank 0 produced no stdout
+        NodeResult("i-1", 1, 0, "DONE world_size=2", ""),  # the printing rank
+    ]
+    train = tmp_path / "train.py"
+    train.write_text("x\n")
+    result = runner.invoke(
+        main,
+        [
+            "cluster",
+            "run",
+            "--cluster-id",
+            "ml1",
+            "--key-path",
+            str(_make_key(tmp_path)),
+            "--log-dir",
+            str(tmp_path / "logs"),
+            str(train),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert "DONE world_size=2" in result.output  # surfaced even though it was rank 1
 
 
 def test_cluster_run_missing_script_errors(runner, tmp_path):
