@@ -760,7 +760,9 @@ def main() -> None:
 
     # CNN Benchmark
     if args.mode in ("cnn", "both"):
-        model = MNISTConvNet()
+        # Annotated as the common base so the variable can be reused for the
+        # Transformer benchmark (MiniGPT) further below without a type clash.
+        model: nn.Module = MNISTConvNet()
         param_count = sum(p.numel() for p in model.parameters())
         print(f"\nMNIST CNN parameters: {param_count:,}")
 

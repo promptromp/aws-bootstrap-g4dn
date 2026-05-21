@@ -14,17 +14,40 @@ on:
     branches: [ "main" ]
 
 jobs:
-  build:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v6
+      with:
+        # setuptools-scm derives the version from git history during `uv sync`.
+        fetch-depth: 0
+    - name: Install uv and set the python version
+      uses: astral-sh/setup-uv@v8.1.0
+      with:
+        python-version: "3.13"
+        version: "latest"
+        enable-cache: true
+    - name: Install the project
+      run: uv sync --all-extras --dev
+    - name: Run ruff lint and formatting checks
+      run: |
+        uv run ruff check aws_bootstrap
+        uv run ruff format --check aws_bootstrap
+    - name: Run mypy
+      run: uv run mypy aws_bootstrap
 
+  test:
     runs-on: ubuntu-latest
     strategy:
       fail-fast: false
       matrix:
         python-version: ["3.12", "3.13", "3.14"]
 
+    name: test (${{ matrix.python-version }})
     steps:
     - uses: actions/checkout@v6
       with:
+        # setuptools-scm derives the version from git history during `uv sync`.
         fetch-depth: 0
     - name: Install uv and set the python version
       uses: astral-sh/setup-uv@v8.1.0
@@ -34,16 +57,5 @@ jobs:
         enable-cache: true
     - name: Install the project
       run: uv sync --all-extras --dev
-    - name: Install ruff
-      uses: astral-sh/ruff-action@v4.0.0
-      with:
-        version: "latest"
-        src: "./aws_bootstrap"
-    - name: Run formatting checks (lint runs as part of ruff-action above)
-      run: |
-        uv run ruff check aws_bootstrap
-        uv run ruff format aws_bootstrap
-    - name: Run mypy
-      run: uv run mypy aws_bootstrap
     - name: Run tests
       run: uv run pytest
