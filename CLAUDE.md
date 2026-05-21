@@ -246,3 +246,7 @@ When making changes that affect project setup, CLI interface, dependencies, proj
 
 - **README.md** — user-facing: installation, usage examples, CLI options, AWS setup/quota instructions
 - **CLAUDE.md** — agent-facing: project overview, tech stack, project structure, coding conventions
+
+### Agentic coding artifacts
+
+Do **not** commit superpowers or other agentic-coding plan artifacts (design specs, implementation plans, scratch notes under `docs/superpowers/`, etc.) to the repo unless there's a specific reason or the user explicitly asks. `docs/superpowers/` is git-ignored; keep these local. Real, user-facing project documentation belongs in `README.md`, `CLAUDE.md`, or `docs/`.
