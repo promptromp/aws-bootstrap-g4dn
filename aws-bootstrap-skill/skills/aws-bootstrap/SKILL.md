@@ -33,8 +33,21 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 | `aws-bootstrap quota show` | Show GPU vCPU quotas (all families) | `--family`, `--region/-r` (repeatable) |
 | `aws-bootstrap quota request` | Request a quota increase (per region) | `--family`, `--type`, `--desired-value`, `--region/-r` (repeatable), `--yes` |
 | `aws-bootstrap quota history` | Show quota increase request history | `--family`, `--type`, `--status`, `--region/-r` (repeatable) |
+| `aws-bootstrap cluster launch` | Launch/grow a multi-node training cluster (1 AZ + placement group) | `--cluster-id` (required), `--nodes`, `--instance-type`, `--region`, `--spot/--on-demand` |
+| `aws-bootstrap cluster status` | Show cluster nodes (rank/state/AZ/IP); omit `--cluster-id` to list all clusters | `--cluster-id`, `--region` |
+| `aws-bootstrap cluster terminate` | Terminate all cluster nodes + delete placement group | `--cluster-id` (required), `--keep-ebs`, `--yes` |
 
 **Global options** (before the command): `--output json|yaml|table|text`, `--profile`, `--region`
+
+### Multi-node clusters (preview)
+
+`cluster launch` provisions N GPU instances tagged with a shared `--cluster-id`, all in **one AZ inside a cluster placement group**, with a self-referencing security-group rule so they can run distributed `torchrun` jobs. Tags are the source of truth (no state file); re-run `cluster launch` with a higher `--nodes` to grow incrementally. Each node gets an `aws-<cluster-id>-<rank>` SSH alias; rank 0 is the rendezvous/master node. Phase 1 = launch/status/terminate; `prepare`/`test`/`run` are later phases.
+
+```bash
+aws-bootstrap cluster launch --cluster-id ml1 --nodes 4 --instance-type g5.xlarge --region us-east-1
+aws-bootstrap -o json cluster status --cluster-id ml1
+aws-bootstrap cluster terminate --cluster-id ml1 --yes
+```
 
 ## Structured Output
 

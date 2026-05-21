@@ -35,9 +35,10 @@ direnv allow  # or manually: source .venv/bin/activate
 ```
 aws_bootstrap/
     __init__.py          # Package init
-    cli.py               # Click CLI entry point (launch, status, terminate commands)
+    cli.py               # Click CLI entry point (launch, status, terminate, list, quota, cluster commands)
+    cluster.py           # Multi-node cluster composition: naming/rank helpers + launch fan-out (launch_cluster_nodes)
     config.py            # LaunchConfig dataclass with defaults
-    ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing, EBS volume ops, multi-region discovery/query
+    ec2.py               # AMI lookup, security group, instance launch/find/terminate, polling, spot pricing, EBS volume ops, multi-region discovery/query, cluster placement-group + tag discovery
     gpu.py               # GPU architecture mapping and GpuInfo dataclass
     output.py            # Output formatting: OutputFormat enum, emit(), echo/secho wrappers for structured output
     quota.py             # Service Quotas API: get/request GPU vCPU quotas (G/VT, P, DL families)
@@ -215,6 +216,19 @@ On Nitro instances (g4dn), `/dev/sdf` is remapped to `/dev/nvmeXn1`. The mount s
 Non-root EBS volumes attached via API have `DeleteOnTermination=False` by default. This means data volumes **survive spot interruptions** — when AWS reclaims the instance, the volume detaches and becomes `available`, preserving all data. The user can reattach it to a new instance with `--ebs-volume-id`.
 
 The `terminate` command discovers volumes via `find_ebs_volumes_for_instance`, waits for them to detach (becomes `available`), then deletes them. `--keep-ebs` skips deletion and prints the volume ID with a reattach command.
+
+## Multi-Node Training Clusters (`cluster` group)
+
+The `cluster` command group (`cluster.py` + the `cluster` Click group in `cli.py`) launches and manages multiple GPU instances as a coordinated cluster for multi-node distributed training (`torchrun`). **Phase 1** ships `cluster launch` / `status` / `terminate`; `prepare` / `test` / `run` are later phases.
+
+- **`cluster.py`** — composition logic only: pure helpers (`placement_group_name`, `node_alias`, `nodes_to_add`) and the launch fan-out (`launch_cluster_nodes`, which calls an injectable `launch_fn` per node and assigns sequential ranks). It imports `ec2` (one-directional: `ec2.py` does **not** import `cluster.py`, which is why the placement-group helpers take an already-derived name rather than a `cluster_id`).
+- **Identity = tags, not state.** A cluster is an arbitrary `--cluster-id` stored as the `TAG_CLUSTER_ID` (`aws-bootstrap-cluster`) tag; each node also carries `TAG_CLUSTER_RANK` (`aws-bootstrap-cluster-rank`). `find_cluster_instances` / `list_clusters` (in `ec2.py`) discover and group by these tags. No local cluster state file.
+- **Single AZ + cluster placement group.** `ensure_cluster_placement_group(ec2, name, tag_value)` creates/reuses a `cluster`-strategy group; `cli.cluster_launch` captures the first node's AZ and pins the rest via `RegionContext.placement_az` + `RegionContext.placement_group` (both threaded through `_build_launch_params`/`_run_instances`/`launch_with_retry` alongside the existing `placement_az`).
+- **Intra-cluster SG rule.** `ensure_cluster_security_group_rule(ec2, sg_id)` adds an idempotent self-referencing (`-1`/all-protocol) ingress rule so members can reach each other on NCCL/rendezvous ports.
+- **SSH aliases.** Each node gets a deterministic `aws-<cluster-id>-<rank>` alias via `add_ssh_host(..., alias=...)` (the explicit-alias parameter added for clusters).
+- **`RDZV_PORT`** (`29400`, in `constants.py`) is the reserved torchrun c10d rendezvous port for later phases.
+
+`cluster launch` reuses the single-node launch machinery (`launch_with_retry`, `ensure_security_group`, `import_key_pair`, `get_latest_ami`, `wait_instance_ready`, `remote_setup`) per node; the AMI/key are looked up once and reused across nodes. `cluster launch` is **incremental**: re-running with a higher `--nodes` adds nodes to reach the target. EFA is out of scope (P-series only; `g4dn`/`g5` use plain VPC networking).
 
 ## Agent Skill (Claude Code Plugin)
 

@@ -408,6 +408,33 @@ Key behaviors:
 - **Automatic AZ matching** — EBS volumes are tied to a single availability zone, and an instance can only attach a volume in its own AZ. When you reattach with `--ebs-volume-id`, the launch automatically pins the new instance to the volume's AZ, so you never hit a "wrong AZ" attach failure. (One consequence: spot capacity is then constrained to that single AZ, so a launch may need `--wait` to ride out a temporary shortage. A `--ebs-volume-id` launch targets the volume's region.)
 - Mount failures are non-fatal — the instance remains usable
 
+## Multi-node training clusters (preview)
+
+Launch several GPU instances as a coordinated **cluster** for multi-node distributed training (e.g. PyTorch DDP via `torchrun`). A cluster is identified by an arbitrary `--cluster-id` used as an EC2 tag — AWS tags are the source of truth, so there's no local state file to keep in sync.
+
+```bash
+# Launch a 4-node cluster (single AZ, cluster placement group, shared SG)
+aws-bootstrap cluster launch --cluster-id ml1 --nodes 4 --instance-type g5.xlarge --region us-east-1
+
+# Re-run with a higher --nodes to grow the cluster incrementally
+aws-bootstrap cluster launch --cluster-id ml1 --nodes 6
+
+# See the cluster's nodes (rank, state, AZ, IP); omit --cluster-id to list all clusters
+aws-bootstrap cluster status --cluster-id ml1
+
+# Tear it all down (nodes, SSH aliases, placement group)
+aws-bootstrap cluster terminate --cluster-id ml1 --yes
+```
+
+Key behaviors:
+- **One AZ + cluster placement group** — all nodes land in the same availability zone inside a cluster placement group for low-latency NCCL communication. Incremental adds reuse that AZ.
+- **Shared security group** — a self-referencing ingress rule lets cluster members reach each other on the NCCL/rendezvous ports (in addition to SSH).
+- **Per-node SSH aliases** — each node gets an `aws-<cluster-id>-<rank>` alias in `~/.ssh/config` (e.g. `ssh aws-ml1-0`).
+- **Stable ranks** — nodes are tagged with a stable rank (`0..N-1`); rank 0 is the rendezvous/master node (it also trains).
+- **EFA / AZ caveat** — `g4dn`/`g5` instances run NCCL over ordinary VPC networking (EFA is essentially P-series only), which is fine for dev/learning/modest scale. Pinning to one AZ means a spot shortage there affects the whole cluster.
+
+> Preview scope: Phase 1 ships `cluster launch` / `status` / `terminate`. Preparing the cluster, a verification canary, and running distributed jobs (`cluster prepare` / `test` / `run`) land in subsequent releases.
+
 ## EC2 vCPU Quotas
 
 AWS accounts have [service quotas](https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/ec2-resource-limits.html) that limit how many vCPUs you can run per instance family. New or lightly-used accounts often have a **default quota of 0 vCPUs** for GPU instance families (G and VT), which will cause errors on launch:

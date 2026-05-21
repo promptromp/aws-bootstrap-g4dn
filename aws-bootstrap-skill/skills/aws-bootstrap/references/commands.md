@@ -486,9 +486,99 @@ Requests are sorted newest-first. Field `case_id` is included when a support cas
 
 ---
 
+## `aws-bootstrap cluster launch`
+
+Launch (or incrementally grow) a multi-node training cluster: N GPU instances tagged with a shared `--cluster-id`, all in one AZ inside a cluster placement group, with a self-referencing security-group rule for intra-cluster NCCL/rendezvous traffic. Re-run with a higher `--nodes` to add nodes toward the target.
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--cluster-id` | string | (required) | Cluster identifier (EC2 tag; tags are the source of truth) |
+| `--nodes` | int | `2` | Target number of nodes |
+| `--instance-type` | string | `g4dn.xlarge` | EC2 instance type |
+| `--spot/--on-demand` | flag | spot | Pricing |
+| `--region` | string | resolved | AWS region (a single AZ is chosen within it) |
+| `--key-path` | path | `~/.ssh/id_ed25519.pub` | Local SSH public key (auto-generated if absent) |
+| `--volume-size` | int | `100` | Root EBS volume size (GB, gp3) |
+| `--no-setup` | flag | false | Skip remote setup |
+| `--ssh-port` | int | `22` | SSH port |
+| `--python-version` | string | none | Python version for remote venv |
+
+### JSON Output
+
+```json
+{
+  "cluster_id": "ml1",
+  "region": "us-east-1",
+  "availability_zone": "us-east-1c",
+  "placement_group": "aws-bootstrap-cluster-ml1",
+  "nodes_added": 4,
+  "node_count": 4,
+  "nodes": [
+    {"rank": 0, "instance_id": "i-0abc", "public_ip": "1.2.3.4", "alias": "aws-ml1-0"}
+  ]
+}
+```
+
+When the cluster already has `--nodes` nodes, `nodes_added` is `0` and no instances are launched.
+
+---
+
+## `aws-bootstrap cluster status`
+
+Show a cluster's nodes (rank, state, type, AZ, IPs). Omit `--cluster-id` to list all clusters in the region.
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--cluster-id` | string | none | Cluster id (omit to list all clusters) |
+| `--region` | string | resolved | AWS region |
+
+### JSON Output
+
+With `--cluster-id`:
+
+```json
+{
+  "cluster_id": "ml1",
+  "region": "us-east-1",
+  "nodes": [
+    {"rank": 0, "instance_id": "i-0abc", "state": "running", "instance_type": "g5.xlarge",
+     "az": "us-east-1c", "public_ip": "1.2.3.4", "private_ip": "10.0.0.5"}
+  ]
+}
+```
+
+Without `--cluster-id`: `{"region": "...", "clusters": [{"cluster_id": "ml1", "node_count": 4}]}`.
+
+---
+
+## `aws-bootstrap cluster terminate`
+
+Terminate all nodes of a cluster, remove their SSH aliases, and delete the placement group.
+
+### Options
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `--cluster-id` | string | (required) | Cluster id to terminate |
+| `--region` | string | resolved | AWS region |
+| `--keep-ebs` | flag | false | Preserve per-node EBS data volumes |
+| `--yes` | flag | false | Skip confirmation (required in structured output modes) |
+
+### JSON Output
+
+```json
+{"cluster_id": "ml1", "region": "us-east-1", "terminated": ["i-0abc", "i-1def"]}
+```
+
+---
+
 ## Notes
 
-- **SSH aliases** use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and are managed in `~/.ssh/config`
+- **SSH aliases** use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and are managed in `~/.ssh/config`; cluster nodes use deterministic `aws-<cluster-id>-<rank>` aliases (e.g. `aws-ml1-0`)
 - **EBS volumes** are tagged with `created-by=aws-bootstrap-g4dn` for automatic discovery
 - **Spot capacity**: on a fully-exhausted spot sweep (`InsufficientInstanceCapacity` in every `--region`) **without `--wait`**, the launcher offers the on-demand fallback (auto-confirmed in structured modes). With `--wait` it retries with backoff and hard-fails on timeout (never auto-buys on-demand). Quota errors and `SpotMaxPriceTooLow` are **not** auto-fallback triggers — in multi-region mode they warn and skip to the next region, hard-failing only when every region is blocked.
 - **Remote setup** installs CUDA-matched PyTorch, Jupyter, GPU benchmark, and VSCode CUDA debug configs
