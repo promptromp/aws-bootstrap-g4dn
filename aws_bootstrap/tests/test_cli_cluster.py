@@ -217,3 +217,88 @@ def test_cluster_prepare_fails_on_version_skew(mock_session, mock_find, mock_gpu
     )
     assert result.exit_code != 0
     assert "mismatch" in result.output.lower()
+
+
+# ---------------------------------------------------------------------------
+# cluster run (Phase 3)
+# ---------------------------------------------------------------------------
+
+
+@patch("aws_bootstrap.cli.cluster_mod.run_distributed_job")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cluster_run_distributes_and_reports(mock_session, mock_find, mock_run, tmp_path):
+    mock_find.return_value = [_node(instance_id="i-0", rank=0), _node(instance_id="i-1", rank=1)]
+    mock_run.return_value = [
+        NodeResult("i-0", 0, 0, "loss 0.1", ""),
+        NodeResult("i-1", 1, 0, "loss 0.1", ""),
+    ]
+    train = tmp_path / "train.py"
+    train.write_text("print('hi')\n")
+    log_dir = tmp_path / "logs"
+    result = _runner().invoke(
+        main,
+        [
+            "-o",
+            "json",
+            "cluster",
+            "run",
+            "--cluster-id",
+            "ml1",
+            "--key-path",
+            str(_make_key(tmp_path)),
+            "--log-dir",
+            str(log_dir),
+            str(train),
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["succeeded"] is True
+    mock_run.assert_called_once()
+    assert (log_dir / "ml1" / "rank0.log").exists()
+
+
+@patch("aws_bootstrap.cli.cluster_mod.run_distributed_job")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cluster_run_nonzero_on_failure(mock_session, mock_find, mock_run, tmp_path):
+    mock_find.return_value = [_node(instance_id="i-0", rank=0)]
+    mock_run.return_value = [NodeResult("i-0", 0, 1, "", "traceback")]
+    train = tmp_path / "train.py"
+    train.write_text("x\n")
+    result = _runner().invoke(
+        main,
+        [
+            "-o",
+            "json",
+            "cluster",
+            "run",
+            "--cluster-id",
+            "ml1",
+            "--key-path",
+            str(_make_key(tmp_path)),
+            "--log-dir",
+            str(tmp_path / "logs"),
+            str(train),
+        ],
+    )
+    assert result.exit_code != 0
+    assert json.loads(result.output)["succeeded"] is False
+
+
+def test_cluster_run_missing_script_errors(tmp_path):
+    with patch("aws_bootstrap.cli.boto3.Session"):
+        result = _runner().invoke(
+            main,
+            [
+                "cluster",
+                "run",
+                "--cluster-id",
+                "ml1",
+                "--key-path",
+                str(_make_key(tmp_path)),
+                str(tmp_path / "nope.py"),
+            ],
+        )
+    assert result.exit_code != 0

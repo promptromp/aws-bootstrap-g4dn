@@ -2077,3 +2077,106 @@ def cluster_prepare(ctx, cluster_id, region, profile, key_path, ssh_user, ssh_po
     )
     if not passed:
         ctx.exit(1)
+
+
+@cluster_cmd.command(name="run", context_settings={"ignore_unknown_options": True})
+@click.option("--cluster-id", required=True, help="Cluster id.")
+@click.option("--region", default=None, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.option(
+    "--key-path", default="~/.ssh/id_ed25519.pub", show_default=True, type=click.Path(), help="Local SSH public key."
+)
+@click.option("--ssh-user", default="ubuntu", show_default=True, help="Remote SSH user.")
+@click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port.")
+@click.option("--nproc-per-node", default=1, show_default=True, type=int, help="Processes (GPUs) per node.")
+@click.option(
+    "--data-script", default=None, type=click.Path(), help="Optional data-prep script run on each node first."
+)
+@click.option(
+    "--log-dir",
+    default=".aws-bootstrap/clusters",
+    show_default=True,
+    type=click.Path(),
+    help="Local dir for per-node logs.",
+)
+@click.argument("script", type=click.Path())
+@click.argument("script_args", nargs=-1, type=click.UNPROCESSED)
+@click.pass_context
+def cluster_run(
+    ctx,
+    cluster_id,
+    region,
+    profile,
+    key_path,
+    ssh_user,
+    ssh_port,
+    nproc_per_node,
+    data_script,
+    log_dir,
+    script,
+    script_args,
+):
+    """Distribute SCRIPT to all nodes and run it across the cluster via torchrun.
+
+    A .py SCRIPT is launched with torchrun (c10d rendezvous); a .sh SCRIPT runs
+    as-is with the AWSB_* env contract exported. Pass training args after ``--``.
+    """
+    local_script = Path(script).expanduser()
+    if not local_script.exists():
+        raise CLIError(f"Script not found: {local_script}")
+    data_path = Path(data_script).expanduser() if data_script else None
+    if data_path is not None and not data_path.exists():
+        raise CLIError(f"Data-prep script not found: {data_path}")
+
+    resolved = resolve_single_region(region, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
+    nodes = find_cluster_instances(ec2, cluster_id)
+    if not nodes:
+        raise CLIError(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+
+    key = Path(key_path).expanduser()
+    scp_fn, run_fn = _canary_runners(ssh_user, key, ssh_port)
+    remote_script = f"/tmp/{local_script.name}"  # noqa: S108
+
+    step(1, 1, f"Running {local_script.name} across {len(nodes)} node(s) of cluster '{cluster_id}'...")
+    results = cluster_mod.run_distributed_job(
+        nodes,
+        cluster_id=cluster_id,
+        nproc_per_node=nproc_per_node,
+        rdzv_port=RDZV_PORT,
+        local_script=local_script,
+        remote_script=remote_script,
+        script_args=list(script_args),
+        scp_fn=scp_fn,
+        run_fn=run_fn,
+        data_script=data_path,
+    )
+
+    # Persist per-node logs.
+    out_dir = Path(log_dir).expanduser() / cluster_id
+    out_dir.mkdir(parents=True, exist_ok=True)
+    for r in results:
+        (out_dir / f"rank{r.rank}.log").write_text(
+            f"# exit={r.returncode}\n## stdout\n{r.stdout}\n## stderr\n{r.stderr}\n"
+        )
+
+    succeeded = all(r.returncode == 0 for r in results)
+    if is_text(ctx):
+        rank0 = next((r for r in results if r.rank == 0), None)
+        if rank0 and rank0.stdout.strip():
+            click.echo(rank0.stdout.rstrip())
+        for r in results:
+            tag = "OK" if r.returncode == 0 else f"FAIL({r.returncode})"
+            click.echo(f"  [{tag}] rank {r.rank} ({r.instance_id})  log: {out_dir / f'rank{r.rank}.log'}")
+        (success if succeeded else warn)("Job complete." if succeeded else "Job FAILED on one or more nodes.")
+    emit(
+        {
+            "cluster_id": cluster_id,
+            "succeeded": succeeded,
+            "log_dir": str(out_dir),
+            "results": [{"rank": r.rank, "instance_id": r.instance_id, "returncode": r.returncode} for r in results],
+        },
+        ctx=ctx,
+    )
+    if not succeeded:
+        ctx.exit(1)
