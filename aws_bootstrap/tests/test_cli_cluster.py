@@ -1,4 +1,4 @@
-"""CliRunner tests for the `cluster` command group (Phase 1)."""
+"""CliRunner tests for the `cluster` command group (Phases 1-2)."""
 
 from __future__ import annotations
 import json
@@ -8,11 +8,19 @@ from unittest.mock import MagicMock, patch
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import main
+from aws_bootstrap.cluster import NodeResult
 from aws_bootstrap.ec2 import RegionContext, RegionLaunch
+from aws_bootstrap.gpu import GpuInfo
 
 
 def _runner():
     return CliRunner()
+
+
+def _make_key(tmp_path):
+    key = tmp_path / "id_ed25519.pub"
+    key.write_text("ssh-ed25519 AAAA test@host")
+    return key
 
 
 def _node(instance_id="i-1", cluster_id="ml1", rank=0, state="running"):
@@ -133,3 +141,79 @@ def test_cluster_launch_two_nodes_tags_ranks(
     assert mock_launch.call_count == 2
     aliases = {c.kwargs.get("alias") for c in mock_add_ssh.call_args_list}
     assert aliases == {"aws-ml1-0", "aws-ml1-1"}
+
+
+# ---------------------------------------------------------------------------
+# cluster test / prepare (Phase 2)
+# ---------------------------------------------------------------------------
+
+
+@patch("aws_bootstrap.cli.cluster_mod.run_canary")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cluster_test_runs_canary(mock_session, mock_find, mock_canary, tmp_path):
+    mock_find.return_value = [_node(instance_id="i-0", rank=0), _node(instance_id="i-1", rank=1)]
+    mock_canary.return_value = [
+        NodeResult("i-0", 0, 0, "[canary] ok", ""),
+        NodeResult("i-1", 1, 0, "[canary] ok", ""),
+    ]
+    result = _runner().invoke(
+        main, ["-o", "json", "cluster", "test", "--cluster-id", "ml1", "--key-path", str(_make_key(tmp_path))]
+    )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["passed"] is True
+    mock_canary.assert_called_once()
+
+
+@patch("aws_bootstrap.cli.cluster_mod.run_canary")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cluster_test_nonzero_on_failure(mock_session, mock_find, mock_canary, tmp_path):
+    mock_find.return_value = [_node(instance_id="i-0", rank=0)]
+    mock_canary.return_value = [NodeResult("i-0", 0, 1, "", "boom")]
+    result = _runner().invoke(
+        main, ["-o", "json", "cluster", "test", "--cluster-id", "ml1", "--key-path", str(_make_key(tmp_path))]
+    )
+    assert result.exit_code != 0
+    assert json.loads(result.output)["passed"] is False
+
+
+@patch("aws_bootstrap.cli.cluster_mod.run_canary")
+@patch("aws_bootstrap.cli.run_on_host", return_value=(0, "", ""))
+@patch("aws_bootstrap.cli.query_gpu_info")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cluster_prepare_verifies_and_runs_canary(mock_session, mock_find, mock_gpu, mock_run, mock_canary, tmp_path):
+    mock_find.return_value = [_node(instance_id="i-0", rank=0), _node(instance_id="i-1", rank=1)]
+    mock_gpu.return_value = GpuInfo(
+        driver_version="550",
+        cuda_driver_version="12.4",
+        cuda_toolkit_version="12.4",
+        gpu_name="T4",
+        compute_capability="7.5",
+        architecture="Turing",
+    )
+    mock_canary.return_value = [NodeResult("i-0", 0, 0, "ok", ""), NodeResult("i-1", 1, 0, "ok", "")]
+    result = _runner().invoke(
+        main, ["cluster", "prepare", "--cluster-id", "ml1", "--key-path", str(_make_key(tmp_path))]
+    )
+    assert result.exit_code == 0, result.output
+    assert mock_canary.called
+    assert mock_run.call_count >= 2  # wrote per-node config
+
+
+@patch("aws_bootstrap.cli.query_gpu_info")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cluster_prepare_fails_on_version_skew(mock_session, mock_find, mock_gpu, tmp_path):
+    mock_find.return_value = [_node(instance_id="i-0", rank=0), _node(instance_id="i-1", rank=1)]
+    mock_gpu.side_effect = [
+        GpuInfo("550", "12.4", "12.4", "T4", "7.5", "Turing"),
+        GpuInfo("550", "12.1", "12.1", "T4", "7.5", "Turing"),
+    ]
+    result = _runner().invoke(
+        main, ["cluster", "prepare", "--cluster-id", "ml1", "--key-path", str(_make_key(tmp_path))]
+    )
+    assert result.exit_code != 0
+    assert "mismatch" in result.output.lower()

@@ -17,6 +17,7 @@ from .constants import (
     EBS_DETACH_WAITER,
     EBS_MOUNT_POINT,
     JUPYTER_PORT,
+    RDZV_PORT,
     SSH_PORT_DEFAULT,
     TAG_BOOTSTRAP_INSTANCE,
     TAG_CLUSTER_ID,
@@ -76,7 +77,9 @@ from .ssh import (
     query_gpu_info,
     remove_ssh_host,
     resolve_instance_id,
+    run_on_host,
     run_remote_setup,
+    scp_to_host,
     wait_for_ssh,
 )
 
@@ -1935,3 +1938,142 @@ def cluster_terminate(ctx, cluster_id, region, profile, yes, keep_ebs):
     if keep_ebs and is_text(ctx):
         info("EBS data volumes preserved (per-node).")
     emit({"cluster_id": cluster_id, "region": resolved, "terminated": instance_ids}, ctx=ctx)
+
+
+def _canary_runners(user, key_path, ssh_port):
+    """Build (scp_fn, run_fn) closures over the ssh primitives for cluster nodes."""
+
+    def scp_fn(node, local, remote):
+        return scp_to_host(node["PublicIp"], user, key_path, local, remote, port=ssh_port)
+
+    def run_fn(node, command):
+        return run_on_host(node["PublicIp"], user, key_path, command, port=ssh_port, timeout=600)
+
+    return scp_fn, run_fn
+
+
+@cluster_cmd.command(name="test")
+@click.option("--cluster-id", required=True, help="Cluster id.")
+@click.option("--region", default=None, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.option(
+    "--key-path", default="~/.ssh/id_ed25519.pub", show_default=True, type=click.Path(), help="Local SSH public key."
+)
+@click.option("--ssh-user", default="ubuntu", show_default=True, help="Remote SSH user.")
+@click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port.")
+@click.pass_context
+def cluster_test(ctx, cluster_id, region, profile, key_path, ssh_user, ssh_port):
+    """Run the built-in distributed canary across the cluster (verify it works)."""
+    resolved = resolve_single_region(region, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
+    nodes = find_cluster_instances(ec2, cluster_id)
+    if not nodes:
+        raise CLIError(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+
+    key = Path(key_path).expanduser()
+    scp_fn, run_fn = _canary_runners(ssh_user, key, ssh_port)
+
+    step(1, 1, f"Running canary across {len(nodes)} node(s) of cluster '{cluster_id}'...")
+    results = cluster_mod.run_canary(
+        nodes, cluster_id=cluster_id, nproc_per_node=1, rdzv_port=RDZV_PORT, scp_fn=scp_fn, run_fn=run_fn
+    )
+    passed = all(r.returncode == 0 for r in results)
+    if is_text(ctx):
+        for r in results:
+            tag = "OK" if r.returncode == 0 else "FAIL"
+            click.echo(f"  [{tag}] rank {r.rank} ({r.instance_id})")
+            if r.returncode != 0 and r.stderr.strip():
+                click.echo(f"        {r.stderr.strip().splitlines()[-1]}")
+        (success if passed else warn)("Canary passed." if passed else "Canary FAILED.")
+    emit(
+        {
+            "cluster_id": cluster_id,
+            "passed": passed,
+            "results": [{"rank": r.rank, "instance_id": r.instance_id, "returncode": r.returncode} for r in results],
+        },
+        ctx=ctx,
+    )
+    if not passed:
+        ctx.exit(1)
+
+
+@cluster_cmd.command(name="prepare")
+@click.option("--cluster-id", required=True, help="Cluster id.")
+@click.option("--region", default=None, help="AWS region.")
+@click.option("--profile", default=None, help="AWS profile override.")
+@click.option(
+    "--key-path", default="~/.ssh/id_ed25519.pub", show_default=True, type=click.Path(), help="Local SSH public key."
+)
+@click.option("--ssh-user", default="ubuntu", show_default=True, help="Remote SSH user.")
+@click.option("--ssh-port", default=22, show_default=True, type=int, help="SSH port.")
+@click.option("--no-canary", is_flag=True, default=False, help="Skip the auto-canary at the end.")
+@click.pass_context
+def cluster_prepare(ctx, cluster_id, region, profile, key_path, ssh_user, ssh_port, no_canary):
+    """Verify a cluster (reachability, GPU, version consistency) and run a canary."""
+    resolved = resolve_single_region(region, profile)
+    ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
+    nodes = find_cluster_instances(ec2, cluster_id)
+    if not nodes:
+        raise CLIError(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+    key = Path(key_path).expanduser()
+    total = 2 if not no_canary else 1
+
+    step(1, total, f"Verifying {len(nodes)} node(s) of cluster '{cluster_id}'...")
+    cuda_versions: dict[str, str] = {}
+    gpus_per_node = 1
+    for n in nodes:
+        gpu = query_gpu_info(n["PublicIp"], ssh_user, key, port=ssh_port)
+        if gpu is None:
+            raise CLIError(f"Node {n['InstanceId']} (rank {n['Rank']}) is unreachable or has no GPU.")
+        cuda_versions[n["InstanceId"]] = gpu.cuda_toolkit_version or gpu.cuda_driver_version or ""
+        val(f"  rank {n['Rank']} {n['InstanceId']}", f"{gpu.gpu_name} CUDA {cuda_versions[n['InstanceId']]}")
+
+    skew = cluster_mod.detect_version_skew(cuda_versions)
+    if skew:
+        raise CLIError("Cluster nodes are inconsistent:\n  " + "\n  ".join(skew))
+
+    # Write a per-node cluster config (used by later `cluster run`).
+    addr = cluster_mod.master_addr(nodes)
+    node_ips = [n["PrivateIp"] for n in nodes]
+    for n in nodes:
+        env = cluster_mod.node_env(cluster_id, n["Rank"], len(nodes), gpus_per_node, node_ips, addr)
+        config_body = "\n".join(f"{k}={v}" for k, v in env.items())
+        write_cmd = f"cat > ~/.aws-bootstrap-cluster <<'EOF'\n{config_body}\nEOF"
+        rc, _, err = run_on_host(n["PublicIp"], ssh_user, key, write_cmd, port=ssh_port)
+        if rc != 0:
+            warn(f"Could not write cluster config on {n['InstanceId']}: {err.strip()}")
+
+    success(f"Cluster '{cluster_id}' verified: {len(nodes)} node(s), CUDA consistent, master {addr}.")
+
+    if no_canary:
+        emit(
+            {"cluster_id": cluster_id, "verified": True, "master_addr": addr, "node_count": len(nodes)},
+            ctx=ctx,
+        )
+        return
+
+    step(2, total, "Running verification canary...")
+    scp_fn, run_fn = _canary_runners(ssh_user, key, ssh_port)
+    results = cluster_mod.run_canary(
+        nodes, cluster_id=cluster_id, nproc_per_node=gpus_per_node, rdzv_port=RDZV_PORT, scp_fn=scp_fn, run_fn=run_fn
+    )
+    passed = all(r.returncode == 0 for r in results)
+    if not passed and is_text(ctx):
+        for r in results:
+            if r.returncode != 0:
+                click.echo(f"  rank {r.rank} ({r.instance_id}) canary failed: {r.stderr.strip()[:200]}")
+    (success if passed else warn)("Canary passed — cluster is ready." if passed else "Canary FAILED.")
+    if is_text(ctx) and passed:
+        info(f"Next: aws-bootstrap cluster run --cluster-id {cluster_id} <your_train.py>  (Phase 3)")
+    emit(
+        {
+            "cluster_id": cluster_id,
+            "verified": True,
+            "canary_passed": passed,
+            "master_addr": addr,
+            "node_count": len(nodes),
+        },
+        ctx=ctx,
+    )
+    if not passed:
+        ctx.exit(1)
