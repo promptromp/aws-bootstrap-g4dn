@@ -138,6 +138,67 @@ def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int =
     return sg_id
 
 
+def ensure_cluster_placement_group(ec2_client, name: str, tag_value: str) -> str:
+    """Create (or reuse) a *cluster*-strategy placement group by name.
+
+    ``name`` is the already-derived group name (see
+    ``cluster.placement_group_name``); keeping naming out of this AWS-primitive
+    layer avoids an ec2→cluster import cycle. Returns the name. Idempotent.
+    """
+    existing = ec2_client.describe_placement_groups(Filters=[{"Name": "group-name", "Values": [name]}])
+    if existing.get("PlacementGroups"):
+        echo(f"  Placement group '{name}' already exists, reusing.")
+        return name
+    ec2_client.create_placement_group(
+        GroupName=name,
+        Strategy="cluster",
+        TagSpecifications=[
+            {
+                "ResourceType": "placement-group",
+                "Tags": [
+                    {"Key": TAG_CREATED_BY, "Value": tag_value},
+                    {"Key": TAG_NAME, "Value": name},
+                ],
+            }
+        ],
+    )
+    secho(f"  Created cluster placement group '{name}'.", fg="green")
+    return name
+
+
+def delete_cluster_placement_group(ec2_client, name: str) -> None:
+    """Delete a placement group by name; no-op if it no longer exists."""
+    try:
+        ec2_client.delete_placement_group(GroupName=name)
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "InvalidPlacementGroup.Unknown":
+            return
+        raise
+
+
+def ensure_cluster_security_group_rule(ec2_client, sg_id: str) -> None:
+    """Allow all traffic between members of the same security group.
+
+    Cluster nodes need to reach each other on the NCCL/rendezvous ports; a
+    self-referencing ingress rule is the simplest correct grant. Idempotent —
+    a pre-existing identical rule is treated as success.
+    """
+    try:
+        ec2_client.authorize_security_group_ingress(
+            GroupId=sg_id,
+            IpPermissions=[
+                {
+                    "IpProtocol": "-1",
+                    "UserIdGroupPairs": [{"GroupId": sg_id, "Description": "aws-bootstrap intra-cluster"}],
+                }
+            ],
+        )
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] == "InvalidPermission.Duplicate":
+            return
+        raise
+
+
 class CapacityError(Exception):
     """Retryable: AWS has no capacity for the requested type in this region/AZ.
 

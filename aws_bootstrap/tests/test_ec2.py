@@ -16,6 +16,9 @@ from aws_bootstrap.ec2 import (
     RegionContext,
     RegionLaunch,
     _run_instances,
+    delete_cluster_placement_group,
+    ensure_cluster_placement_group,
+    ensure_cluster_security_group_rule,
     find_tagged_instances,
     find_tagged_instances_in_regions,
     get_latest_ami,
@@ -818,3 +821,64 @@ def test_launch_with_retry_passes_placement_az_to_run_instances():
 
     assert result.region == "us-east-1"
     assert client.run_instances.call_args[1]["Placement"] == {"AvailabilityZone": "us-east-1c"}
+
+
+# ---------------------------------------------------------------------------
+# Cluster placement-group lifecycle
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_cluster_placement_group_creates_when_absent():
+    ec2 = MagicMock()
+    ec2.describe_placement_groups.return_value = {"PlacementGroups": []}
+    name = ensure_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1", "aws-bootstrap-g4dn")
+    assert name == "aws-bootstrap-cluster-ml1"
+    create_kwargs = ec2.create_placement_group.call_args[1]
+    assert create_kwargs["GroupName"] == "aws-bootstrap-cluster-ml1"
+    assert create_kwargs["Strategy"] == "cluster"
+
+
+def test_ensure_cluster_placement_group_reuses_existing():
+    ec2 = MagicMock()
+    ec2.describe_placement_groups.return_value = {
+        "PlacementGroups": [{"GroupName": "aws-bootstrap-cluster-ml1", "State": "available"}]
+    }
+    name = ensure_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1", "aws-bootstrap-g4dn")
+    assert name == "aws-bootstrap-cluster-ml1"
+    ec2.create_placement_group.assert_not_called()
+
+
+def test_delete_cluster_placement_group_ignores_unknown():
+    ec2 = MagicMock()
+    ec2.delete_placement_group.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "InvalidPlacementGroup.Unknown", "Message": "nope"}},
+        "DeletePlacementGroup",
+    )
+    # Must not raise.
+    delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1")
+    ec2.delete_placement_group.assert_called_once_with(GroupName="aws-bootstrap-cluster-ml1")
+
+
+# ---------------------------------------------------------------------------
+# Intra-cluster security-group rule
+# ---------------------------------------------------------------------------
+
+
+def test_ensure_cluster_sg_rule_authorizes_self_reference():
+    ec2 = MagicMock()
+    ensure_cluster_security_group_rule(ec2, "sg-123")
+    kwargs = ec2.authorize_security_group_ingress.call_args[1]
+    assert kwargs["GroupId"] == "sg-123"
+    perm = kwargs["IpPermissions"][0]
+    assert perm["IpProtocol"] == "-1"
+    assert perm["UserIdGroupPairs"][0]["GroupId"] == "sg-123"
+
+
+def test_ensure_cluster_sg_rule_idempotent_on_duplicate():
+    ec2 = MagicMock()
+    ec2.authorize_security_group_ingress.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "InvalidPermission.Duplicate", "Message": "exists"}},
+        "AuthorizeSecurityGroupIngress",
+    )
+    # Must not raise.
+    ensure_cluster_security_group_rule(ec2, "sg-123")
