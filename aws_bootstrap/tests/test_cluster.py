@@ -85,3 +85,65 @@ def test_launch_cluster_nodes_starts_at_offset():
         launch_fn=_fake_launch(holder),
     )
     assert [r.rank for r in results] == [2, 3]
+
+
+# ---------------------------------------------------------------------------
+# Pure orchestration helpers (master addr, torchrun command, env, version skew)
+# ---------------------------------------------------------------------------
+
+
+def test_master_addr_is_rank0_private_ip():
+    nodes = [
+        {"Rank": 1, "PrivateIp": "10.0.0.6"},
+        {"Rank": 0, "PrivateIp": "10.0.0.5"},
+    ]
+    assert cluster.master_addr(nodes) == "10.0.0.5"
+
+
+def test_build_torchrun_command_c10d():
+    cmd = cluster.build_torchrun_command(
+        script="train.py",
+        num_nodes=4,
+        nproc_per_node=1,
+        master_addr="10.0.0.5",
+        rdzv_id="ml1",
+        rdzv_port=29400,
+        script_args=["--epochs", "1"],
+    )
+    assert "torchrun" in cmd
+    assert "--nnodes=4" in cmd
+    assert "--nproc-per-node=1" in cmd
+    assert "--rdzv-backend=c10d" in cmd
+    assert "--rdzv-endpoint=10.0.0.5:29400" in cmd
+    assert "--rdzv-id=ml1" in cmd
+    assert cmd.strip().endswith("train.py --epochs 1")
+
+
+def test_node_env_contract():
+    env = cluster.node_env(
+        cluster_id="ml1",
+        node_rank=2,
+        num_nodes=4,
+        num_gpus_per_node=1,
+        node_ips=["10.0.0.5", "10.0.0.6"],
+        master_addr="10.0.0.5",
+    )
+    assert env["AWSB_CLUSTER_ID"] == "ml1"
+    assert env["AWSB_NODE_RANK"] == "2"
+    assert env["AWSB_NUM_NODES"] == "4"
+    assert env["AWSB_NUM_GPUS_PER_NODE"] == "1"
+    assert env["AWSB_MASTER_ADDR"] == "10.0.0.5"
+    assert env["AWSB_NODE_IPS"] == "10.0.0.5\n10.0.0.6"
+
+
+@pytest.mark.parametrize(
+    "versions,expected_ok",
+    [
+        ({"i-0": "12.4", "i-1": "12.4"}, True),
+        ({"i-0": "12.4", "i-1": "12.1"}, False),
+        ({"i-0": "12.4"}, True),
+    ],
+)
+def test_detect_version_skew(versions, expected_ok):
+    mismatches = cluster.detect_version_skew(versions)
+    assert (len(mismatches) == 0) == expected_ok
