@@ -547,6 +547,38 @@ def find_stale_ssh_hosts(live_instance_ids: set[str], config_path: Path | None =
     return stale
 
 
+def find_missing_ssh_hosts(live_instances: list[dict], config_path: Path | None = None) -> list[dict]:
+    """Live instances (with a public IP) that have no managed SSH config block.
+
+    Returns the live instance dicts (so the caller has ``PublicIp`` and any
+    cluster tags) for instances whose ``InstanceId`` is absent from the config.
+    Instances without a public IP are skipped (no usable host to add).
+    """
+    known = set(list_ssh_hosts(config_path))
+    return [i for i in live_instances if i["InstanceId"] not in known and i.get("PublicIp")]
+
+
+def find_drifted_ssh_hosts(live_instances: list[dict], config_path: Path | None = None) -> list[tuple[str, str, str]]:
+    """Managed SSH entries whose stanza ``HostName`` no longer matches the live IP.
+
+    Returns ``[(instance_id, alias, current_public_ip), ...]`` for live instances
+    that have a config block whose ``HostName`` differs from the instance's
+    current ``PublicIp`` (e.g. after a stop/start). Instances without a public
+    IP are skipped.
+    """
+    aliases = list_ssh_hosts(config_path)
+    by_id = {i["InstanceId"]: i for i in live_instances}
+    drifted: list[tuple[str, str, str]] = []
+    for iid, alias in aliases.items():
+        inst = by_id.get(iid)
+        if not inst or not inst.get("PublicIp"):
+            continue
+        details = get_ssh_host_details(iid, config_path)
+        if details and details.hostname != inst["PublicIp"]:
+            drifted.append((iid, alias, inst["PublicIp"]))
+    return drifted
+
+
 def cleanup_stale_ssh_hosts(
     live_instance_ids: set[str],
     config_path: Path | None = None,

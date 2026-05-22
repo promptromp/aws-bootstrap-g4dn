@@ -358,21 +358,23 @@ aws-bootstrap terminate aws-gpu1 i-def456
 # Skip confirmation prompt
 aws-bootstrap terminate --yes
 
-# Remove stale SSH config entries for terminated instances
+# Sync ~/.ssh/config with live instances across ALL regions
+# (removes stale aliases left by spot reclaims / out-of-band terminations).
 aws-bootstrap cleanup
 
-# Preview what would be removed without modifying config
+# Preview (diagnostic) — shows stale / missing / drifted, changes nothing
 aws-bootstrap cleanup --dry-run
 
+# --sync also ADDS aliases for live instances missing one, and REPAIRS
+# aliases whose IP drifted (e.g. after a stop/start)
+aws-bootstrap cleanup --sync
+
 # Also find and delete orphan EBS data volumes
-aws-bootstrap cleanup --include-ebs
-
-# Preview orphan volumes without deleting
 aws-bootstrap cleanup --include-ebs --dry-run
-
-# Skip confirmation prompt
-aws-bootstrap cleanup --yes
+aws-bootstrap cleanup --include-ebs --yes
 ```
+
+`cleanup` scans **all enabled regions** (an SSH alias records no region, so staleness can only be judged globally). If a region query fails it reports the stale aliases but does **not** remove them — it can't prove the instance isn't alive in the region it couldn't reach. It never terminates instances.
 
 `status --gpu` reports both the **installed CUDA toolkit** version (from `nvcc`) and the **maximum CUDA version supported by the driver** (from `nvidia-smi`), so you can see at a glance whether they match:
 

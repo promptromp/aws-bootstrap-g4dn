@@ -7,13 +7,14 @@ from pathlib import Path
 from unittest.mock import MagicMock, patch
 
 import botocore.exceptions
+import pytest
 import yaml
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import main
 from aws_bootstrap.ec2 import CLIError, RegionContext, RegionLaunch
 from aws_bootstrap.gpu import GpuInfo
-from aws_bootstrap.ssh import CleanupResult, SSHHostDetails
+from aws_bootstrap.ssh import SSHHostDetails, add_ssh_host
 
 
 def _region_launch(instance, *, region="us-west-2", pricing="spot", ami=None):
@@ -1600,145 +1601,254 @@ def test_status_shows_ebs_volumes(mock_find, mock_spot_price, mock_session, mock
 # ---------------------------------------------------------------------------
 
 
+def _writekey(tmp_path):
+    k = tmp_path / "id_ed25519.pub"
+    k.write_text("ssh-ed25519 AAAA t@h")
+    return k
+
+
+def _live(instance_id, public_ip="1.2.3.4", region="us-east-1", cluster_id="", rank=None):
+    return {"InstanceId": instance_id, "PublicIp": public_ip, "Region": region, "ClusterId": cluster_id, "Rank": rank}
+
+
 def test_cleanup_help():
     runner = CliRunner()
     result = runner.invoke(main, ["cleanup", "--help"])
     assert result.exit_code == 0
-    assert "--dry-run" in result.output
-    assert "--yes" in result.output
-    assert "--region" in result.output
-    assert "--profile" in result.output
+    for opt in ("--dry-run", "--yes", "--sync", "--key-path"):
+        assert opt in result.output
+    assert "--region" not in result.output  # cleanup is always all-regions now
 
 
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions", return_value=([], []))
 @patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_no_stale(mock_find, mock_session, mock_stale):
-    runner = CliRunner()
-    result = runner.invoke(main, ["cleanup"])
+def test_cleanup_nothing_to_do(mock_session, mock_find, mock_regions, tmp_path):
+    cfg = tmp_path / "config"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("")
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["cleanup"])
     assert result.exit_code == 0
-    assert "No stale" in result.output
+    assert "in sync" in result.output
 
 
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[("i-dead1234", "aws-gpu1")])
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1", "us-west-2"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
 @patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_dry_run(mock_find, mock_session, mock_stale):
-    runner = CliRunner()
-    result = runner.invoke(main, ["cleanup", "--dry-run"])
+def test_cleanup_keeps_alive_instance_in_other_region(mock_session, mock_find, mock_regions, tmp_path):
+    cfg = tmp_path / "config"
+    add_ssh_host("i-east0001", "1.1.1.1", "ubuntu", _writekey(tmp_path), config_path=cfg)
+    mock_find.return_value = ([_live("i-east0001", "1.1.1.1", "us-east-1")], [])
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["-o", "json", "cleanup", "--yes"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["cleaned"] == []
+    assert "i-east0001" in cfg.read_text()
+
+
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_removes_stale(mock_session, mock_find, mock_regions, tmp_path):
+    cfg = tmp_path / "config"
+    add_ssh_host("i-dead0001", "1.1.1.1", "ubuntu", _writekey(tmp_path), config_path=cfg)
+    mock_find.return_value = ([], [])  # not alive anywhere, no failures
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["-o", "json", "cleanup", "--yes"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert [c["instance_id"] for c in data["cleaned"]] == ["i-dead0001"]
+    assert "i-dead0001" not in cfg.read_text()
+
+
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_dry_run_does_not_modify(mock_session, mock_find, mock_regions, tmp_path):
+    cfg = tmp_path / "config"
+    add_ssh_host("i-dead0001", "1.1.1.1", "ubuntu", _writekey(tmp_path), config_path=cfg)
+    mock_find.return_value = ([], [])
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["cleanup", "--dry-run"])
     assert result.exit_code == 0
-    assert "Would remove" in result.output
-    assert "aws-gpu1" in result.output
-    assert "i-dead1234" in result.output
+    assert "would remove" in result.output
+    assert "i-dead0001" in cfg.read_text()  # unchanged
 
 
-@patch("aws_bootstrap.cli.cleanup_stale_ssh_hosts")
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[("i-dead1234", "aws-gpu1")])
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
 @patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_with_yes(mock_find, mock_session, mock_stale, mock_cleanup):
-    mock_cleanup.return_value = [CleanupResult(instance_id="i-dead1234", alias="aws-gpu1", removed=True)]
-    runner = CliRunner()
-    result = runner.invoke(main, ["cleanup", "--yes"])
-    assert result.exit_code == 0
-    assert "Removed aws-gpu1" in result.output
-    assert "Cleaned up 1" in result.output
-    mock_cleanup.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# cleanup --include-ebs
-# ---------------------------------------------------------------------------
-
-
-@patch("aws_bootstrap.cli.find_orphan_ebs_volumes", return_value=[])
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
-@patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_include_ebs_no_orphans(mock_find, mock_session, mock_stale, mock_orphan):
-    runner = CliRunner()
-    result = runner.invoke(main, ["cleanup", "--include-ebs"])
-    assert result.exit_code == 0
-    assert "No stale SSH config entries or orphan EBS volumes found." in result.output
-    mock_orphan.assert_called_once()
-
-
-@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
-@patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_include_ebs_dry_run(mock_find, mock_session, mock_stale, mock_orphan):
-    mock_orphan.return_value = [
-        {"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-dead1234"},
-    ]
-    runner = CliRunner()
-    result = runner.invoke(main, ["cleanup", "--include-ebs", "--dry-run"])
-    assert result.exit_code == 0
-    assert "Would delete vol-orphan1" in result.output
-    assert "50 GB" in result.output
-
-
-@patch("aws_bootstrap.cli.delete_ebs_volume")
-@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
-@patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_include_ebs_delete_with_yes(mock_find, mock_session, mock_stale, mock_orphan, mock_delete):
-    mock_orphan.return_value = [
-        {"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-dead1234"},
-    ]
-    runner = CliRunner()
-    result = runner.invoke(main, ["cleanup", "--include-ebs", "--yes"])
-    assert result.exit_code == 0
-    assert "Deleted vol-orphan1" in result.output
-    mock_delete.assert_called_once_with(mock_session.return_value.client.return_value, "vol-orphan1")
-
-
-@patch("aws_bootstrap.cli.delete_ebs_volume")
-@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
-@patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_include_ebs_json(mock_find, mock_session, mock_stale, mock_orphan, mock_delete):
-    mock_orphan.return_value = [
-        {"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-dead1234"},
-    ]
-    runner = CliRunner()
-    result = runner.invoke(main, ["-o", "json", "cleanup", "--include-ebs", "--yes"])
+def test_cleanup_conservative_guard_skips_removal_on_region_failure(mock_session, mock_find, mock_regions, tmp_path):
+    cfg = tmp_path / "config"
+    add_ssh_host("i-gone0001", "1.1.1.1", "ubuntu", _writekey(tmp_path), config_path=cfg)
+    # Not in the (partial) live list, but a region query FAILED -> must not remove.
+    mock_find.return_value = ([], [{"region": "us-east-1", "error": "AuthFailure"}])
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["-o", "json", "cleanup", "--yes"])
     assert result.exit_code == 0
     data = json.loads(result.output)
-    assert "deleted_volumes" in data
-    assert len(data["deleted_volumes"]) == 1
+    assert data["cleaned"] == []
+    assert data["regions_failed"]
+    assert "i-gone0001" in cfg.read_text()
+
+
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-ml1-0")
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_sync_adds_missing_cluster_alias(mock_session, mock_find, mock_regions, mock_add, tmp_path):
+    cfg = tmp_path / "config"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("")
+    mock_find.return_value = ([_live("i-c1000001", "1.2.3.4", cluster_id="ml1", rank=0)], [])
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(
+            main, ["-o", "json", "cleanup", "--sync", "--yes", "--key-path", str(_writekey(tmp_path))]
+        )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert any(a["instance_id"] == "i-c1000001" for a in data["added"])
+    assert mock_add.call_args.kwargs.get("alias") == "aws-ml1-0"  # deterministic cluster alias
+
+
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_sync_repairs_drift(mock_session, mock_find, mock_regions, tmp_path):
+    cfg = tmp_path / "config"
+    add_ssh_host("i-d41f7001", "1.1.1.1", "ubuntu", _writekey(tmp_path), config_path=cfg)  # old IP
+    mock_find.return_value = ([_live("i-d41f7001", "9.9.9.9")], [])  # new IP
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(
+            main, ["-o", "json", "cleanup", "--sync", "--yes", "--key-path", str(_writekey(tmp_path))]
+        )
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert [u["instance_id"] for u in data["updated"]] == ["i-d41f7001"]
+    assert "9.9.9.9" in cfg.read_text()
+
+
+def test_cleanup_requires_yes_in_structured():
+    with patch("aws_bootstrap.cli.boto3.Session"):
+        result = CliRunner().invoke(main, ["-o", "json", "cleanup"])
+    assert result.exit_code != 0
+
+
+@pytest.mark.parametrize("fmt", ["json", "yaml", "table"])
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_renders_in_each_structured_format(mock_session, mock_find, mock_regions, tmp_path, fmt):
+    cfg = tmp_path / "config"
+    add_ssh_host("i-dead0001", "1.1.1.1", "ubuntu", _writekey(tmp_path), config_path=cfg)
+    mock_find.return_value = ([], [])
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["-o", fmt, "cleanup", "--yes"])
+    assert result.exit_code == 0, result.output
+    assert "i-dead0001" in result.output  # the removed alias's instance appears in output
+    assert "'instance_id'" not in result.output  # no raw dict repr (table picks the right list)
+
+
+@pytest.mark.parametrize("fmt", ["json", "yaml", "table"])
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_sync_renders_added_and_updated_in_each_format(mock_session, mock_find, mock_regions, tmp_path, fmt):
+    # A mixed --sync run (remove + add + repair): every action must be visible in
+    # ALL structured modes, not just json (table shows a unified action table).
+    cfg = tmp_path / "config"
+    add_ssh_host("i-dead0001", "1.1.1.1", "ubuntu", _writekey(tmp_path), config_path=cfg)  # stale -> removed
+    add_ssh_host("i-0d41f700", "2.2.2.2", "ubuntu", _writekey(tmp_path), config_path=cfg)  # drifted -> repaired
+    mock_find.return_value = (
+        [
+            _live("i-0d41f700", "9.9.9.9"),  # drifted
+            _live("i-0aabbccd", "3.3.3.3"),  # missing -> added
+        ],
+        [],
+    )
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(
+            main, ["-o", fmt, "cleanup", "--sync", "--yes", "--key-path", str(_writekey(tmp_path))]
+        )
+    assert result.exit_code == 0, result.output
+    # removed, added, and repaired instances all surface (regardless of format)
+    assert "i-dead0001" in result.output
+    assert "i-0aabbccd" in result.output
+    assert "i-0d41f700" in result.output
+    assert "'instance_id'" not in result.output
+
+
+# ---------------------------------------------------------------------------
+# cleanup --include-ebs (orphan volumes, scanned across regions)
+# ---------------------------------------------------------------------------
+
+
+@patch("aws_bootstrap.cli.delete_ebs_volume")
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions", return_value=([], []))
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_include_ebs_deletes_orphans(mock_session, mock_find, mock_regions, mock_orphan, mock_delete, tmp_path):
+    cfg = tmp_path / "config"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("")
+    mock_orphan.return_value = [{"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-x"}]
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["-o", "json", "cleanup", "--include-ebs", "--yes"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
     assert data["deleted_volumes"][0]["volume_id"] == "vol-orphan1"
-    assert data["deleted_volumes"][0]["deleted"] is True
+    mock_delete.assert_called_once()
+
+
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_sync_drift_preserves_port(mock_session, mock_find, mock_regions, tmp_path):
+    cfg = tmp_path / "config"
+    add_ssh_host("i-0aaf7001", "1.1.1.1", "ubuntu", _writekey(tmp_path), config_path=cfg, port=2222)
+    mock_find.return_value = ([_live("i-0aaf7001", "9.9.9.9")], [])
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["cleanup", "--sync", "--yes", "--key-path", str(_writekey(tmp_path))])
+    assert result.exit_code == 0, result.output
+    content = cfg.read_text()
+    assert "HostName 9.9.9.9" in content  # IP repaired
+    assert "Port 2222" in content  # non-standard port preserved, not reset to 22
+
+
+@patch("aws_bootstrap.cli.delete_ebs_volume")
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_include_ebs_not_deleted_on_region_failure(
+    mock_session, mock_find, mock_regions, mock_orphan, mock_delete, tmp_path
+):
+    cfg = tmp_path / "config"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("")
+    mock_find.return_value = ([], [{"region": "us-east-1", "error": "AuthFailure"}])  # incomplete scan
+    mock_orphan.return_value = [{"VolumeId": "vol-x", "Size": 50, "State": "available", "InstanceId": "i-x"}]
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["-o", "json", "cleanup", "--include-ebs", "--yes"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    mock_delete.assert_not_called()  # conservative guard: don't delete on incomplete scan
+    assert "orphan_volumes" in data  # reported as candidates, not deleted_volumes
 
 
 @patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions", return_value=([], []))
 @patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_include_ebs_dry_run_json(mock_find, mock_session, mock_stale, mock_orphan):
-    mock_orphan.return_value = [
-        {"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-dead1234"},
-    ]
-    runner = CliRunner()
-    result = runner.invoke(main, ["-o", "json", "cleanup", "--include-ebs", "--dry-run"])
-    assert result.exit_code == 0
-    data = json.loads(result.output)
-    assert data["dry_run"] is True
-    assert "orphan_volumes" in data
-    assert data["orphan_volumes"][0]["volume_id"] == "vol-orphan1"
-    assert data["orphan_volumes"][0]["size_gb"] == 50
-
-
-@patch("aws_bootstrap.cli.find_orphan_ebs_volumes", return_value=[])
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[])
-@patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_without_include_ebs_skips_volume_check(mock_find, mock_session, mock_stale, mock_orphan):
-    """Without --include-ebs, orphan volume discovery should not be called."""
-    runner = CliRunner()
-    result = runner.invoke(main, ["cleanup"])
+def test_cleanup_without_include_ebs_skips_volume_check(mock_session, mock_find, mock_regions, mock_orphan, tmp_path):
+    cfg = tmp_path / "config"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("")
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["cleanup"])
     assert result.exit_code == 0
     mock_orphan.assert_not_called()
 
@@ -1919,36 +2029,6 @@ def test_terminate_output_json(mock_terminate, mock_find, mock_session, mock_rem
     assert data["terminated"][0]["previous_state"] == "running"
     assert data["terminated"][0]["current_state"] == "shutting-down"
     assert data["terminated"][0]["ssh_alias_removed"] == "aws-gpu1"
-
-
-@patch("aws_bootstrap.cli.cleanup_stale_ssh_hosts")
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[("i-dead1234", "aws-gpu1")])
-@patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_output_json(mock_find, mock_session, mock_stale, mock_cleanup):
-    mock_cleanup.return_value = [CleanupResult(instance_id="i-dead1234", alias="aws-gpu1", removed=True)]
-    runner = CliRunner()
-    result = runner.invoke(main, ["-o", "json", "cleanup", "--yes"])
-    assert result.exit_code == 0
-    data = json.loads(result.output)
-    assert "cleaned" in data
-    assert len(data["cleaned"]) == 1
-    assert data["cleaned"][0]["instance_id"] == "i-dead1234"
-    assert data["cleaned"][0]["alias"] == "aws-gpu1"
-    assert data["cleaned"][0]["removed"] is True
-
-
-@patch("aws_bootstrap.cli.find_stale_ssh_hosts", return_value=[("i-dead1234", "aws-gpu1")])
-@patch("aws_bootstrap.cli.boto3.Session")
-@patch("aws_bootstrap.cli.find_tagged_instances", return_value=[])
-def test_cleanup_dry_run_json(mock_find, mock_session, mock_stale):
-    runner = CliRunner()
-    result = runner.invoke(main, ["-o", "json", "cleanup", "--dry-run"])
-    assert result.exit_code == 0
-    data = json.loads(result.output)
-    assert data["dry_run"] is True
-    assert "stale" in data
-    assert data["stale"][0]["alias"] == "aws-gpu1"
 
 
 @patch("aws_bootstrap.cli.boto3.Session")

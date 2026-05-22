@@ -1017,3 +1017,59 @@ def test_launch_with_retry_threads_placement_group():
     )
     launch_with_retry(LaunchConfig(regions=("us-east-1",), spot=True), lambda r: ctx)
     assert client.run_instances.call_args[1]["Placement"]["GroupName"] == "aws-bootstrap-cluster-ml1"
+
+
+# ---------------------------------------------------------------------------
+# find_tagged_instances exposes cluster id/rank (used by `cleanup --sync`)
+# ---------------------------------------------------------------------------
+
+
+def test_find_tagged_instances_includes_cluster_tags():
+    ec2 = MagicMock()
+    ec2.describe_instances.return_value = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-1",
+                        "State": {"Name": "running"},
+                        "InstanceType": "g5.xlarge",
+                        "PublicIpAddress": "1.2.3.4",
+                        "LaunchTime": datetime(2026, 5, 21, tzinfo=UTC),
+                        "Placement": {"AvailabilityZone": "us-east-1c"},
+                        "Tags": [
+                            {"Key": "Name", "Value": "n"},
+                            {"Key": "aws-bootstrap-cluster", "Value": "ml1"},
+                            {"Key": "aws-bootstrap-cluster-rank", "Value": "2"},
+                        ],
+                    }
+                ]
+            }
+        ]
+    }
+    inst = find_tagged_instances(ec2, "aws-bootstrap-g4dn")[0]
+    assert inst["ClusterId"] == "ml1"
+    assert inst["Rank"] == 2
+
+
+def test_find_tagged_instances_no_cluster_tags():
+    ec2 = MagicMock()
+    ec2.describe_instances.return_value = {
+        "Reservations": [
+            {
+                "Instances": [
+                    {
+                        "InstanceId": "i-2",
+                        "State": {"Name": "running"},
+                        "InstanceType": "g4dn.xlarge",
+                        "LaunchTime": datetime(2026, 5, 21, tzinfo=UTC),
+                        "Placement": {"AvailabilityZone": "us-west-2a"},
+                        "Tags": [{"Key": "Name", "Value": "n"}],
+                    }
+                ]
+            }
+        ]
+    }
+    inst = find_tagged_instances(ec2, "aws-bootstrap-g4dn")[0]
+    assert inst["ClusterId"] == ""
+    assert inst["Rank"] is None

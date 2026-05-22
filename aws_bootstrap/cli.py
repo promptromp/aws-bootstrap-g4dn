@@ -55,7 +55,7 @@ from .ec2 import (
     validate_ebs_volume,
     wait_instance_ready,
 )
-from .output import OutputFormat, emit, is_text
+from .output import OutputFormat, emit, get_format, is_text
 from .quota import (
     QUOTA_FAMILIES,
     QUOTA_FAMILY_LABELS,
@@ -67,7 +67,8 @@ from .quota import (
 from .retry import parse_duration, resolve_regions
 from .ssh import (
     add_ssh_host,
-    cleanup_stale_ssh_hosts,
+    find_drifted_ssh_hosts,
+    find_missing_ssh_hosts,
     find_stale_ssh_hosts,
     generate_ssh_keypair,
     get_ssh_host_details,
@@ -87,6 +88,10 @@ from .ssh import (
 
 
 SETUP_SCRIPT = Path(__file__).parent / "resources" / "remote_setup.sh"
+
+# SSH config path used by `cleanup`; None -> ssh.py default (~/.ssh/config).
+# Overridable in tests so cleanup operates on a temp config.
+_SSH_CONFIG_PATH: Path | None = None
 
 
 def step(number: int, total: int, msg: str) -> None:
@@ -1089,142 +1094,199 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
     success(f"Terminated {len(changes)} instance(s).")
 
 
+def _node_alias_for(inst: dict) -> str | None:
+    """Deterministic cluster alias (``aws-<cluster-id>-<rank>``) for a cluster
+    node, or None (let add_ssh_host auto-assign) for a non-cluster instance or
+    one missing a valid rank tag."""
+    if inst.get("ClusterId") and inst.get("Rank") is not None:
+        return cluster_mod.node_alias(inst["ClusterId"], inst["Rank"])
+    return None
+
+
+def _cleanup_changes_rows(result: dict) -> list[dict]:
+    """Flatten cleanup's multi-section result into one action-tagged list for
+    table rendering (a single table can't show several sections, and showing
+    only the first would hide adds/repairs). json/yaml keep the rich result."""
+    sections = [
+        ("stale", "would-remove"),
+        ("cleaned", "removed"),
+        ("skipped", "skipped"),
+        ("added", "added"),
+        ("updated", "repaired"),
+        ("orphan_volumes", "would-delete-volume"),
+        ("deleted_volumes", "deleted-volume"),
+    ]
+    rows: list[dict] = []
+    for key, action in sections:
+        for item in result.get(key, []):
+            rows.append(
+                {
+                    "action": action,
+                    "instance_id": item.get("instance_id", ""),
+                    "alias": item.get("alias") or "",
+                    "detail": item.get("public_ip") or item.get("volume_id") or "",
+                }
+            )
+    return rows
+
+
+def _report_cleanup_text(stale, can_remove, missing, drifted, orphans, dry_run) -> None:
+    """Human-readable preview of the cleanup plan (text mode only)."""
+    verb = "Would" if dry_run else "Will"
+    if stale:
+        tag = "remove" if can_remove else "SKIP (region scan incomplete — can't confirm dead)"
+        click.secho(f"\n  {len(stale)} stale alias(es) — {verb.lower()} {tag}:", bold=True, fg="cyan")
+        for iid, alias in stale:
+            click.echo("    " + click.style(alias, fg="bright_white") + f"  ({iid})")
+    for inst in missing:
+        click.echo(f"  {verb} add alias for {inst['InstanceId']} ({inst['PublicIp']})")
+    for _iid, alias, ip in drifted:
+        click.echo(f"  {verb} repair {alias} -> {ip}")
+    for vol in orphans:
+        click.echo(f"  {verb} delete orphan volume {vol['VolumeId']} ({vol['Size']} GB)")
+    if not (stale or missing or drifted or orphans):
+        click.secho("  Nothing to do — SSH config is in sync with live instances.", fg="green")
+
+
 @main.command()
-@click.option("--dry-run", is_flag=True, default=False, help="Show what would be removed without removing.")
+@click.option("--dry-run", is_flag=True, default=False, help="Preview changes without modifying anything.")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--include-ebs", is_flag=True, default=False, help="Also find and delete orphan EBS data volumes.")
 @click.option(
-    "--region",
-    default=None,
-    metavar="REGION",
-    help="AWS region. Defaults to AWS_DEFAULT_REGION / profile region, then us-west-2.",
+    "--sync",
+    "do_sync",
+    is_flag=True,
+    default=False,
+    help="Also add SSH aliases for live instances missing one, and repair drifted IPs.",
 )
+@click.option(
+    "--key-path",
+    default="~/.ssh/id_ed25519.pub",
+    show_default=True,
+    type=click.Path(),
+    help="Local SSH public key for aliases added by --sync.",
+)
+@click.option("--ssh-user", default="ubuntu", show_default=True, help="Remote SSH user for aliases added by --sync.")
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
-def cleanup(ctx, dry_run, yes, include_ebs, region, profile):
-    """Remove stale SSH config entries for terminated instances."""
-    region = resolve_single_region(region, profile)
-    session = boto3.Session(profile_name=profile, region_name=region)
-    ec2 = session.client("ec2")
+def cleanup(ctx, dry_run, yes, include_ebs, do_sync, key_path, ssh_user, profile):
+    """Sync ~/.ssh/config with live instances across ALL regions.
 
-    # In structured output modes, require --yes for non-dry-run (prompts would corrupt output)
+    Removes stale aliases (instances gone everywhere), and with --sync also adds
+    aliases for live instances missing one and repairs aliases whose IP drifted.
+    Never removes an alias if a region query failed (it might be alive there).
+    Does NOT terminate any instances.
+    """
     if not is_text(ctx) and not yes and not dry_run:
         raise CLIError("--yes is required when using structured output (--output json/yaml/table).")
 
-    if is_text(ctx):
-        val("Region", region)
+    session = boto3.Session(profile_name=profile)
+    base = session.client("ec2", region_name=_session_region(profile) or DEFAULT_REGION)
+    regions = list_enabled_regions(base)
+    instances, failures = find_tagged_instances_in_regions(session, TAG_VALUE, regions)
+    live_ids = {i["InstanceId"] for i in instances}
+    cfg = _SSH_CONFIG_PATH
 
-    live_instances = find_tagged_instances(ec2, TAG_VALUE)
-    live_ids = {inst["InstanceId"] for inst in live_instances}
+    stale = find_stale_ssh_hosts(live_ids, cfg)
+    can_remove = not failures  # conservative guard: an incomplete scan must not remove
+    missing = find_missing_ssh_hosts(instances, cfg) if do_sync else []
+    drifted = find_drifted_ssh_hosts(instances, cfg) if do_sync else []
 
-    stale = find_stale_ssh_hosts(live_ids)
-
-    # Orphan EBS discovery
     orphan_volumes: list[dict] = []
     if include_ebs:
-        orphan_volumes = find_orphan_ebs_volumes(ec2, TAG_VALUE, live_ids)
-
-    if not stale and not orphan_volumes:
-        if is_text(ctx):
-            msg = "No stale SSH config entries found."
-            if include_ebs:
-                msg = "No stale SSH config entries or orphan EBS volumes found."
-            click.secho(msg, fg="green")
-        else:
-            result_key = "stale" if dry_run else "cleaned"
-            result: dict = {result_key: []}
-            if include_ebs:
-                ebs_key = "orphan_volumes" if dry_run else "deleted_volumes"
-                result[ebs_key] = []
-            emit(result, ctx=ctx)
-        return
+        for r in regions:
+            ec2_r = session.client("ec2", region_name=r)
+            for vol in find_orphan_ebs_volumes(ec2_r, TAG_VALUE, live_ids):
+                vol["Region"] = r
+                orphan_volumes.append(vol)
 
     if is_text(ctx):
-        if stale:
-            click.secho(f"\n  Found {len(stale)} stale SSH config entry(ies):\n", bold=True, fg="cyan")
-            for iid, alias in stale:
-                click.echo("  " + click.style(alias, fg="bright_white") + f"  ({iid})")
-        if orphan_volumes:
-            click.secho(f"\n  Found {len(orphan_volumes)} orphan EBS volume(s):\n", bold=True, fg="cyan")
-            for vol in orphan_volumes:
-                click.echo(
-                    "  "
-                    + click.style(vol["VolumeId"], fg="bright_white")
-                    + f"  ({vol['Size']} GB, was {vol['InstanceId']})"
-                )
+        val("Regions queried", str(len(regions)))
+        for f in failures:
+            warn(f"Region {f['region']} query failed ({f['error']}); not removing aliases (could be alive there).")
+        _report_cleanup_text(stale, can_remove, missing, drifted, orphan_volumes, dry_run)
 
-    if dry_run:
-        if is_text(ctx):
-            click.echo()
-            for iid, alias in stale:
-                info(f"Would remove {alias} ({iid})")
-            for vol in orphan_volumes:
-                info(f"Would delete {vol['VolumeId']} ({vol['Size']} GB)")
-        else:
-            result = {
-                "stale": [{"instance_id": iid, "alias": alias} for iid, alias in stale],
-                "dry_run": True,
-            }
-            if include_ebs:
-                result["orphan_volumes"] = [
-                    {
-                        "volume_id": vol["VolumeId"],
-                        "size_gb": vol["Size"],
-                        "instance_id": vol["InstanceId"],
-                    }
-                    for vol in orphan_volumes
-                ]
-            emit(result, ctx=ctx)
-        return
+    removed: list[dict] = []
+    added: list[dict] = []
+    updated: list[dict] = []
+    deleted_volumes: list[dict] = []
 
-    if not yes:
-        click.echo()
-        parts = []
-        if stale:
-            parts.append(f"{len(stale)} stale SSH entry(ies)")
-        if orphan_volumes:
-            parts.append(f"{len(orphan_volumes)} orphan EBS volume(s)")
-        if not click.confirm(f"  Remove {' and '.join(parts)}?"):
+    # Removals (stale aliases + orphan volumes) require a complete scan; adds /
+    # repairs act only on confirmed-live instances, so they're never guarded.
+    has_changes = (stale and can_remove) or missing or drifted or (orphan_volumes and can_remove)
+    if not dry_run and has_changes:
+        if not yes and is_text(ctx) and not click.confirm("\n  Apply these changes?"):
             click.secho("  Cancelled.", fg="yellow")
             return
+        key = Path(key_path).expanduser()
+        if can_remove:
+            for iid, alias in stale:
+                remove_ssh_host(iid, cfg)
+                removed.append({"instance_id": iid, "alias": alias})
+        for inst in missing:
+            new_alias = add_ssh_host(
+                inst["InstanceId"], inst["PublicIp"], ssh_user, key, config_path=cfg, alias=_node_alias_for(inst)
+            )
+            added.append({"instance_id": inst["InstanceId"], "alias": new_alias, "public_ip": inst["PublicIp"]})
+        for iid, alias, ip in drifted:
+            # Only the IP changed — preserve the stanza's existing user / key / port.
+            d = get_ssh_host_details(iid, cfg)
+            add_ssh_host(
+                iid,
+                ip,
+                d.user if d else ssh_user,
+                d.identity_file if d else key,
+                config_path=cfg,
+                alias=alias,
+                port=d.port if d else SSH_PORT_DEFAULT,
+            )
+            updated.append({"instance_id": iid, "alias": alias, "public_ip": ip})
+        if can_remove:
+            for vol in orphan_volumes:
+                ec2_v = session.client("ec2", region_name=vol["Region"])
+                try:
+                    delete_ebs_volume(ec2_v, vol["VolumeId"])
+                    deleted_volumes.append({"volume_id": vol["VolumeId"], "size_gb": vol["Size"], "deleted": True})
+                except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+                    warn(f"Failed to delete {vol['VolumeId']}: {exc}")
+                    deleted_volumes.append(
+                        {"volume_id": vol["VolumeId"], "size_gb": vol["Size"], "deleted": False, "error": str(exc)}
+                    )
 
-    ssh_results = cleanup_stale_ssh_hosts(live_ids) if stale else []
-
-    # Delete orphan EBS volumes
-    deleted_volumes: list[dict] = []
-    for vol in orphan_volumes:
-        try:
-            delete_ebs_volume(ec2, vol["VolumeId"])
-            deleted_volumes.append({"volume_id": vol["VolumeId"], "size_gb": vol["Size"], "deleted": True})
-        except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
-            if is_text(ctx):
-                warn(f"Failed to delete {vol['VolumeId']}: {exc}")
-            deleted_volumes.append({"volume_id": vol["VolumeId"], "size_gb": vol["Size"], "deleted": False})
-
-    if not is_text(ctx):
-        result = {
-            "cleaned": [{"instance_id": r.instance_id, "alias": r.alias, "removed": r.removed} for r in ssh_results],
-        }
-        if include_ebs:
+    result: dict = {
+        "regions_queried": regions,
+        "regions_failed": failures,
+        ("stale" if dry_run else "cleaned"): (
+            [{"instance_id": i, "alias": a} for i, a in stale] if (dry_run or can_remove) else []
+        ),
+        "added": (
+            [{"instance_id": m["InstanceId"], "alias": _node_alias_for(m), "public_ip": m["PublicIp"]} for m in missing]
+            if dry_run
+            else added
+        ),
+        "updated": ([{"instance_id": i, "alias": a, "public_ip": ip} for i, a, ip in drifted] if dry_run else updated),
+    }
+    # Incomplete scan: stale aliases were NOT removed — surface them so structured
+    # consumers see what was skipped (text mode already reported it inline).
+    if not dry_run and not can_remove and stale:
+        result["skipped"] = [{"instance_id": i, "alias": a} for i, a in stale]
+    if include_ebs:
+        if dry_run or not can_remove:
+            result["orphan_volumes"] = [{"volume_id": v["VolumeId"], "size_gb": v["Size"]} for v in orphan_volumes]
+        else:
             result["deleted_volumes"] = deleted_volumes
+    if get_format(ctx) == OutputFormat.TABLE:
+        # One unified table of every action (json/yaml keep the rich result).
+        emit(
+            {"changes": _cleanup_changes_rows(result)},
+            headers={"action": "Action", "instance_id": "Instance", "alias": "Alias", "detail": "IP / Volume"},
+            ctx=ctx,
+        )
+    else:
         emit(result, ctx=ctx)
-        return
-
-    click.echo()
-    for r in ssh_results:
-        success(f"Removed {r.alias} ({r.instance_id})")
-    for vol in deleted_volumes:
-        if vol["deleted"]:
-            success(f"Deleted {vol['volume_id']} ({vol['size_gb']} GB)")
-
-    click.echo()
-    parts = []
-    if ssh_results:
-        parts.append(f"{len(ssh_results)} stale entry(ies)")
-    if deleted_volumes:
-        ok_count = sum(1 for v in deleted_volumes if v["deleted"])
-        parts.append(f"{ok_count} orphan volume(s)")
-    success(f"Cleaned up {' and '.join(parts)}.")
+    if is_text(ctx) and not dry_run and has_changes:
+        success("Cleanup complete.")
+    return
 
 
 # ---------------------------------------------------------------------------

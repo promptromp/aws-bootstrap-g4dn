@@ -11,6 +11,8 @@ from aws_bootstrap.ssh import (
     _read_ssh_config,
     add_ssh_host,
     cleanup_stale_ssh_hosts,
+    find_drifted_ssh_hosts,
+    find_missing_ssh_hosts,
     find_ssh_alias,
     find_stale_ssh_hosts,
     get_ssh_host_details,
@@ -490,3 +492,40 @@ def test_add_ssh_host_explicit_alias(tmp_path):
     alias = add_ssh_host("i-123abcde", "1.2.3.4", "ubuntu", KEY_PATH, config_path=cfg, alias="aws-ml1-0")
     assert alias == "aws-ml1-0"
     assert "Host aws-ml1-0" in cfg.read_text()
+
+
+# ---------------------------------------------------------------------------
+# find_missing_ssh_hosts / find_drifted_ssh_hosts (for `cleanup --sync`)
+# ---------------------------------------------------------------------------
+
+
+def test_find_missing_ssh_hosts(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-1111aaaa", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
+    live = [
+        {"InstanceId": "i-1111aaaa", "PublicIp": "1.1.1.1"},
+        {"InstanceId": "i-2222bbbb", "PublicIp": "2.2.2.2"},
+    ]
+    missing = find_missing_ssh_hosts(live, config_path=cfg)
+    assert [m["InstanceId"] for m in missing] == ["i-2222bbbb"]
+
+
+def test_find_missing_skips_instances_without_public_ip(tmp_path):
+    cfg = _config_path(tmp_path)
+    live = [{"InstanceId": "i-3333cccc", "PublicIp": ""}]
+    assert find_missing_ssh_hosts(live, config_path=cfg) == []
+
+
+def test_find_drifted_ssh_hosts(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)  # old IP
+    live = [{"InstanceId": "i-1", "PublicIp": "9.9.9.9"}]  # new IP
+    drift = find_drifted_ssh_hosts(live, config_path=cfg)
+    assert drift == [("i-1", "aws-gpu1", "9.9.9.9")]
+
+
+def test_find_drifted_none_when_ip_matches(tmp_path):
+    cfg = _config_path(tmp_path)
+    add_ssh_host("i-1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
+    live = [{"InstanceId": "i-1", "PublicIp": "1.1.1.1"}]
+    assert find_drifted_ssh_hosts(live, config_path=cfg) == []

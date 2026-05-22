@@ -19,7 +19,7 @@ Per-command options `--region` and `--profile` are available on all commands:
 | `--region` / `-r` | string | `AWS_DEFAULT_REGION`/profile region, then `us-west-2` | AWS region. Precedence: explicit flag → env/profile region → `us-west-2`. **Repeatable** on `launch` (tried in order), `quota show`/`request`/`history`, and `list instance-types`/`amis` (queried/submitted per region; each structured record carries a `region`). On `status` it is also repeatable and, when omitted, defaults to *all enabled regions* (see below) instead of a single region. |
 | `--profile` | string | `AWS_PROFILE` env | AWS profile override |
 
-The active region(s) are shown in `launch`, `status`, `terminate`, `cleanup`, `quota`, and `list` output (single region → a `Region:` line; multiple → a per-region block).
+The active region(s) are shown in `launch`, `terminate`, `quota`, and `list` output (single region → a `Region:` line; multiple → a per-region block). `status` and `cleanup` always query **all enabled regions** (they report `regions_queried`/`regions_failed` instead of a single region label).
 
 ---
 
@@ -207,7 +207,7 @@ Fields `ssh_alias_removed` and `ebs_volumes_deleted` are conditional. With `--ke
 
 ## `aws-bootstrap cleanup`
 
-Remove stale SSH config entries for terminated instances.
+Sync `~/.ssh/config` with live instances **across all enabled regions**. Removes stale aliases (instances gone everywhere); with `--sync` also adds aliases for live instances missing one and repairs aliases whose IP drifted. Never terminates instances. **Conservative guard:** if any region query fails, stale aliases are reported but not removed (`regions_failed` is non-empty).
 
 ```
 aws-bootstrap cleanup [OPTIONS]
@@ -217,40 +217,45 @@ aws-bootstrap cleanup [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--dry-run` | flag | false | Preview removals without modifying anything |
-| `--yes` / `-y` | flag | false | Skip confirmation prompt |
-| `--include-ebs` | flag | false | Also find and delete orphan EBS data volumes |
+| `--dry-run` | flag | false | Preview (diagnostic) — show stale/missing/drifted/orphaned, change nothing |
+| `--yes` / `-y` | flag | false | Skip confirmation prompt (required in structured output modes) |
+| `--sync` | flag | false | Also add SSH aliases for live instances missing one, and repair drifted IPs |
+| `--key-path` | path | `~/.ssh/id_ed25519.pub` | Local SSH public key for aliases added by `--sync` |
+| `--ssh-user` | string | `ubuntu` | Remote SSH user for aliases added by `--sync` |
+| `--include-ebs` | flag | false | Also find and delete orphan EBS data volumes (across the scanned regions) |
+
+There is no `--region` flag — `cleanup` always scans all enabled regions (an SSH alias records no region, so staleness is only safe to judge globally).
 
 ### JSON Output
 
-**Dry run:**
+**Dry run** (keys `stale`/`orphan_volumes`):
 ```json
 {
-  "stale": [
-    {"instance_id": "i-0abc123", "alias": "aws-gpu1"}
-  ],
-  "dry_run": true,
-  "orphan_volumes": [
-    {"volume_id": "vol-0abc123", "size_gb": 96, "instance_id": "i-0abc123"}
-  ]
+  "regions_queried": ["us-east-1", "us-west-2"],
+  "regions_failed": [],
+  "stale": [{"instance_id": "i-0abc123", "alias": "aws-gpu1"}],
+  "added": [{"instance_id": "i-0def456", "alias": null, "public_ip": "1.2.3.4"}],
+  "updated": [{"instance_id": "i-0aaa111", "alias": "aws-gpu2", "public_ip": "5.6.7.8"}],
+  "orphan_volumes": [{"volume_id": "vol-0abc123", "size_gb": 96}]
 }
 ```
 
-`orphan_volumes` is only present when `--include-ebs` is used.
-
-**Actual cleanup:**
+**Apply** (keys `cleaned`/`deleted_volumes`):
 ```json
 {
-  "cleaned": [
-    {"instance_id": "i-0abc123", "alias": "aws-gpu1", "removed": true}
-  ],
-  "deleted_volumes": [
-    {"volume_id": "vol-0abc123", "size_gb": 96, "deleted": true}
-  ]
+  "regions_queried": ["us-east-1"],
+  "regions_failed": [],
+  "cleaned": [{"instance_id": "i-0abc123", "alias": "aws-gpu1"}],
+  "added": [{"instance_id": "i-0def456", "alias": "aws-gpu3", "public_ip": "1.2.3.4"}],
+  "updated": [],
+  "deleted_volumes": [{"volume_id": "vol-0abc123", "size_gb": 96, "deleted": true}]
 }
 ```
 
-`deleted_volumes` is only present when `--include-ebs` is used.
+- `added`/`updated` are populated only with `--sync`. In `added`, `alias` is the deterministic `aws-<cluster-id>-<rank>` for cluster-tagged nodes, else `null` (auto-assigned on apply). Drift `--sync` preserves the existing stanza's user/key/port.
+- `orphan_volumes`/`deleted_volumes` only with `--include-ebs`; a failed delete is recorded as `{"deleted": false, "error": "..."}`.
+- **Conservative guard** (when `regions_failed` is non-empty): no stale aliases are removed and no orphan volumes are deleted (the scan is incomplete). In apply mode the un-removed stale aliases are surfaced under a `skipped` key (instead of `cleaned`), and orphan volumes appear under `orphan_volumes` (not `deleted_volumes`).
+- `-o json`/`yaml` return the full multi-section result above (prefer these for programmatic use). `-o table` flattens every section into one action-tagged table (`Action` / `Instance` / `Alias` / `IP-Volume`) so all removals, adds, and repairs are visible at once.
 
 ---
 

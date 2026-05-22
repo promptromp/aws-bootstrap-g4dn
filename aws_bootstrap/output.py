@@ -66,12 +66,18 @@ def emit(data: dict | list, *, headers: dict[str, str] | None = None, ctx: click
         from tabulate import tabulate  # noqa: PLC0415
 
         table_data = data
-        # Unwrap dict-wrapped lists (e.g. {"instances": [...]}) for table rendering
+        # Unwrap dict-wrapped lists (e.g. {"instances": [...]}) for table rendering.
+        # When the dict has several lists (e.g. cleanup's regions_queried + cleaned
+        # + added), pick the one whose dicts carry the requested header keys, rather
+        # than blindly the first list (which may be strings or the wrong section).
         if isinstance(data, dict) and headers:
-            for v in data.values():
-                if isinstance(v, list):
-                    table_data = v
-                    break
+            keyset = set(headers)
+            dict_lists = [v for v in data.values() if isinstance(v, list) and (not v or isinstance(v[0], dict))]
+            match = next((v for v in dict_lists if v and keyset & set(v[0])), None)
+            if match is not None:
+                table_data = match
+            elif dict_lists:
+                table_data = dict_lists[0]
 
         if isinstance(table_data, list) and table_data and isinstance(table_data[0], dict):
             if headers:
