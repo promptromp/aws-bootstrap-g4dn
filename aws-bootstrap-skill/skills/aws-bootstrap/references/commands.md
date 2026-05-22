@@ -255,6 +255,7 @@ There is no `--region` flag — `cleanup` always scans all enabled regions (an S
 - `added`/`updated` are populated only with `--sync`. In `added`, `alias` is the deterministic `aws-<cluster-id>-<rank>` for cluster-tagged nodes, else `null` (auto-assigned on apply). Drift `--sync` preserves the existing stanza's user/key/port.
 - `orphan_volumes`/`deleted_volumes` only with `--include-ebs`; a failed delete is recorded as `{"deleted": false, "error": "..."}`.
 - **Conservative guard** (when `regions_failed` is non-empty): no stale aliases are removed and no orphan volumes are deleted (the scan is incomplete). In apply mode the un-removed stale aliases are surfaced under a `skipped` key (instead of `cleaned`), and orphan volumes appear under `orphan_volumes` (not `deleted_volumes`).
+- `-o json`/`yaml` return the full multi-section result above (prefer these for programmatic use). `-o table` flattens every section into one action-tagged table (`Action` / `Instance` / `Alias` / `IP-Volume`) so all removals, adds, and repairs are visible at once.
 
 ---
 

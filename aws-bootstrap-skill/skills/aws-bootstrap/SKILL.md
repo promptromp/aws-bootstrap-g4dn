@@ -162,15 +162,17 @@ aws-bootstrap terminate
 # Terminate but keep EBS volumes for reuse
 aws-bootstrap terminate --keep-ebs
 
-# Clean up stale SSH config entries
+# Sync ~/.ssh/config with live instances across ALL regions (remove stale aliases)
 aws-bootstrap cleanup
 
-# Also clean up orphan EBS volumes
-aws-bootstrap cleanup --include-ebs
+# --sync also adds aliases for live instances missing one and repairs drifted IPs
+aws-bootstrap -o json cleanup --sync --yes
 
-# Preview what would be cleaned (no changes)
-aws-bootstrap cleanup --include-ebs --dry-run
+# Preview (diagnostic) — reports stale/missing/drifted/orphaned, changes nothing
+aws-bootstrap -o json cleanup --sync --include-ebs --dry-run
 ```
+
+All four `--output` modes are supported. For programmatic use prefer `-o json`/`yaml` (the full result: `regions_queried`, `regions_failed`, `cleaned`/`stale`, `added`, `updated`, `skipped`, `deleted_volumes`/`orphan_volumes`). `-o table` renders a single unified action table (`Action`/`Instance`/`Alias`/`IP-Volume`).
 
 ### Persistent Data with EBS
 

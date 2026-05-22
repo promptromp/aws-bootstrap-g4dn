@@ -1748,6 +1748,36 @@ def test_cleanup_renders_in_each_structured_format(mock_session, mock_find, mock
         result = CliRunner().invoke(main, ["-o", fmt, "cleanup", "--yes"])
     assert result.exit_code == 0, result.output
     assert "i-dead0001" in result.output  # the removed alias's instance appears in output
+    assert "'instance_id'" not in result.output  # no raw dict repr (table picks the right list)
+
+
+@pytest.mark.parametrize("fmt", ["json", "yaml", "table"])
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_sync_renders_added_and_updated_in_each_format(mock_session, mock_find, mock_regions, tmp_path, fmt):
+    # A mixed --sync run (remove + add + repair): every action must be visible in
+    # ALL structured modes, not just json (table shows a unified action table).
+    cfg = tmp_path / "config"
+    add_ssh_host("i-dead0001", "1.1.1.1", "ubuntu", _writekey(tmp_path), config_path=cfg)  # stale -> removed
+    add_ssh_host("i-0d41f700", "2.2.2.2", "ubuntu", _writekey(tmp_path), config_path=cfg)  # drifted -> repaired
+    mock_find.return_value = (
+        [
+            _live("i-0d41f700", "9.9.9.9"),  # drifted
+            _live("i-0aabbccd", "3.3.3.3"),  # missing -> added
+        ],
+        [],
+    )
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(
+            main, ["-o", fmt, "cleanup", "--sync", "--yes", "--key-path", str(_writekey(tmp_path))]
+        )
+    assert result.exit_code == 0, result.output
+    # removed, added, and repaired instances all surface (regardless of format)
+    assert "i-dead0001" in result.output
+    assert "i-0aabbccd" in result.output
+    assert "i-0d41f700" in result.output
+    assert "'instance_id'" not in result.output
 
 
 # ---------------------------------------------------------------------------

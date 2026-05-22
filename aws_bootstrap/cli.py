@@ -55,7 +55,7 @@ from .ec2 import (
     validate_ebs_volume,
     wait_instance_ready,
 )
-from .output import OutputFormat, emit, is_text
+from .output import OutputFormat, emit, get_format, is_text
 from .quota import (
     QUOTA_FAMILIES,
     QUOTA_FAMILY_LABELS,
@@ -1103,6 +1103,33 @@ def _node_alias_for(inst: dict) -> str | None:
     return None
 
 
+def _cleanup_changes_rows(result: dict) -> list[dict]:
+    """Flatten cleanup's multi-section result into one action-tagged list for
+    table rendering (a single table can't show several sections, and showing
+    only the first would hide adds/repairs). json/yaml keep the rich result."""
+    sections = [
+        ("stale", "would-remove"),
+        ("cleaned", "removed"),
+        ("skipped", "skipped"),
+        ("added", "added"),
+        ("updated", "repaired"),
+        ("orphan_volumes", "would-delete-volume"),
+        ("deleted_volumes", "deleted-volume"),
+    ]
+    rows: list[dict] = []
+    for key, action in sections:
+        for item in result.get(key, []):
+            rows.append(
+                {
+                    "action": action,
+                    "instance_id": item.get("instance_id", ""),
+                    "alias": item.get("alias") or "",
+                    "detail": item.get("public_ip") or item.get("volume_id") or "",
+                }
+            )
+    return rows
+
+
 def _report_cleanup_text(stale, can_remove, missing, drifted, orphans, dry_run) -> None:
     """Human-readable preview of the cleanup plan (text mode only)."""
     verb = "Would" if dry_run else "Will"
@@ -1248,7 +1275,15 @@ def cleanup(ctx, dry_run, yes, include_ebs, do_sync, key_path, ssh_user, profile
             result["orphan_volumes"] = [{"volume_id": v["VolumeId"], "size_gb": v["Size"]} for v in orphan_volumes]
         else:
             result["deleted_volumes"] = deleted_volumes
-    emit(result, headers={"instance_id": "Instance", "alias": "Alias"}, ctx=ctx)
+    if get_format(ctx) == OutputFormat.TABLE:
+        # One unified table of every action (json/yaml keep the rich result).
+        emit(
+            {"changes": _cleanup_changes_rows(result)},
+            headers={"action": "Action", "instance_id": "Instance", "alias": "Alias", "detail": "IP / Volume"},
+            ctx=ctx,
+        )
+    else:
+        emit(result, ctx=ctx)
     if is_text(ctx) and not dry_run and has_changes:
         success("Cleanup complete.")
     return
