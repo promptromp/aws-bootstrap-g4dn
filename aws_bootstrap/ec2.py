@@ -660,17 +660,20 @@ def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
     instances = []
     for reservation in response["Reservations"]:
         for inst in reservation["Instances"]:
-            name = next((tag["Value"] for tag in inst.get("Tags", []) if tag["Key"] == TAG_NAME), "")
+            tags = {t["Key"]: t["Value"] for t in inst.get("Tags", [])}
+            rank_raw = tags.get(TAG_CLUSTER_RANK)
             instances.append(
                 {
                     "InstanceId": inst["InstanceId"],
-                    "Name": name,
+                    "Name": tags.get(TAG_NAME, ""),
                     "State": inst["State"]["Name"],
                     "InstanceType": inst["InstanceType"],
                     "PublicIp": inst.get("PublicIpAddress", ""),
                     "LaunchTime": inst["LaunchTime"],
                     "Lifecycle": inst.get("InstanceLifecycle", "on-demand"),
                     "AvailabilityZone": inst["Placement"]["AvailabilityZone"],
+                    "ClusterId": tags.get(TAG_CLUSTER_ID, ""),
+                    "Rank": int(rank_raw) if rank_raw is not None and rank_raw.isdigit() else None,
                 }
             )
     return instances
