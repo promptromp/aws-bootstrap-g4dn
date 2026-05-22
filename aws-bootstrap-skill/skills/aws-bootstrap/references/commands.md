@@ -19,7 +19,7 @@ Per-command options `--region` and `--profile` are available on all commands:
 | `--region` / `-r` | string | `AWS_DEFAULT_REGION`/profile region, then `us-west-2` | AWS region. Precedence: explicit flag → env/profile region → `us-west-2`. **Repeatable** on `launch` (tried in order), `quota show`/`request`/`history`, and `list instance-types`/`amis` (queried/submitted per region; each structured record carries a `region`). On `status` it is also repeatable and, when omitted, defaults to *all enabled regions* (see below) instead of a single region. |
 | `--profile` | string | `AWS_PROFILE` env | AWS profile override |
 
-The active region(s) are shown in `launch`, `status`, `terminate`, `cleanup`, `quota`, and `list` output (single region → a `Region:` line; multiple → a per-region block).
+The active region(s) are shown in `launch`, `terminate`, `quota`, and `list` output (single region → a `Region:` line; multiple → a per-region block). `status` and `cleanup` always query **all enabled regions** (they report `regions_queried`/`regions_failed` instead of a single region label).
 
 ---
 
@@ -234,7 +234,7 @@ There is no `--region` flag — `cleanup` always scans all enabled regions (an S
   "regions_queried": ["us-east-1", "us-west-2"],
   "regions_failed": [],
   "stale": [{"instance_id": "i-0abc123", "alias": "aws-gpu1"}],
-  "added": [{"instance_id": "i-0def456", "public_ip": "1.2.3.4"}],
+  "added": [{"instance_id": "i-0def456", "alias": null, "public_ip": "1.2.3.4"}],
   "updated": [{"instance_id": "i-0aaa111", "alias": "aws-gpu2", "public_ip": "5.6.7.8"}],
   "orphan_volumes": [{"volume_id": "vol-0abc123", "size_gb": 96}]
 }
@@ -248,11 +248,13 @@ There is no `--region` flag — `cleanup` always scans all enabled regions (an S
   "cleaned": [{"instance_id": "i-0abc123", "alias": "aws-gpu1"}],
   "added": [{"instance_id": "i-0def456", "alias": "aws-gpu3", "public_ip": "1.2.3.4"}],
   "updated": [],
-  "deleted_volumes": [{"volume_id": "vol-0abc123", "size_gb": 96}]
+  "deleted_volumes": [{"volume_id": "vol-0abc123", "size_gb": 96, "deleted": true}]
 }
 ```
 
-`added`/`updated` are populated only with `--sync`; `orphan_volumes`/`deleted_volumes` only with `--include-ebs`. When `regions_failed` is non-empty, `cleaned` is empty (conservative guard).
+- `added`/`updated` are populated only with `--sync`. In `added`, `alias` is the deterministic `aws-<cluster-id>-<rank>` for cluster-tagged nodes, else `null` (auto-assigned on apply). Drift `--sync` preserves the existing stanza's user/key/port.
+- `orphan_volumes`/`deleted_volumes` only with `--include-ebs`; a failed delete is recorded as `{"deleted": false, "error": "..."}`.
+- **Conservative guard** (when `regions_failed` is non-empty): no stale aliases are removed and no orphan volumes are deleted (the scan is incomplete). In apply mode the un-removed stale aliases are surfaced under a `skipped` key (instead of `cleaned`), and orphan volumes appear under `orphan_volumes` (not `deleted_volumes`).
 
 ---
 
