@@ -1773,6 +1773,42 @@ def test_cleanup_include_ebs_deletes_orphans(mock_session, mock_find, mock_regio
     mock_delete.assert_called_once()
 
 
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_sync_drift_preserves_port(mock_session, mock_find, mock_regions, tmp_path):
+    cfg = tmp_path / "config"
+    add_ssh_host("i-0aaf7001", "1.1.1.1", "ubuntu", _writekey(tmp_path), config_path=cfg, port=2222)
+    mock_find.return_value = ([_live("i-0aaf7001", "9.9.9.9")], [])
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["cleanup", "--sync", "--yes", "--key-path", str(_writekey(tmp_path))])
+    assert result.exit_code == 0, result.output
+    content = cfg.read_text()
+    assert "HostName 9.9.9.9" in content  # IP repaired
+    assert "Port 2222" in content  # non-standard port preserved, not reset to 22
+
+
+@patch("aws_bootstrap.cli.delete_ebs_volume")
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
+@patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
+@patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+def test_cleanup_include_ebs_not_deleted_on_region_failure(
+    mock_session, mock_find, mock_regions, mock_orphan, mock_delete, tmp_path
+):
+    cfg = tmp_path / "config"
+    cfg.parent.mkdir(parents=True, exist_ok=True)
+    cfg.write_text("")
+    mock_find.return_value = ([], [{"region": "us-east-1", "error": "AuthFailure"}])  # incomplete scan
+    mock_orphan.return_value = [{"VolumeId": "vol-x", "Size": 50, "State": "available", "InstanceId": "i-x"}]
+    with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
+        result = CliRunner().invoke(main, ["-o", "json", "cleanup", "--include-ebs", "--yes"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    mock_delete.assert_not_called()  # conservative guard: don't delete on incomplete scan
+    assert "orphan_volumes" in data  # reported as candidates, not deleted_volumes
+
+
 @patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
 @patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
 @patch("aws_bootstrap.cli.find_tagged_instances_in_regions", return_value=([], []))

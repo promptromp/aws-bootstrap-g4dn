@@ -1094,8 +1094,17 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
     success(f"Terminated {len(changes)} instance(s).")
 
 
+def _node_alias_for(inst: dict) -> str | None:
+    """Deterministic cluster alias (``aws-<cluster-id>-<rank>``) for a cluster
+    node, or None (let add_ssh_host auto-assign) for a non-cluster instance or
+    one missing a valid rank tag."""
+    if inst.get("ClusterId") and inst.get("Rank") is not None:
+        return cluster_mod.node_alias(inst["ClusterId"], inst["Rank"])
+    return None
+
+
 def _report_cleanup_text(stale, can_remove, missing, drifted, orphans, dry_run) -> None:
-    """Human-readable preview/summary of the cleanup plan (text mode only)."""
+    """Human-readable preview of the cleanup plan (text mode only)."""
     verb = "Would" if dry_run else "Will"
     if stale:
         tag = "remove" if can_remove else "SKIP (region scan incomplete — can't confirm dead)"
@@ -1175,7 +1184,9 @@ def cleanup(ctx, dry_run, yes, include_ebs, do_sync, key_path, ssh_user, profile
     updated: list[dict] = []
     deleted_volumes: list[dict] = []
 
-    has_changes = (stale and can_remove) or missing or drifted or orphan_volumes
+    # Removals (stale aliases + orphan volumes) require a complete scan; adds /
+    # repairs act only on confirmed-live instances, so they're never guarded.
+    has_changes = (stale and can_remove) or missing or drifted or (orphan_volumes and can_remove)
     if not dry_run and has_changes:
         if not yes and is_text(ctx) and not click.confirm("\n  Apply these changes?"):
             click.secho("  Cancelled.", fg="yellow")
@@ -1186,19 +1197,34 @@ def cleanup(ctx, dry_run, yes, include_ebs, do_sync, key_path, ssh_user, profile
                 remove_ssh_host(iid, cfg)
                 removed.append({"instance_id": iid, "alias": alias})
         for inst in missing:
-            alias = cluster_mod.node_alias(inst["ClusterId"], inst["Rank"]) if inst["ClusterId"] else None
-            new_alias = add_ssh_host(inst["InstanceId"], inst["PublicIp"], ssh_user, key, config_path=cfg, alias=alias)
+            new_alias = add_ssh_host(
+                inst["InstanceId"], inst["PublicIp"], ssh_user, key, config_path=cfg, alias=_node_alias_for(inst)
+            )
             added.append({"instance_id": inst["InstanceId"], "alias": new_alias, "public_ip": inst["PublicIp"]})
         for iid, alias, ip in drifted:
-            add_ssh_host(iid, ip, ssh_user, key, config_path=cfg, alias=alias)
+            # Only the IP changed — preserve the stanza's existing user / key / port.
+            d = get_ssh_host_details(iid, cfg)
+            add_ssh_host(
+                iid,
+                ip,
+                d.user if d else ssh_user,
+                d.identity_file if d else key,
+                config_path=cfg,
+                alias=alias,
+                port=d.port if d else SSH_PORT_DEFAULT,
+            )
             updated.append({"instance_id": iid, "alias": alias, "public_ip": ip})
-        for vol in orphan_volumes:
-            ec2_v = session.client("ec2", region_name=vol["Region"])
-            try:
-                delete_ebs_volume(ec2_v, vol["VolumeId"])
-                deleted_volumes.append({"volume_id": vol["VolumeId"], "size_gb": vol["Size"]})
-            except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
-                warn(f"Failed to delete {vol['VolumeId']}: {exc}")
+        if can_remove:
+            for vol in orphan_volumes:
+                ec2_v = session.client("ec2", region_name=vol["Region"])
+                try:
+                    delete_ebs_volume(ec2_v, vol["VolumeId"])
+                    deleted_volumes.append({"volume_id": vol["VolumeId"], "size_gb": vol["Size"], "deleted": True})
+                except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as exc:
+                    warn(f"Failed to delete {vol['VolumeId']}: {exc}")
+                    deleted_volumes.append(
+                        {"volume_id": vol["VolumeId"], "size_gb": vol["Size"], "deleted": False, "error": str(exc)}
+                    )
 
     result: dict = {
         "regions_queried": regions,
@@ -1207,14 +1233,21 @@ def cleanup(ctx, dry_run, yes, include_ebs, do_sync, key_path, ssh_user, profile
             [{"instance_id": i, "alias": a} for i, a in stale] if (dry_run or can_remove) else []
         ),
         "added": (
-            [{"instance_id": m["InstanceId"], "public_ip": m["PublicIp"]} for m in missing] if dry_run else added
+            [{"instance_id": m["InstanceId"], "alias": _node_alias_for(m), "public_ip": m["PublicIp"]} for m in missing]
+            if dry_run
+            else added
         ),
         "updated": ([{"instance_id": i, "alias": a, "public_ip": ip} for i, a, ip in drifted] if dry_run else updated),
     }
+    # Incomplete scan: stale aliases were NOT removed — surface them so structured
+    # consumers see what was skipped (text mode already reported it inline).
+    if not dry_run and not can_remove and stale:
+        result["skipped"] = [{"instance_id": i, "alias": a} for i, a in stale]
     if include_ebs:
-        result["orphan_volumes" if dry_run else "deleted_volumes"] = (
-            [{"volume_id": v["VolumeId"], "size_gb": v["Size"]} for v in orphan_volumes] if dry_run else deleted_volumes
-        )
+        if dry_run or not can_remove:
+            result["orphan_volumes"] = [{"volume_id": v["VolumeId"], "size_gb": v["Size"]} for v in orphan_volumes]
+        else:
+            result["deleted_volumes"] = deleted_volumes
     emit(result, headers={"instance_id": "Instance", "alias": "Alias"}, ctx=ctx)
     if is_text(ctx) and not dry_run and has_changes:
         success("Cleanup complete.")
