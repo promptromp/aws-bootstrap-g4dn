@@ -160,11 +160,22 @@ aws-bootstrap status [OPTIONS]
   "regions_queried": ["us-east-1", "us-west-2"],
   "regions_failed": [
     {"region": "ap-south-1", "error": "AuthFailure: ..."}
+  ],
+  "orphan_volumes": [
+    {
+      "volume_id": "vol-0def456",
+      "region": "us-west-2",
+      "size_gb": 150,
+      "monthly_cost_usd": 12.0,
+      "last_instance_id": "i-0dead123"
+    }
   ]
 }
 ```
 
 Top-level `regions_queried` lists every region the query was attempted against (including any that subsequently failed). `regions_failed` is present only when one or more regions could not be queried (e.g. unauthorized); those regions appear in both lists. Per-instance fields `gpu`, `ebs_volumes`, `spot_price_per_hour`, `uptime_seconds`, and `estimated_cost` are conditional.
+
+`orphan_volumes` is **always present** (empty list when none): aws-bootstrap data volumes that are detached and whose linked instance no longer exists — they still bill (`monthly_cost_usd` is an estimate at the common gp3 rate) until reattached (`launch --ebs-volume-id <id> --region <region>`) or deleted (`cleanup --include-ebs`). Reported even when `instances` is empty; in `table` mode orphans render as a second table.
 
 ---
 

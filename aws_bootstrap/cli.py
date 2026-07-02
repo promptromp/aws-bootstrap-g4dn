@@ -16,6 +16,7 @@ from .constants import (
     DEFAULT_REGION,
     DEFAULT_WAIT_TIMEOUT,
     EBS_DETACH_WAITER,
+    EBS_GP3_PRICE_PER_GB_MONTH,
     EBS_MOUNT_POINT,
     JUPYTER_PORT,
     RDZV_PORT,
@@ -39,7 +40,7 @@ from .ec2 import (
     ensure_security_group,
     find_cluster_instances,
     find_ebs_volumes_for_instance,
-    find_orphan_ebs_volumes,
+    find_orphan_ebs_volumes_in_regions,
     find_tagged_instances,
     find_tagged_instances_in_regions,
     get_latest_ami,
@@ -712,6 +713,30 @@ def launch(
     click.echo()
 
 
+def _report_orphan_ebs_text(orphan_volumes: list[dict]) -> None:
+    """Orphaned-volume section for status text output (no-op when none)."""
+    if not orphan_volumes:
+        return
+    total = sum(v["Size"] * EBS_GP3_PRICE_PER_GB_MONTH for v in orphan_volumes)
+    click.echo()
+    click.secho(
+        f"  {len(orphan_volumes)} orphaned EBS data volume(s) — detached but still billed (~${total:.2f}/mo):",
+        bold=True,
+        fg="yellow",
+    )
+    for vol in orphan_volumes:
+        monthly = vol["Size"] * EBS_GP3_PRICE_PER_GB_MONTH
+        click.echo(
+            "    "
+            + click.style(vol["VolumeId"], fg="bright_white")
+            + f"  {vol['Size']} GB, {vol['Region']}, ~${monthly:.2f}/mo  (was attached to {vol['InstanceId']})"
+        )
+        reattach = f"aws-bootstrap launch --ebs-volume-id {vol['VolumeId']} --region {vol['Region']}"
+        click.echo("      Reattach:  " + _cmd(reattach))
+    click.echo()
+    click.echo("  To delete all orphans:  " + _cmd("aws-bootstrap cleanup --include-ebs"))
+
+
 @main.command()
 @click.option(
     "--region",
@@ -759,14 +784,15 @@ def status(ctx, region, profile, gpu, instructions):
     for failure in failures:
         warn(f"Skipped region {failure['region']}: {failure['error']}")
 
-    if not instances:
-        if is_text(ctx):
-            click.secho("No active aws-bootstrap instances found.", fg="yellow")
-        else:
-            result: dict = {"instances": [], "regions_queried": regions}
-            if failures:
-                result["regions_failed"] = failures
-            emit(result, ctx=ctx)
+    # Orphaned data volumes (detached, linked instance gone) bill silently and
+    # are invisible via the per-instance volume lookup below — sweep for them
+    # in the same regions so status is the safety net, not just cleanup.
+    live_ids = {inst["InstanceId"] for inst in instances}
+    orphan_volumes = find_orphan_ebs_volumes_in_regions(session, TAG_VALUE, regions, live_ids)
+
+    if not instances and is_text(ctx):
+        click.secho("No active aws-bootstrap instances found.", fg="yellow")
+        _report_orphan_ebs_text(orphan_volumes)
         return
 
     ssh_hosts = list_ssh_hosts()
@@ -937,30 +963,58 @@ def status(ctx, region, profile, gpu, instructions):
 
         structured_instances.append(inst_data)
 
+    orphan_data = [
+        {
+            "volume_id": vol["VolumeId"],
+            "region": vol["Region"],
+            "size_gb": vol["Size"],
+            "monthly_cost_usd": round(vol["Size"] * EBS_GP3_PRICE_PER_GB_MONTH, 2),
+            "last_instance_id": vol["InstanceId"],
+        }
+        for vol in orphan_volumes
+    ]
+
     if not is_text(ctx):
         result = {"instances": structured_instances, "regions_queried": regions}
         if failures:
             result["regions_failed"] = failures
-        emit(
-            result,
-            headers={
-                "instance_id": "Instance ID",
-                "region": "Region",
-                "state": "State",
-                "instance_type": "Type",
-                "public_ip": "IP",
-                "ssh_alias": "Alias",
-                "lifecycle": "Pricing",
-                "uptime_seconds": "Uptime (s)",
-            },
-            ctx=ctx,
-        )
+        result["orphan_volumes"] = orphan_data
+        instance_headers = {
+            "instance_id": "Instance ID",
+            "region": "Region",
+            "state": "State",
+            "instance_type": "Type",
+            "public_ip": "IP",
+            "ssh_alias": "Alias",
+            "lifecycle": "Pricing",
+            "uptime_seconds": "Uptime (s)",
+        }
+        if get_format(ctx) == OutputFormat.TABLE:
+            # Table mode renders one list per emit; orphans get their own table
+            # (json/yaml keep both lists in the single rich result).
+            emit({"instances": structured_instances}, headers=instance_headers, ctx=ctx)
+            if orphan_data:
+                click.echo()
+                emit(
+                    {"orphan_volumes": orphan_data},
+                    headers={
+                        "volume_id": "Volume ID",
+                        "region": "Region",
+                        "size_gb": "Size (GB)",
+                        "monthly_cost_usd": "Est. $/mo",
+                        "last_instance_id": "Last Instance",
+                    },
+                    ctx=ctx,
+                )
+        else:
+            emit(result, ctx=ctx)
         return
 
     click.echo()
     first = instances[0]
     first_ref = ssh_hosts.get(first["InstanceId"], first["InstanceId"])
     click.echo("  To terminate:  " + _cmd(f"aws-bootstrap terminate {first_ref} --region {first['Region']}"))
+    _report_orphan_ebs_text(orphan_volumes)
     click.echo()
 
 
@@ -1194,11 +1248,7 @@ def cleanup(ctx, dry_run, yes, include_ebs, do_sync, key_path, ssh_user, profile
 
     orphan_volumes: list[dict] = []
     if include_ebs:
-        for r in regions:
-            ec2_r = session.client("ec2", region_name=r)
-            for vol in find_orphan_ebs_volumes(ec2_r, TAG_VALUE, live_ids):
-                vol["Region"] = r
-                orphan_volumes.append(vol)
+        orphan_volumes = find_orphan_ebs_volumes_in_regions(session, TAG_VALUE, regions, live_ids)
 
     if is_text(ctx):
         val("Regions queried", str(len(regions)))

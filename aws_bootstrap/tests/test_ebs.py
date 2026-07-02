@@ -15,6 +15,7 @@ from aws_bootstrap.ec2 import (
     detach_ebs_volume,
     find_ebs_volumes_for_instance,
     find_orphan_ebs_volumes,
+    find_orphan_ebs_volumes_in_regions,
     validate_ebs_volume,
 )
 
@@ -333,3 +334,64 @@ def test_find_orphan_ebs_volumes_client_error():
     )
     orphans = find_orphan_ebs_volumes(ec2, "aws-bootstrap-g4dn", live_instance_ids=set())
     assert orphans == []
+
+
+# ---------------------------------------------------------------------------
+# find_orphan_ebs_volumes_in_regions
+# ---------------------------------------------------------------------------
+
+
+def _orphan_client(volumes: list[dict]) -> MagicMock:
+    client = MagicMock()
+    client.describe_volumes.return_value = {"Volumes": volumes}
+    return client
+
+
+def _available_volume(volume_id: str, size: int, instance_id: str) -> dict:
+    return {
+        "VolumeId": volume_id,
+        "Size": size,
+        "State": "available",
+        "Tags": [
+            {"Key": "created-by", "Value": "aws-bootstrap-g4dn"},
+            {"Key": "aws-bootstrap-instance", "Value": instance_id},
+        ],
+    }
+
+
+def test_find_orphan_ebs_volumes_in_regions_labels_and_sorts():
+    """Volumes from every region are merged, labelled with Region, and sorted."""
+    session = MagicMock()
+    clients = {
+        "us-west-2": _orphan_client([_available_volume("vol-w", 50, "i-dead1")]),
+        "us-east-1": _orphan_client([_available_volume("vol-e", 100, "i-dead2")]),
+    }
+    session.client.side_effect = lambda service, region_name: clients[region_name]
+
+    orphans = find_orphan_ebs_volumes_in_regions(session, "aws-bootstrap-g4dn", ["us-west-2", "us-east-1"], set())
+
+    assert [(v["VolumeId"], v["Region"]) for v in orphans] == [("vol-e", "us-east-1"), ("vol-w", "us-west-2")]
+
+
+def test_find_orphan_ebs_volumes_in_regions_filters_live_instances():
+    session = MagicMock()
+    session.client.side_effect = lambda service, region_name: _orphan_client(
+        [_available_volume("vol-w", 50, "i-alive")]
+    )
+    orphans = find_orphan_ebs_volumes_in_regions(session, "aws-bootstrap-g4dn", ["us-west-2"], {"i-alive"})
+    assert orphans == []
+
+
+def test_find_orphan_ebs_volumes_in_regions_survives_region_failure():
+    """A failing region contributes nothing but does not abort the sweep."""
+    session = MagicMock()
+    bad = MagicMock()
+    bad.describe_volumes.side_effect = botocore.exceptions.ClientError(
+        {"Error": {"Code": "AuthFailure", "Message": "no"}}, "DescribeVolumes"
+    )
+    clients = {"eu-west-1": bad, "us-west-2": _orphan_client([_available_volume("vol-w", 50, "i-dead1")])}
+    session.client.side_effect = lambda service, region_name: clients[region_name]
+
+    orphans = find_orphan_ebs_volumes_in_regions(session, "aws-bootstrap-g4dn", ["eu-west-1", "us-west-2"], set())
+
+    assert [v["VolumeId"] for v in orphans] == ["vol-w"]

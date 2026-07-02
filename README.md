@@ -324,7 +324,8 @@ checking and raising your vCPU quota.
 
 ```bash
 # Show all aws-bootstrap instances across every enabled region (including shutting-down).
-# Each instance is labelled with its region.
+# Each instance is labelled with its region. Also reports orphaned EBS data
+# volumes (detached but still billed) with cost estimates and cleanup hints.
 aws-bootstrap status
 
 # Include GPU info (CUDA toolkit + driver version, GPU name, architecture) via SSH
@@ -405,6 +406,7 @@ Key behaviors:
 - New volumes are formatted as ext4; existing volumes are mounted as-is
 - Volumes are tagged for automatic discovery by `status` and `terminate`
 - `terminate` deletes data volumes by default; use `--keep-ebs` to preserve them
+- **Orphan visibility** — `status` always reports orphaned data volumes (detached, linked instance gone) with size, region, and an estimated monthly cost, plus reattach/delete commands — even when you have zero running instances. Orphans bill silently (~$0.08/GB-month for gp3), so this is your safety net after a spot reclaim or a forgotten `--keep-ebs`
 - **Orphan cleanup** — use `aws-bootstrap cleanup --include-ebs` to find and delete orphan volumes (e.g. from spot interruptions or forgotten `--keep-ebs` volumes). Use `--dry-run` to preview
 - **Spot-safe** — data volumes survive spot interruptions. If AWS reclaims your instance, the volume detaches automatically and can be reattached to a new instance with `--ebs-volume-id`
 - **Automatic AZ matching** — EBS volumes are tied to a single availability zone, and an instance can only attach a volume in its own AZ. When you reattach with `--ebs-volume-id`, the launch automatically pins the new instance to the volume's AZ, so you never hit a "wrong AZ" attach failure. (One consequence: spot capacity is then constrained to that single AZ, so a launch may need `--wait` to ride out a temporary shortage. A `--ebs-volume-id` launch targets the volume's region.)

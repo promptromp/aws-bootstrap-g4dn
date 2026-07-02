@@ -1597,6 +1597,135 @@ def test_status_shows_ebs_volumes(mock_find, mock_spot_price, mock_session, mock
 
 
 # ---------------------------------------------------------------------------
+# status: orphaned EBS volumes (detached, still billed)
+# ---------------------------------------------------------------------------
+
+_ORPHAN_VOLUME = {
+    "VolumeId": "vol-orphan1",
+    "Size": 100,
+    "State": "available",
+    "InstanceId": "i-dead1",
+    "Region": "us-west-2",
+}
+
+_RUNNING_INSTANCE = {
+    "InstanceId": "i-abc123",
+    "Name": "aws-bootstrap-g4dn.xlarge",
+    "State": "running",
+    "InstanceType": "g4dn.xlarge",
+    "PublicIp": "1.2.3.4",
+    "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+    "Lifecycle": "spot",
+    "AvailabilityZone": "us-west-2a",
+}
+
+
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes_in_regions")
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.ec2.find_tagged_instances")
+def test_status_shows_orphan_volumes(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_orphans):
+    """Detached tool-created volumes are surfaced with cost + remediation hints."""
+    mock_find.return_value = [dict(_RUNNING_INSTANCE)]
+    mock_orphans.return_value = [dict(_ORPHAN_VOLUME)]
+    result = CliRunner().invoke(main, ["status", "--region", "us-west-2"])
+    assert result.exit_code == 0, result.output
+    assert "vol-orphan1" in result.output
+    assert "100 GB" in result.output
+    assert "$8.00/mo" in result.output  # 100 GB * $0.08/GB-month gp3
+    assert "aws-bootstrap launch --ebs-volume-id vol-orphan1 --region us-west-2" in result.output
+    assert "aws-bootstrap cleanup --include-ebs" in result.output
+
+
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.ec2.find_tagged_instances", return_value=[])
+def test_status_no_instances_still_shows_orphans(mock_find, mock_session, mock_orphans):
+    """Zero instances is the worst case for orphans — the section must still render."""
+    mock_orphans.return_value = [dict(_ORPHAN_VOLUME)]
+    result = CliRunner().invoke(main, ["status", "--region", "us-west-2"])
+    assert result.exit_code == 0, result.output
+    assert "No active" in result.output
+    assert "vol-orphan1" in result.output
+    assert "aws-bootstrap cleanup --include-ebs" in result.output
+
+
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes_in_regions")
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.ec2.find_tagged_instances")
+def test_status_no_orphans_no_section(mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_orphans):
+    mock_find.return_value = [dict(_RUNNING_INSTANCE)]
+    mock_orphans.return_value = []
+    result = CliRunner().invoke(main, ["status", "--region", "us-west-2"])
+    assert result.exit_code == 0, result.output
+    assert "orphan" not in result.output.lower()
+
+
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes_in_regions")
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.ec2.find_tagged_instances", return_value=[])
+def test_status_json_orphan_volume_fields(mock_find, mock_session, mock_orphans):
+    mock_orphans.return_value = [dict(_ORPHAN_VOLUME)]
+    result = CliRunner().invoke(main, ["-o", "json", "status", "--region", "us-west-2"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["instances"] == []
+    assert data["orphan_volumes"] == [
+        {
+            "volume_id": "vol-orphan1",
+            "region": "us-west-2",
+            "size_gb": 100,
+            "monthly_cost_usd": 8.0,
+            "last_instance_id": "i-dead1",
+        }
+    ]
+
+
+@pytest.mark.parametrize("fmt", ["json", "yaml", "table"])
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes_in_regions")
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.ec2.find_tagged_instances")
+def test_status_orphan_volumes_all_formats(
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_orphans, fmt
+):
+    """Every structured format must render both the instances and the orphans."""
+    mock_find.return_value = [dict(_RUNNING_INSTANCE)]
+    mock_orphans.return_value = [dict(_ORPHAN_VOLUME)]
+    result = CliRunner().invoke(main, ["-o", fmt, "status", "--region", "us-west-2"])
+    assert result.exit_code == 0, result.output
+    assert "i-abc123" in result.output
+    assert "vol-orphan1" in result.output
+    if fmt == "table":
+        assert "Volume ID" in result.output  # orphan volumes get their own table
+
+
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes_in_regions")
+@patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None)
+@patch("aws_bootstrap.cli.list_ssh_hosts", return_value={})
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_spot_price", return_value=0.15)
+@patch("aws_bootstrap.ec2.find_tagged_instances")
+def test_status_json_no_orphans_empty_list(
+    mock_find, mock_spot, mock_session, mock_ssh_hosts, mock_details, mock_orphans
+):
+    """orphan_volumes is always present in structured output so consumers can rely on it."""
+    mock_find.return_value = [dict(_RUNNING_INSTANCE)]
+    mock_orphans.return_value = []
+    result = CliRunner().invoke(main, ["-o", "json", "status", "--region", "us-west-2"])
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["orphan_volumes"] == []
+
+
+# ---------------------------------------------------------------------------
 # cleanup subcommand
 # ---------------------------------------------------------------------------
 
@@ -1786,7 +1915,7 @@ def test_cleanup_sync_renders_added_and_updated_in_each_format(mock_session, moc
 
 
 @patch("aws_bootstrap.cli.delete_ebs_volume")
-@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes_in_regions")
 @patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
 @patch("aws_bootstrap.cli.find_tagged_instances_in_regions", return_value=([], []))
 @patch("aws_bootstrap.cli.boto3.Session")
@@ -1794,7 +1923,9 @@ def test_cleanup_include_ebs_deletes_orphans(mock_session, mock_find, mock_regio
     cfg = tmp_path / "config"
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text("")
-    mock_orphan.return_value = [{"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-x"}]
+    mock_orphan.return_value = [
+        {"VolumeId": "vol-orphan1", "Size": 50, "State": "available", "InstanceId": "i-x", "Region": "us-east-1"}
+    ]
     with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
         result = CliRunner().invoke(main, ["-o", "json", "cleanup", "--include-ebs", "--yes"])
     assert result.exit_code == 0, result.output
@@ -1819,7 +1950,7 @@ def test_cleanup_sync_drift_preserves_port(mock_session, mock_find, mock_regions
 
 
 @patch("aws_bootstrap.cli.delete_ebs_volume")
-@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes_in_regions")
 @patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
 @patch("aws_bootstrap.cli.find_tagged_instances_in_regions")
 @patch("aws_bootstrap.cli.boto3.Session")
@@ -1830,7 +1961,9 @@ def test_cleanup_include_ebs_not_deleted_on_region_failure(
     cfg.parent.mkdir(parents=True, exist_ok=True)
     cfg.write_text("")
     mock_find.return_value = ([], [{"region": "us-east-1", "error": "AuthFailure"}])  # incomplete scan
-    mock_orphan.return_value = [{"VolumeId": "vol-x", "Size": 50, "State": "available", "InstanceId": "i-x"}]
+    mock_orphan.return_value = [
+        {"VolumeId": "vol-x", "Size": 50, "State": "available", "InstanceId": "i-x", "Region": "us-east-1"}
+    ]
     with patch("aws_bootstrap.cli._SSH_CONFIG_PATH", cfg):
         result = CliRunner().invoke(main, ["-o", "json", "cleanup", "--include-ebs", "--yes"])
     assert result.exit_code == 0
@@ -1839,7 +1972,7 @@ def test_cleanup_include_ebs_not_deleted_on_region_failure(
     assert "orphan_volumes" in data  # reported as candidates, not deleted_volumes
 
 
-@patch("aws_bootstrap.cli.find_orphan_ebs_volumes")
+@patch("aws_bootstrap.cli.find_orphan_ebs_volumes_in_regions")
 @patch("aws_bootstrap.cli.list_enabled_regions", return_value=["us-east-1"])
 @patch("aws_bootstrap.cli.find_tagged_instances_in_regions", return_value=([], []))
 @patch("aws_bootstrap.cli.boto3.Session")
@@ -1971,7 +2104,7 @@ def test_status_no_instances_json(mock_find, mock_session):
     result = runner.invoke(main, ["-o", "json", "status", "--region", "us-west-2"])
     assert result.exit_code == 0
     data = json.loads(result.output)
-    assert data == {"instances": [], "regions_queried": ["us-west-2"]}
+    assert data == {"instances": [], "regions_queried": ["us-west-2"], "orphan_volumes": []}
 
 
 @patch("aws_bootstrap.cli.boto3.Session")
