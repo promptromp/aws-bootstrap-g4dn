@@ -1093,3 +1093,43 @@ def find_orphan_ebs_volumes(ec2_client, tag_value: str, live_instance_ids: set[s
                 }
             )
     return orphans
+
+
+def find_orphan_ebs_volumes_in_regions(
+    session, tag_value: str, regions: list[str], live_instance_ids: set[str], max_workers: int = 10
+) -> list[dict]:
+    """Find orphan aws-bootstrap EBS volumes across multiple regions, in parallel.
+
+    Fans out :func:`find_orphan_ebs_volumes` per region; each volume dict gains
+    a ``"Region"`` key. A failing region contributes nothing rather than
+    aborting the sweep (``find_orphan_ebs_volumes`` swallows ``ClientError``;
+    connection errors are caught here) — callers that delete based on this list
+    must gate on their own region-scan failure signal, as ``cleanup`` does.
+
+    Matching an instance's liveness against the global *live_instance_ids* set
+    is region-safe: a volume's linked instance always lived in the volume's own
+    region (EBS attachment is AZ-scoped), so scanning a region for volumes
+    implies its instances are in the live set too.
+    """
+    orphans: list[dict] = []
+    if not regions:
+        return orphans
+
+    def query(region: str) -> list[dict]:
+        client = session.client("ec2", region_name=region)
+        found = find_orphan_ebs_volumes(client, tag_value, live_instance_ids)
+        for vol in found:
+            vol["Region"] = region
+        return found
+
+    workers = min(max_workers, len(regions))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [executor.submit(query, region) for region in regions]
+        for future in as_completed(futures):
+            try:
+                orphans.extend(future.result())
+            except (botocore.exceptions.ClientError, botocore.exceptions.EndpointConnectionError):
+                continue
+
+    orphans.sort(key=lambda v: (v["Region"], v["VolumeId"]))
+    return orphans

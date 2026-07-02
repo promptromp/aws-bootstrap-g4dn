@@ -51,6 +51,9 @@ VOLUME_TYPE = "gp3"
 ROOT_DEVICE_NAME = "/dev/sda1"
 EBS_DEVICE_NAME = "/dev/sdf"
 EBS_MOUNT_POINT = "/data"
+# Rough gp3 storage rate for cost estimates shown next to orphaned volumes.
+# Actual price varies slightly by region; this is the common US-region rate.
+EBS_GP3_PRICE_PER_GB_MONTH = 0.08
 
 # --- EC2 waiters -------------------------------------------------------------
 # Two distinct profiles, kept separate on purpose:

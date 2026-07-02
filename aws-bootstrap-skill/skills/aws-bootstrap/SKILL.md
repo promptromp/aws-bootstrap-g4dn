@@ -25,7 +25,7 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 | Command | Purpose | Key Options |
 |---------|---------|-------------|
 | `aws-bootstrap launch` | Provision a GPU instance (spot by default) | `--instance-type`, `--spot/--on-demand`, `--region` (repeatable), `--wait`, `--wait-timeout`, `--ebs-storage`, `--dry-run` |
-| `aws-bootstrap status` | List running instances (all enabled regions by default) with region, IPs, pricing | `--gpu` (CUDA info), `--region/-r` (repeatable), `--no-instructions` |
+| `aws-bootstrap status` | List running instances (all enabled regions by default) with region, IPs, pricing; also reports orphaned EBS data volumes (detached, still billed) with cost estimates | `--gpu` (CUDA info), `--region/-r` (repeatable), `--no-instructions` |
 | `aws-bootstrap terminate` | Terminate instances and clean up | `[ID_OR_ALIAS...]`, `--keep-ebs`, `--yes` |
 | `aws-bootstrap cleanup` | Sync `~/.ssh/config` with live instances across ALL regions (remove stale; `--sync` adds missing / repairs drifted) | `--sync`, `--include-ebs`, `--dry-run`, `--yes` |
 | `aws-bootstrap list instance-types` | Browse GPU instance types (+ suggested quota commands) | `--prefix` (default: g4dn), `--region/-r` (repeatable) |
