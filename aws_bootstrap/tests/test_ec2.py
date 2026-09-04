@@ -1076,10 +1076,15 @@ def test_find_tagged_instances_no_cluster_tags():
 # ---------------------------------------------------------------------------
 
 
-def _sg_client(permissions):
+def _sg_client(permissions, *, owned=True):
+    """A client whose SG lookup hits an existing group. ``owned`` controls whether
+    it carries this tool's created-by tag — the gate on mutating its ingress."""
     ec2 = MagicMock()
     ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
-    ec2.describe_security_groups.return_value = {"SecurityGroups": [{"GroupId": "sg-1", "IpPermissions": permissions}]}
+    tags = [{"Key": TAG_CREATED_BY, "Value": "tv"}] if owned else [{"Key": "Name", "Value": "someone-elses-sg"}]
+    ec2.describe_security_groups.return_value = {
+        "SecurityGroups": [{"GroupId": "sg-1", "IpPermissions": permissions, "Tags": tags}]
+    }
     return ec2
 
 
@@ -1135,7 +1140,9 @@ def test_reused_sg_propagates_an_unexpected_authorize_error():
 
 def _describe_owned(*instance_ids):
     ec2 = MagicMock()
-    ec2.describe_instances.return_value = {"Reservations": [{"Instances": [{"InstanceId": i} for i in instance_ids]}]}
+    ec2.get_paginator.return_value.paginate.return_value = [
+        {"Reservations": [{"Instances": [{"InstanceId": i} for i in instance_ids]}]}
+    ]
     return ec2
 
 
@@ -1158,14 +1165,54 @@ def test_find_unowned_instances_flags_ids_absent_from_the_region():
 def test_find_unowned_instances_short_circuits_on_empty_input():
     ec2 = MagicMock()
     assert find_unowned_instances(ec2, [], TAG_VALUE) == []
-    ec2.describe_instances.assert_not_called()
+    ec2.get_paginator.assert_not_called()
 
 
 def test_find_unowned_instances_filters_by_the_created_by_tag():
     ec2 = _describe_owned("i-a")
     find_unowned_instances(ec2, ["i-a"], TAG_VALUE)
-    filters = ec2.describe_instances.call_args.kwargs["Filters"]
-    assert filters == [{"Name": f"tag:{TAG_CREATED_BY}", "Values": [TAG_VALUE]}]
+    kwargs = ec2.get_paginator.return_value.paginate.call_args.kwargs
+    assert kwargs["Filters"] == [{"Name": f"tag:{TAG_CREATED_BY}", "Values": [TAG_VALUE]}]
     # Passing InstanceIds would make AWS raise for any id it has never seen,
     # which is precisely the case this check exists to answer.
-    assert "InstanceIds" not in ec2.describe_instances.call_args.kwargs
+    assert "InstanceIds" not in kwargs
+
+
+def test_reused_sg_never_widens_a_group_this_tool_did_not_create():
+    """`--security-group` is user-supplied and the lookup matches on name + VPC
+    alone, so a pre-existing restricted group can share the name. Punching
+    0.0.0.0/0 into it would be a security change nobody asked for."""
+    ec2 = _sg_client(
+        [{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}],
+        owned=False,
+    )
+    assert ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=2222) == "sg-1"
+    ec2.authorize_security_group_ingress.assert_not_called()
+
+
+def test_unowned_sg_without_ingress_warns_with_the_exact_command(capsys):
+    ec2 = _sg_client([], owned=False)
+    ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=2222)
+    err = capsys.readouterr().err
+    assert "not tagged" in err
+    assert "authorize-security-group-ingress --group-id sg-1" in err
+    assert "--port 2222" in err
+
+
+def test_unowned_sg_that_already_has_ingress_is_silent():
+    """Nothing to do and nothing to warn about — the port is already reachable."""
+    ec2 = _sg_client(_SSH_22, owned=False)
+    ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=22)
+    ec2.authorize_security_group_ingress.assert_not_called()
+
+
+def test_find_unowned_instances_paginates():
+    """A truncated page would misclassify an owned instance as unowned and
+    refuse a legitimate terminate."""
+    ec2 = MagicMock()
+    ec2.get_paginator.return_value.paginate.return_value = [
+        {"Reservations": [{"Instances": [{"InstanceId": "i-page1"}]}]},
+        {"Reservations": [{"Instances": [{"InstanceId": "i-page2"}]}]},
+    ]
+    assert find_unowned_instances(ec2, ["i-page1", "i-page2"], TAG_VALUE) == []
+    ec2.get_paginator.assert_called_once_with("describe_instances")

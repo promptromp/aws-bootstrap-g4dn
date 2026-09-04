@@ -99,12 +99,34 @@ def _has_ssh_ingress(permissions: list[dict], ssh_port: int) -> bool:
     return False
 
 
-def _ensure_ssh_ingress(ec2_client, sg_id: str, permissions: list[dict], ssh_port: int) -> None:
-    """Add the SSH ingress rule for *ssh_port* to *sg_id* if it isn't there yet.
+def _ensure_ssh_ingress(ec2_client, group: dict, tag_value: str, ssh_port: int) -> None:
+    """Add the SSH ingress rule for *ssh_port* to *group* if it isn't there yet.
+
+    **Only mutates a group this tool created.** ``--security-group`` is
+    user-supplied and the lookup matches on name + VPC alone, so a pre-existing,
+    deliberately-restricted group can share the name; silently widening it to
+    ``0.0.0.0/0`` would be a security change the user never asked for. For an
+    untagged group we warn with the exact command instead and let the launch
+    continue — ingress may already exist in a rule shape we don't model (a
+    prefix list, or a security-group source).
 
     Idempotent: a concurrent add (``InvalidPermission.Duplicate``) is success.
     """
-    if _has_ssh_ingress(permissions, ssh_port):
+    sg_id = group["GroupId"]
+    if _has_ssh_ingress(group.get("IpPermissions", []), ssh_port):
+        return
+
+    tags = {t["Key"]: t["Value"] for t in group.get("Tags", [])}
+    if tags.get(TAG_CREATED_BY) != tag_value:
+        secho(
+            f"  WARNING: security group {sg_id} has no ingress on port {ssh_port}, and is not tagged\n"
+            f"  {TAG_CREATED_BY}={tag_value} — refusing to widen a group this tool did not create.\n"
+            "  If SSH cannot connect, open the port yourself:\n"
+            f"    aws ec2 authorize-security-group-ingress --group-id {sg_id} \\\n"
+            f"      --protocol tcp --port {ssh_port} --cidr {SSH_INGRESS_CIDR}",
+            fg="yellow",
+            err=True,
+        )
         return
     try:
         ec2_client.authorize_security_group_ingress(
@@ -149,7 +171,7 @@ def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int =
         # used. Without this, `launch --ssh-port 2222` against an existing group
         # silently has no ingress on 2222 and only fails much later, as an opaque
         # "SSH did not become available" timeout.
-        _ensure_ssh_ingress(ec2_client, sg_id, group.get("IpPermissions", []), ssh_port)
+        _ensure_ssh_ingress(ec2_client, group, tag_value, ssh_port)
         return sg_id
 
     # Create new SG
@@ -691,11 +713,19 @@ def find_unowned_instances(ec2_client, instance_ids: list[str], tag_value: str) 
     Filters by tag only (no ``InstanceIds``): passing an id AWS has never seen
     makes ``describe_instances`` raise ``InvalidInstanceID.NotFound`` for the
     whole call, which is exactly the case this check has to answer for.
+    Results are paginated — see the note in the body.
     """
     if not instance_ids:
         return []
-    response = ec2_client.describe_instances(Filters=[{"Name": f"tag:{TAG_CREATED_BY}", "Values": [tag_value]}])
-    owned = {inst["InstanceId"] for reservation in response["Reservations"] for inst in reservation["Instances"]}
+    # Paginated: this is a *guard*, so a truncated page would misclassify an
+    # owned instance as unowned and refuse a legitimate terminate.
+    paginator = ec2_client.get_paginator("describe_instances")
+    owned = {
+        inst["InstanceId"]
+        for page in paginator.paginate(Filters=[{"Name": f"tag:{TAG_CREATED_BY}", "Values": [tag_value]}])
+        for reservation in page["Reservations"]
+        for inst in reservation["Instances"]
+    }
     return [i for i in instance_ids if i not in owned]
 
 

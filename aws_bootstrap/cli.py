@@ -548,6 +548,10 @@ def launch(
     public_ip = instance.get("PublicIpAddress")
     az = instance["Placement"]["AvailabilityZone"]
 
+    # Declared before _incomplete so the no-public-ip call (which runs before the
+    # EBS block) reads a bound name rather than raising UnboundLocalError.
+    ebs_volume_attached: str | None = None
+
     def _incomplete(status: str, message: str) -> None:
         """Report a launch that left a running-but-unusable instance.
 
@@ -567,6 +571,10 @@ def launch(
                     "region": active_region,
                     "pricing": pricing,
                     "error": message,
+                    # The volume is created and attached *before* the SSH wait, so
+                    # an ssh-unavailable launch is already billing for it too —
+                    # a caller reclaiming the instance must be able to see it.
+                    **({"ebs_volume": {"volume_id": ebs_volume_attached}} if ebs_volume_attached else {}),
                 },
                 ctx=ctx,
             )
@@ -580,7 +588,6 @@ def launch(
     val("Public IP", public_ip)
 
     # Step 5.5 (optional): EBS data volume
-    ebs_volume_attached = None
     ebs_format = False
     if has_ebs:
         step(3, total_steps, "Setting up EBS data volume...")
@@ -2205,10 +2212,12 @@ def _running_cluster_nodes(ec2, cluster_id: str, region: str) -> list[dict]:
         raise CLIError(
             f"Cluster '{cluster_id}' has {len(nodes) - len(running)} node(s) not running: {stale}.\n"
             "  A distributed job needs every node up — all ranks must reach the rendezvous.\n"
-            f"  Restore the cluster with:  aws-bootstrap cluster launch --cluster-id {cluster_id} "
-            f"--nodes {len(nodes)} --region {region}\n"
-            f"  Or tear it down with:      aws-bootstrap cluster terminate --cluster-id {cluster_id} "
-            f"--region {region} --yes"
+            "  Rebuild it with:\n"
+            f"    aws-bootstrap cluster terminate --cluster-id {cluster_id} --region {region} --yes\n"
+            f"    aws-bootstrap cluster launch --cluster-id {cluster_id} --nodes {len(nodes)} --region {region}\n"
+            "  (`cluster launch` alone will not help: it counts every non-terminated node, so it\n"
+            "  sees the cluster as already full. A node still shutting down frees its slot once\n"
+            "  termination completes.)"
         )
     return running
 

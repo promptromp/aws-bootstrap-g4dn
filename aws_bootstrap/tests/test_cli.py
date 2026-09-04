@@ -2700,3 +2700,32 @@ def test_terminate_all_skips_the_ownership_check(mock_find, mock_unowned, mock_t
     result = CliRunner().invoke(main, ["terminate", "--yes"])
     assert result.exit_code == 0
     mock_unowned.assert_not_called()
+
+
+@patch("aws_bootstrap.cli.mount_ebs_volume", return_value=True)
+@patch("aws_bootstrap.cli.attach_ebs_volume")
+@patch("aws_bootstrap.cli.create_ebs_volume", return_value="vol-0abc123")
+def test_incomplete_launch_record_names_the_ebs_volume_it_created(_create, _attach, _mount):
+    """The volume is created and attached *before* the SSH wait, so an
+    ssh-unavailable launch is already billing for it — a caller reclaiming the
+    instance has to be able to see it in the same record."""
+    result = _invoke_launch(["-o", "json", "launch", "--ebs-storage", "200"], ssh_ok=False)
+    assert result.exit_code != 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "ssh-unavailable"
+    assert payload["ebs_volume"]["volume_id"] == "vol-0abc123"
+
+
+def test_incomplete_launch_without_ebs_omits_the_volume_key():
+    payload = json.loads(_invoke_launch(["-o", "json", "launch"], ssh_ok=False).output)
+    assert "ebs_volume" not in payload
+
+
+def test_no_public_ip_record_is_emitted_before_any_ebs_work():
+    """Regression guard: `ebs_volume_attached` is assigned below the EBS block but
+    read by _incomplete above it — it must be bound, not UnboundLocalError."""
+    result = _invoke_launch(["-o", "json", "launch", "--ebs-storage", "200"], public_ip=None)
+    assert result.exit_code != 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "no-public-ip"
+    assert "ebs_volume" not in payload

@@ -506,3 +506,27 @@ def test_cluster_status_still_shows_non_running_nodes(mock_find, _session, runne
     assert result.exit_code == 0
     states = {n["rank"]: n["state"] for n in json.loads(result.output)["nodes"]}
     assert states == {0: "running", 1: "stopped"}
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+def test_partial_cluster_remediation_leads_with_terminate_not_launch(mock_find, _session, runner):
+    """`cluster launch --nodes <total>` is a no-op here: it counts every
+    non-terminated node, so it sees the cluster as already full and prints
+    'nothing to add'. The remediation must not send the user down that path."""
+    mock_find.return_value = [_node("i-1", rank=0, state="running"), _node("i-2", rank=1, state="shutting-down")]
+    result = runner.invoke(main, ["cluster", "test", "--cluster-id", "ml1", "--region", "us-east-1"])
+    assert result.exit_code != 0
+    out = result.output
+    assert "cluster terminate" in out
+    assert out.index("cluster terminate") < out.index("cluster launch")
+    assert "will not help" in out
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+def test_cluster_launch_reports_nothing_to_add_for_a_half_dead_cluster(mock_find, _session, runner):
+    """Pins the behaviour the remediation wording has to account for."""
+    mock_find.return_value = [_node("i-1", rank=0, state="running"), _node("i-2", rank=1, state="shutting-down")]
+    result = runner.invoke(main, ["cluster", "launch", "--cluster-id", "ml1", "--nodes", "2", "--region", "us-east-1"])
+    assert "nothing to add" in result.output

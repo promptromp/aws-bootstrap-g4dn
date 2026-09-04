@@ -1,7 +1,7 @@
 {
   "name": "aws-bootstrap-skill",
   "description": "Provision and manage AWS EC2 GPU instances for ML/CUDA development via the aws-bootstrap CLI",
-  "version": "0.19.0",
+  "version": "0.20.0",
   "author": {
     "name": "promptromp"
   },
