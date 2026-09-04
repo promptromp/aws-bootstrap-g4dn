@@ -12,7 +12,6 @@ from aws_bootstrap.ec2 import (
     attach_ebs_volume,
     create_ebs_volume,
     delete_ebs_volume,
-    detach_ebs_volume,
     find_ebs_volumes_for_instance,
     find_orphan_ebs_volumes,
     find_orphan_ebs_volumes_in_regions,
@@ -158,23 +157,6 @@ def test_attach_ebs_volume_custom_device():
 
 # ---------------------------------------------------------------------------
 # detach_ebs_volume
-# ---------------------------------------------------------------------------
-
-
-def test_detach_ebs_volume():
-    ec2 = MagicMock()
-    waiter = MagicMock()
-    ec2.get_waiter.return_value = waiter
-
-    detach_ebs_volume(ec2, "vol-abc123")
-
-    ec2.detach_volume.assert_called_once_with(VolumeId="vol-abc123")
-    ec2.get_waiter.assert_called_once_with("volume_available")
-    waiter.wait.assert_called_once()
-
-
-# ---------------------------------------------------------------------------
-# delete_ebs_volume
 # ---------------------------------------------------------------------------
 
 

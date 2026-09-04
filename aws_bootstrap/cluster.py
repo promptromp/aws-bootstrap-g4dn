@@ -13,7 +13,7 @@ fan-out). AWS primitives live in :mod:`aws_bootstrap.ec2`; CLI wiring lives in
 from __future__ import annotations
 import shlex
 from collections.abc import Callable
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -48,6 +48,8 @@ def master_addr(nodes: list[dict]) -> str:
     rank tag failed to write) by sorting them last rather than crashing on a
     ``None``/``int`` comparison.
     """
+    if not nodes:
+        raise ValueError("cannot determine a master address: no cluster nodes")
     rank0 = min(nodes, key=lambda n: (n["Rank"] is None, n["Rank"] if n["Rank"] is not None else 0))
     return rank0["PrivateIp"]
 
@@ -178,7 +180,8 @@ def run_on_all_nodes(
     results: list[NodeResult | None] = [None] * len(nodes)
     with ThreadPoolExecutor(max_workers=workers) as pool:
         futures = {pool.submit(run_fn, node, command_for(node)): i for i, node in enumerate(nodes)}
-        for future, i in futures.items():
+        for future in as_completed(futures):
+            i = futures[future]
             node = nodes[i]
             try:
                 rc, out, err = future.result()

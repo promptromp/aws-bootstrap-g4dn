@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 import json
+from contextlib import ExitStack
 from datetime import UTC, datetime
 from pathlib import Path
 from unittest.mock import MagicMock, patch
@@ -306,8 +307,9 @@ def test_terminate_with_confirm(mock_terminate, mock_find, mock_session, mock_re
 @patch("aws_bootstrap.cli.remove_ssh_host", return_value=None)
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.terminate_tagged_instances")
+@patch("aws_bootstrap.cli.find_unowned_instances", return_value=[])
 @patch("aws_bootstrap.cli.resolve_instance_id", return_value="i-abc123")
-def test_terminate_by_alias(mock_resolve, mock_terminate, mock_session, mock_remove_ssh):
+def test_terminate_by_alias(mock_resolve, _mock_unowned, mock_terminate, mock_session, mock_remove_ssh):
     mock_terminate.return_value = [
         {
             "InstanceId": "i-abc123",
@@ -337,8 +339,11 @@ def test_terminate_unknown_alias_errors(mock_resolve, mock_session):
 @patch("aws_bootstrap.cli.remove_ssh_host", return_value=None)
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.terminate_tagged_instances")
+@patch("aws_bootstrap.cli.find_unowned_instances", return_value=[])
 @patch("aws_bootstrap.cli.resolve_instance_id", return_value="i-abc123")
-def test_terminate_by_instance_id_passthrough(mock_resolve, mock_terminate, mock_session, mock_remove_ssh):
+def test_terminate_by_instance_id_passthrough(
+    mock_resolve, _mock_unowned, mock_terminate, mock_session, mock_remove_ssh
+):
     """Instance IDs are passed through without resolution message."""
     mock_resolve.return_value = "i-abc123"
     mock_terminate.return_value = [
@@ -2557,3 +2562,170 @@ def test_quota_show_all_families(mock_session, mock_quotas):
     data = json.loads(result.output)
     assert len(data["quotas"]) == 6
     assert mock_quotas.call_count == 3
+
+
+# ---------------------------------------------------------------------------
+# launch: an incomplete launch must still report the instance it left running
+# ---------------------------------------------------------------------------
+
+
+def _launch_patches(*, public_ip="1.2.3.4", ssh_ok=True):
+    """Patch launch far enough to reach the post-`wait_instance_ready` paths."""
+    ctxobj = RegionContext(
+        region="us-west-2",
+        ec2_client=MagicMock(),
+        ami={"ImageId": "ami-1", "Name": "dl"},
+        sg_id="sg-1",
+        key_name="k",
+    )
+    instance = {"InstanceId": "i-abc", "Placement": {"AvailabilityZone": "us-west-2a"}}
+    if public_ip:
+        instance["PublicIpAddress"] = public_ip
+    return [
+        patch("aws_bootstrap.cli.boto3.Session"),
+        patch("aws_bootstrap.cli.get_latest_ami", return_value={"ImageId": "ami-1", "Name": "dl"}),
+        patch("aws_bootstrap.cli.import_key_pair", return_value="k"),
+        patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-1"),
+        patch(
+            "aws_bootstrap.cli.launch_with_retry",
+            return_value=RegionLaunch("us-west-2", ctxobj, {"InstanceId": "i-abc"}, "spot"),
+        ),
+        patch("aws_bootstrap.cli.wait_instance_ready", return_value=instance),
+        patch("aws_bootstrap.cli.wait_for_ssh", return_value=ssh_ok),
+        patch("pathlib.Path.exists", return_value=True),
+    ]
+
+
+def _invoke_launch(args, **kw):
+    with ExitStack() as stack:
+        for p in _launch_patches(**kw):
+            stack.enter_context(p)
+        return CliRunner().invoke(main, args)
+
+
+@pytest.mark.parametrize("fmt", ["json", "yaml"])
+def test_launch_emits_a_record_when_ssh_never_comes_up(fmt):
+    """Regression: this path returned early with empty stdout and exit 0, so an
+    agent saw success while a billable instance was left running and unnamed."""
+    result = _invoke_launch(["-o", fmt, "launch"], ssh_ok=False)
+    assert result.exit_code != 0
+    payload = json.loads(result.output) if fmt == "json" else yaml.safe_load(result.output)
+    assert payload["status"] == "ssh-unavailable"
+    assert payload["instance_id"] == "i-abc"
+    assert payload["public_ip"] == "1.2.3.4"
+    assert payload["region"] == "us-west-2"
+    assert payload["error"]
+
+
+def test_launch_emits_a_record_when_no_public_ip_is_assigned():
+    result = _invoke_launch(["-o", "json", "launch"], public_ip=None)
+    assert result.exit_code != 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "no-public-ip"
+    assert payload["instance_id"] == "i-abc"
+    assert payload["public_ip"] is None
+
+
+def test_launch_incomplete_text_mode_names_the_instance_to_terminate():
+    result = _invoke_launch(["launch"], ssh_ok=False)
+    assert result.exit_code != 0
+    assert "i-abc" in result.output
+    assert "terminate" in result.output
+
+
+@patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
+@patch("aws_bootstrap.cli.query_cuda_version", return_value=None)
+@patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
+def test_launch_success_is_status_ready(_setup, _cuda, _alias):
+    """The success record carries the same discriminator, so one key answers
+    'did this work?' across every outcome."""
+    result = _invoke_launch(["-o", "json", "launch"])
+    assert result.exit_code == 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "ready"
+    assert payload["ssh_alias"] == "aws-gpu1"
+
+
+# ---------------------------------------------------------------------------
+# terminate: refuse instances this tool did not create
+# ---------------------------------------------------------------------------
+
+
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value=None)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.terminate_tagged_instances")
+@patch("aws_bootstrap.cli.find_unowned_instances", return_value=["i-0deadbeefdeadbeef"])
+@patch("aws_bootstrap.cli.resolve_instance_id", return_value="i-0deadbeefdeadbeef")
+def test_terminate_refuses_an_instance_it_did_not_create(_resolve, _unowned, mock_terminate, _session, _remove):
+    """Regression: an explicit id bypassed tag discovery entirely, so a typo (or
+    an agent's wrong id) terminated an unrelated production instance."""
+    result = CliRunner().invoke(main, ["terminate", "--yes", "i-0deadbeefdeadbeef"])
+    assert result.exit_code != 0
+    assert "not created by aws-bootstrap" in result.output
+    assert "--force" in result.output
+    mock_terminate.assert_not_called()
+
+
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value=None)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.terminate_tagged_instances")
+@patch("aws_bootstrap.cli.find_unowned_instances", return_value=["i-0deadbeefdeadbeef"])
+@patch("aws_bootstrap.cli.resolve_instance_id", return_value="i-0deadbeefdeadbeef")
+def test_terminate_force_overrides_the_ownership_guard(_resolve, mock_unowned, mock_terminate, _session, _remove):
+    mock_terminate.return_value = [
+        {
+            "InstanceId": "i-0deadbeefdeadbeef",
+            "PreviousState": {"Name": "running"},
+            "CurrentState": {"Name": "shutting-down"},
+        }
+    ]
+    result = CliRunner().invoke(main, ["terminate", "--yes", "--force", "i-0deadbeefdeadbeef"])
+    assert result.exit_code == 0
+    mock_terminate.assert_called_once()
+    mock_unowned.assert_not_called()
+
+
+@patch("aws_bootstrap.cli.remove_ssh_host", return_value=None)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.terminate_tagged_instances")
+@patch("aws_bootstrap.cli.find_unowned_instances")
+@patch("aws_bootstrap.cli.find_tagged_instances")
+def test_terminate_all_skips_the_ownership_check(mock_find, mock_unowned, mock_terminate, _session, _remove):
+    """Terminating everything already goes through tag discovery, so re-checking
+    ownership would be a pointless extra API call."""
+    mock_find.return_value = [{"InstanceId": "i-abc", "State": "running", "InstanceType": "g4dn.xlarge"}]
+    mock_terminate.return_value = [
+        {"InstanceId": "i-abc", "PreviousState": {"Name": "running"}, "CurrentState": {"Name": "shutting-down"}}
+    ]
+    result = CliRunner().invoke(main, ["terminate", "--yes"])
+    assert result.exit_code == 0
+    mock_unowned.assert_not_called()
+
+
+@patch("aws_bootstrap.cli.mount_ebs_volume", return_value=True)
+@patch("aws_bootstrap.cli.attach_ebs_volume")
+@patch("aws_bootstrap.cli.create_ebs_volume", return_value="vol-0abc123")
+def test_incomplete_launch_record_names_the_ebs_volume_it_created(_create, _attach, _mount):
+    """The volume is created and attached *before* the SSH wait, so an
+    ssh-unavailable launch is already billing for it — a caller reclaiming the
+    instance has to be able to see it in the same record."""
+    result = _invoke_launch(["-o", "json", "launch", "--ebs-storage", "200"], ssh_ok=False)
+    assert result.exit_code != 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "ssh-unavailable"
+    assert payload["ebs_volume"]["volume_id"] == "vol-0abc123"
+
+
+def test_incomplete_launch_without_ebs_omits_the_volume_key():
+    payload = json.loads(_invoke_launch(["-o", "json", "launch"], ssh_ok=False).output)
+    assert "ebs_volume" not in payload
+
+
+def test_no_public_ip_record_is_emitted_before_any_ebs_work():
+    """Regression guard: `ebs_volume_attached` is assigned below the EBS block but
+    read by _incomplete above it — it must be bound, not UnboundLocalError."""
+    result = _invoke_launch(["-o", "json", "launch", "--ebs-storage", "200"], public_ip=None)
+    assert result.exit_code != 0
+    payload = json.loads(result.output)
+    assert payload["status"] == "no-public-ip"
+    assert "ebs_volume" not in payload

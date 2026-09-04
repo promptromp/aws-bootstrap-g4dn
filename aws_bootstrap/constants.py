@@ -44,6 +44,7 @@ SSH_PORT_DEFAULT = DEFAULT_SSH_PORT
 JUPYTER_PORT = 8888
 SSH_INGRESS_CIDR = "0.0.0.0/0"  # public SSH ingress (intentional for remote dev)
 SSH_CONNECT_TIMEOUT = 10  # seconds, ssh -o ConnectTimeout / socket timeout
+SCP_TIMEOUT = 300  # seconds, hard cap on a single scp transfer (setup payload / cluster fan-out)
 RDZV_PORT = 29400  # torchrun c10d rendezvous port (intra-cluster)
 
 # --- Storage -----------------------------------------------------------------

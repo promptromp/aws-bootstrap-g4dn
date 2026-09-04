@@ -438,3 +438,95 @@ def test_cluster_run_missing_script_errors(runner, tmp_path):
             ],
         )
     assert result.exit_code != 0
+
+
+# ---------------------------------------------------------------------------
+# Execution commands require every node to be running
+#
+# `find_cluster_instances` deliberately reports non-terminated nodes so `status`
+# can show a stopped one. prepare/test/run must not: a spot-reclaimed rank 0 is
+# still what `master_addr` picks, and every node then hangs waiting to
+# rendezvous against an IP that is going away.
+# ---------------------------------------------------------------------------
+
+
+_EXEC_COMMANDS = [
+    ["cluster", "prepare", "--cluster-id", "ml1", "--region", "us-east-1"],
+    ["cluster", "test", "--cluster-id", "ml1", "--region", "us-east-1"],
+    ["cluster", "run", "--cluster-id", "ml1", "--region", "us-east-1", "train.py"],
+]
+
+
+@pytest.mark.parametrize("argv", _EXEC_COMMANDS, ids=["prepare", "test", "run"])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+def test_cluster_exec_refuses_a_partially_running_cluster(mock_find, _session, runner, tmp_path, argv):
+    mock_find.return_value = [_node("i-1", rank=0, state="running"), _node("i-2", rank=1, state="shutting-down")]
+    script = tmp_path / "train.py"
+    script.write_text("print('hi')\n")
+    result = runner.invoke(main, [a.replace("train.py", str(script)) for a in argv])
+    assert result.exit_code != 0
+    assert "not running" in result.output
+    assert "rank 1 (shutting-down)" in result.output
+    # The remediation has to be actionable, not just a complaint.
+    assert "cluster launch" in result.output
+    assert "cluster terminate" in result.output
+
+
+@pytest.mark.parametrize("argv", _EXEC_COMMANDS, ids=["prepare", "test", "run"])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+def test_cluster_exec_refuses_a_fully_stopped_cluster(mock_find, _session, runner, tmp_path, argv):
+    mock_find.return_value = [_node("i-1", rank=0, state="stopped"), _node("i-2", rank=1, state="stopped")]
+    script = tmp_path / "train.py"
+    script.write_text("print('hi')\n")
+    result = runner.invoke(main, [a.replace("train.py", str(script)) for a in argv])
+    assert result.exit_code != 0
+    assert "No running nodes" in result.output
+    assert "rank 0=stopped" in result.output
+
+
+@pytest.mark.parametrize("argv", _EXEC_COMMANDS, ids=["prepare", "test", "run"])
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_cluster_instances", return_value=[])
+def test_cluster_exec_reports_an_unknown_cluster(_find, _session, runner, tmp_path, argv):
+    script = tmp_path / "train.py"
+    script.write_text("print('hi')\n")
+    result = runner.invoke(main, [a.replace("train.py", str(script)) for a in argv])
+    assert result.exit_code != 0
+    assert "No nodes found for cluster 'ml1'" in result.output
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+def test_cluster_status_still_shows_non_running_nodes(mock_find, _session, runner):
+    """status is the diagnostic view — it must keep reporting a stopped node."""
+    mock_find.return_value = [_node("i-1", rank=0, state="running"), _node("i-2", rank=1, state="stopped")]
+    result = runner.invoke(main, ["-o", "json", "cluster", "status", "--cluster-id", "ml1", "--region", "us-east-1"])
+    assert result.exit_code == 0
+    states = {n["rank"]: n["state"] for n in json.loads(result.output)["nodes"]}
+    assert states == {0: "running", 1: "stopped"}
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+def test_partial_cluster_remediation_leads_with_terminate_not_launch(mock_find, _session, runner):
+    """`cluster launch --nodes <total>` is a no-op here: it counts every
+    non-terminated node, so it sees the cluster as already full and prints
+    'nothing to add'. The remediation must not send the user down that path."""
+    mock_find.return_value = [_node("i-1", rank=0, state="running"), _node("i-2", rank=1, state="shutting-down")]
+    result = runner.invoke(main, ["cluster", "test", "--cluster-id", "ml1", "--region", "us-east-1"])
+    assert result.exit_code != 0
+    out = result.output
+    assert "cluster terminate" in out
+    assert out.index("cluster terminate") < out.index("cluster launch")
+    assert "will not help" in out
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.find_cluster_instances")
+def test_cluster_launch_reports_nothing_to_add_for_a_half_dead_cluster(mock_find, _session, runner):
+    """Pins the behaviour the remediation wording has to account for."""
+    mock_find.return_value = [_node("i-1", rank=0, state="running"), _node("i-2", rank=1, state="shutting-down")]
+    result = runner.invoke(main, ["cluster", "launch", "--cluster-id", "ml1", "--nodes", "2", "--region", "us-east-1"])
+    assert "nothing to add" in result.output

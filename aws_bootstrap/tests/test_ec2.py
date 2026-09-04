@@ -3,29 +3,34 @@
 from __future__ import annotations
 import io
 from datetime import UTC, datetime
-from unittest.mock import MagicMock, patch
+from unittest.mock import MagicMock
 
 import botocore.exceptions
 import click
 import pytest
 
 from aws_bootstrap.config import LaunchConfig
+from aws_bootstrap.constants import TAG_CREATED_BY, TAG_VALUE
 from aws_bootstrap.ec2 import (
     CapacityError,
     CLIError,
     RegionContext,
+    RegionFatalError,
     RegionLaunch,
     _build_launch_params,
+    _quota_error_message,
+    _quota_hint,
     _run_instances,
     delete_cluster_placement_group,
     ensure_cluster_placement_group,
     ensure_cluster_security_group_rule,
+    ensure_security_group,
     find_cluster_instances,
     find_tagged_instances,
     find_tagged_instances_in_regions,
+    find_unowned_instances,
     get_latest_ami,
     get_spot_price,
-    launch_instance,
     launch_with_retry,
     list_amis,
     list_clusters,
@@ -77,90 +82,78 @@ def _make_client_error(code: str, message: str = "test") -> botocore.exceptions.
     )
 
 
-def test_launch_instance_spot_quota_exceeded():
-    ec2 = MagicMock()
-    ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
-    config = LaunchConfig(spot=True)
-    with pytest.raises(click.ClickException, match="Spot instance quota exceeded"):
-        launch_instance(ec2, config, "ami-test", "sg-test")
+# ---------------------------------------------------------------------------
+# Quota error messages
+#
+# These assert the *message* contract (label, --type, --family, region-pinned
+# commands) against the pure builder. They used to go through the since-removed
+# `launch_instance`; `launch_with_retry` covers the multi-region orchestration.
+# ---------------------------------------------------------------------------
 
 
-def test_launch_instance_vcpu_limit_exceeded():
-    ec2 = MagicMock()
-    ec2.run_instances.side_effect = _make_client_error("VcpuLimitExceeded")
-    config = LaunchConfig(spot=False)
-    with pytest.raises(click.ClickException, match="vCPU quota exceeded"):
-        launch_instance(ec2, config, "ami-test", "sg-test")
+def test_quota_message_spot_label_and_type():
+    msg = _quota_error_message("MaxSpotInstanceCountExceeded", LaunchConfig(spot=True), "us-west-2")
+    assert "Spot instance quota exceeded" in msg
+    assert "--type spot" in msg
+    assert "aws-bootstrap quota show" in msg
 
 
-def test_launch_instance_quota_error_includes_quota_hint():
-    ec2 = MagicMock()
-    ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
-    config = LaunchConfig(spot=True)
-    with pytest.raises(click.ClickException, match="aws-bootstrap quota show"):
-        launch_instance(ec2, config, "ami-test", "sg-test")
+def test_quota_message_on_demand_label_and_type():
+    msg = _quota_error_message("VcpuLimitExceeded", LaunchConfig(spot=False), "us-west-2")
+    assert "On-demand vCPU quota exceeded" in msg
+    assert "--type on-demand" in msg
 
 
-def test_launch_instance_spot_quota_hint_has_type_spot():
-    """Spot quota error hint suggests --type spot."""
-    ec2 = MagicMock()
-    ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
-    config = LaunchConfig(spot=True, instance_type="g4dn.xlarge")
-    with pytest.raises(click.ClickException, match="--type spot"):
-        launch_instance(ec2, config, "ami-test", "sg-test")
+@pytest.mark.parametrize(
+    ("instance_type", "family"),
+    [("g4dn.xlarge", "gvt"), ("g5.2xlarge", "gvt"), ("p5.48xlarge", "p"), ("dl1.24xlarge", "dl")],
+)
+def test_quota_message_family_matches_instance_type(instance_type, family):
+    msg = _quota_error_message("MaxSpotInstanceCountExceeded", LaunchConfig(instance_type=instance_type), "us-west-2")
+    assert f"--family {family}" in msg
 
 
-def test_launch_instance_on_demand_quota_hint_has_type_on_demand():
-    """On-demand quota error hint suggests --type on-demand."""
-    ec2 = MagicMock()
-    ec2.run_instances.side_effect = _make_client_error("VcpuLimitExceeded")
-    config = LaunchConfig(spot=False, instance_type="g4dn.xlarge")
-    with pytest.raises(click.ClickException, match="--type on-demand"):
-        launch_instance(ec2, config, "ami-test", "sg-test")
+def test_quota_message_non_gpu_instance_type_falls_back_to_gvt():
+    """A non-GPU type has no quota family; the hint still has to name one."""
+    msg = _quota_error_message("VcpuLimitExceeded", LaunchConfig(instance_type="t3.medium"), "us-west-2")
+    assert "--family gvt" in msg
 
 
-def test_launch_instance_quota_hint_includes_family():
-    """Quota error hint includes --family matching the instance type."""
-    ec2 = MagicMock()
-    ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
-    config = LaunchConfig(spot=True, instance_type="p5.48xlarge")
-    with pytest.raises(click.ClickException, match="--family p"):
-        launch_instance(ec2, config, "ami-test", "sg-test")
+def test_quota_message_pins_the_failed_region():
+    msg = _quota_error_message("MaxSpotInstanceCountExceeded", LaunchConfig(), "eu-west-1")
+    assert "in eu-west-1" in msg
+    assert "--region eu-west-1" in msg
 
 
-@patch("aws_bootstrap.ec2.is_text", return_value=False)
-def test_launch_instance_on_demand_retry_quota_hint_type(_mock_is_text):
-    """On-demand retry quota error hints --type on-demand, not spot."""
-    ec2 = MagicMock()
-    ec2.run_instances.side_effect = [
-        _make_client_error("InsufficientInstanceCapacity", "No spot capacity"),
-        _make_client_error("VcpuLimitExceeded"),
-    ]
-    config = LaunchConfig(spot=True, instance_type="g4dn.xlarge")
-    with pytest.raises(click.ClickException, match="--type on-demand"):
-        launch_instance(ec2, config, "ami-test", "sg-test")
-
-
-def test_launch_instance_insufficient_capacity_on_demand():
-    """On-demand launch with InsufficientInstanceCapacity gives a friendly error."""
+def test_run_instances_maps_capacity_error():
+    """InsufficientInstanceCapacity is retryable (CapacityError), not fatal."""
     ec2 = MagicMock()
     ec2.run_instances.side_effect = _make_client_error("InsufficientInstanceCapacity")
-    config = LaunchConfig(spot=False, instance_type="p5.4xlarge")
-    with pytest.raises(click.ClickException, match="Insufficient capacity for p5.4xlarge"):
-        launch_instance(ec2, config, "ami-test", "sg-test")
+    with pytest.raises(CapacityError) as exc:
+        _run_instances(ec2, LaunchConfig(spot=True), "ami-1", "sg-1", "us-west-2", True, "k")
+    assert exc.value.region == "us-west-2"
+    assert exc.value.market == "spot"
 
 
-@patch("aws_bootstrap.ec2.is_text", return_value=False)
-def test_launch_instance_insufficient_capacity_on_demand_retry(_mock_is_text):
-    """Spot fails, on-demand retry also gets InsufficientInstanceCapacity."""
+@pytest.mark.parametrize(
+    ("code", "kind"),
+    [("MaxSpotInstanceCountExceeded", "quota"), ("VcpuLimitExceeded", "quota"), ("SpotMaxPriceTooLow", "price")],
+)
+def test_run_instances_maps_region_fatal_error(code, kind):
+    """Quota / price are never worth waiting on -> RegionFatalError with a kind."""
     ec2 = MagicMock()
-    ec2.run_instances.side_effect = [
-        _make_client_error("InsufficientInstanceCapacity", "No spot capacity"),
-        _make_client_error("InsufficientInstanceCapacity", "No on-demand capacity"),
-    ]
-    config = LaunchConfig(spot=True, instance_type="p5.4xlarge")
-    with pytest.raises(click.ClickException, match="Neither spot nor on-demand"):
-        launch_instance(ec2, config, "ami-test", "sg-test")
+    ec2.run_instances.side_effect = _make_client_error(code)
+    with pytest.raises(RegionFatalError) as exc:
+        _run_instances(ec2, LaunchConfig(spot=True), "ami-1", "sg-1", "us-west-2", True, "k")
+    assert exc.value.kind == kind
+
+
+def test_run_instances_reraises_unknown_client_error():
+    """An unmapped API error must not be silently reclassified as capacity."""
+    ec2 = MagicMock()
+    ec2.run_instances.side_effect = _make_client_error("UnauthorizedOperation")
+    with pytest.raises(botocore.exceptions.ClientError):
+        _run_instances(ec2, LaunchConfig(spot=True), "ami-1", "sg-1", "us-west-2", True, "k")
 
 
 def _region_ctx(region: str, run_side_effect):
@@ -397,13 +390,16 @@ def test_launch_with_retry_quota_hint_pins_failed_region():
 
 
 def test_quota_hint_without_region_omits_flag():
-    ec2 = MagicMock()
-    ec2.run_instances.side_effect = _make_client_error("MaxSpotInstanceCountExceeded")
+    """With no region to pin, the suggested commands carry no --region flag."""
+    hint = _quota_hint("spot", "gvt", None)
+    assert "--region" not in hint
+    assert "aws-bootstrap quota show --family gvt" in hint
+
+
+def test_quota_error_message_falls_back_to_config_region():
+    """`region=None` still pins the hint, via config.regions[0]."""
     config = LaunchConfig(spot=True, instance_type="g4dn.xlarge", regions=("us-west-2",))
-    with pytest.raises(click.ClickException) as exc:
-        launch_instance(ec2, config, "ami-test", "sg-test")
-    # Single-region back-compat path still pins the region (config.region).
-    assert "--region us-west-2" in exc.value.format_message()
+    assert "--region us-west-2" in _quota_error_message("MaxSpotInstanceCountExceeded", config, None)
 
 
 def test_launch_with_retry_capacity_error_carries_region_and_market():
@@ -1073,3 +1069,150 @@ def test_find_tagged_instances_no_cluster_tags():
     inst = find_tagged_instances(ec2, "aws-bootstrap-g4dn")[0]
     assert inst["ClusterId"] == ""
     assert inst["Rank"] is None
+
+
+# ---------------------------------------------------------------------------
+# Security-group SSH ingress on reuse
+# ---------------------------------------------------------------------------
+
+
+def _sg_client(permissions, *, owned=True):
+    """A client whose SG lookup hits an existing group. ``owned`` controls whether
+    it carries this tool's created-by tag — the gate on mutating its ingress."""
+    ec2 = MagicMock()
+    ec2.describe_vpcs.return_value = {"Vpcs": [{"VpcId": "vpc-1"}]}
+    tags = [{"Key": TAG_CREATED_BY, "Value": "tv"}] if owned else [{"Key": "Name", "Value": "someone-elses-sg"}]
+    ec2.describe_security_groups.return_value = {
+        "SecurityGroups": [{"GroupId": "sg-1", "IpPermissions": permissions, "Tags": tags}]
+    }
+    return ec2
+
+
+_SSH_22 = [{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]
+
+
+def test_reused_sg_opens_a_port_it_is_missing():
+    """Regression: --ssh-port against an existing SG left it with no ingress,
+    surfacing only much later as an opaque 'SSH never became available'."""
+    ec2 = _sg_client(_SSH_22)
+    assert ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=2222) == "sg-1"
+    ec2.authorize_security_group_ingress.assert_called_once()
+    perm = ec2.authorize_security_group_ingress.call_args.kwargs["IpPermissions"][0]
+    assert perm["FromPort"] == perm["ToPort"] == 2222
+
+
+def test_reused_sg_does_not_re_add_an_existing_rule():
+    ec2 = _sg_client(_SSH_22)
+    assert ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22) == "sg-1"
+    ec2.authorize_security_group_ingress.assert_not_called()
+
+
+def test_reused_sg_accepts_a_port_range_that_covers_the_port():
+    ec2 = _sg_client([{"IpProtocol": "tcp", "FromPort": 20, "ToPort": 30, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
+    ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22)
+    ec2.authorize_security_group_ingress.assert_not_called()
+
+
+def test_reused_sg_ignores_a_rule_for_a_different_cidr():
+    """A rule open only to some other CIDR does not make our port reachable."""
+    ec2 = _sg_client([{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}])
+    ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22)
+    ec2.authorize_security_group_ingress.assert_called_once()
+
+
+def test_reused_sg_tolerates_a_concurrent_duplicate_add():
+    ec2 = _sg_client([])
+    ec2.authorize_security_group_ingress.side_effect = _make_client_error("InvalidPermission.Duplicate")
+    assert ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22) == "sg-1"
+
+
+def test_reused_sg_propagates_an_unexpected_authorize_error():
+    ec2 = _sg_client([])
+    ec2.authorize_security_group_ingress.side_effect = _make_client_error("UnauthorizedOperation")
+    with pytest.raises(botocore.exceptions.ClientError):
+        ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22)
+
+
+# ---------------------------------------------------------------------------
+# Terminate ownership guard
+# ---------------------------------------------------------------------------
+
+
+def _describe_owned(*instance_ids):
+    ec2 = MagicMock()
+    ec2.get_paginator.return_value.paginate.return_value = [
+        {"Reservations": [{"Instances": [{"InstanceId": i} for i in instance_ids]}]}
+    ]
+    return ec2
+
+
+def test_find_unowned_instances_flags_untagged_ids():
+    ec2 = _describe_owned("i-mine")
+    assert find_unowned_instances(ec2, ["i-mine", "i-theirs"], TAG_VALUE) == ["i-theirs"]
+
+
+def test_find_unowned_instances_empty_when_all_owned():
+    ec2 = _describe_owned("i-a", "i-b")
+    assert find_unowned_instances(ec2, ["i-a", "i-b"], TAG_VALUE) == []
+
+
+def test_find_unowned_instances_flags_ids_absent_from_the_region():
+    """Nothing tagged in this region -> every id is unowned (likely wrong --region)."""
+    ec2 = _describe_owned()
+    assert find_unowned_instances(ec2, ["i-a"], TAG_VALUE) == ["i-a"]
+
+
+def test_find_unowned_instances_short_circuits_on_empty_input():
+    ec2 = MagicMock()
+    assert find_unowned_instances(ec2, [], TAG_VALUE) == []
+    ec2.get_paginator.assert_not_called()
+
+
+def test_find_unowned_instances_filters_by_the_created_by_tag():
+    ec2 = _describe_owned("i-a")
+    find_unowned_instances(ec2, ["i-a"], TAG_VALUE)
+    kwargs = ec2.get_paginator.return_value.paginate.call_args.kwargs
+    assert kwargs["Filters"] == [{"Name": f"tag:{TAG_CREATED_BY}", "Values": [TAG_VALUE]}]
+    # Passing InstanceIds would make AWS raise for any id it has never seen,
+    # which is precisely the case this check exists to answer.
+    assert "InstanceIds" not in kwargs
+
+
+def test_reused_sg_never_widens_a_group_this_tool_did_not_create():
+    """`--security-group` is user-supplied and the lookup matches on name + VPC
+    alone, so a pre-existing restricted group can share the name. Punching
+    0.0.0.0/0 into it would be a security change nobody asked for."""
+    ec2 = _sg_client(
+        [{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}],
+        owned=False,
+    )
+    assert ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=2222) == "sg-1"
+    ec2.authorize_security_group_ingress.assert_not_called()
+
+
+def test_unowned_sg_without_ingress_warns_with_the_exact_command(capsys):
+    ec2 = _sg_client([], owned=False)
+    ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=2222)
+    err = capsys.readouterr().err
+    assert "not tagged" in err
+    assert "authorize-security-group-ingress --group-id sg-1" in err
+    assert "--port 2222" in err
+
+
+def test_unowned_sg_that_already_has_ingress_is_silent():
+    """Nothing to do and nothing to warn about — the port is already reachable."""
+    ec2 = _sg_client(_SSH_22, owned=False)
+    ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=22)
+    ec2.authorize_security_group_ingress.assert_not_called()
+
+
+def test_find_unowned_instances_paginates():
+    """A truncated page would misclassify an owned instance as unowned and
+    refuse a legitimate terminate."""
+    ec2 = MagicMock()
+    ec2.get_paginator.return_value.paginate.return_value = [
+        {"Reservations": [{"Instances": [{"InstanceId": "i-page1"}]}]},
+        {"Reservations": [{"Instances": [{"InstanceId": "i-page2"}]}]},
+    ]
+    assert find_unowned_instances(ec2, ["i-page1", "i-page2"], TAG_VALUE) == []
+    ec2.get_paginator.assert_called_once_with("describe_instances")

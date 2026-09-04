@@ -5,7 +5,10 @@ import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
-from aws_bootstrap.ssh import run_on_host, scp_to_host
+import pytest
+
+from aws_bootstrap.constants import SSH_CONNECT_TIMEOUT
+from aws_bootstrap.ssh import _port_opts, _ssh_opts, run_on_host, scp_to_host
 
 
 KEY = Path("/home/user/.ssh/id_ed25519.pub")
@@ -58,3 +61,35 @@ def test_scp_to_host_failure_returns_false(tmp_path):
     with patch("aws_bootstrap.ssh.subprocess.run", return_value=completed):
         ok = scp_to_host("1.2.3.4", "ubuntu", KEY, local, "/tmp/f.py")
     assert ok is False
+
+
+def test_ssh_opts_are_non_interactive_and_bounded():
+    """BatchMode keeps ssh/scp from blocking forever on a password prompt when
+    the key does not match; ConnectTimeout bounds an unreachable host."""
+    opts = _ssh_opts(Path("/k/id_ed25519.pub"))
+    assert "BatchMode=yes" in opts
+    assert f"ConnectTimeout={SSH_CONNECT_TIMEOUT}" in opts
+    assert "/k/id_ed25519" in opts  # .pub stripped
+
+
+def test_ssh_opts_connect_timeout_is_overridable():
+    """ssh honors the FIRST -o occurrence, so a caller-specific timeout has to
+    be threaded through here rather than appended after these options."""
+    assert "ConnectTimeout=45" in _ssh_opts(Path("/k/id_ed25519"), connect_timeout=45)
+
+
+@pytest.mark.parametrize(
+    ("tool", "port", "expected"),
+    [("ssh", 22, []), ("scp", 22, []), ("ssh", 2222, ["-p", "2222"]), ("scp", 2222, ["-P", "2222"])],
+)
+def test_port_opts(tool, port, expected):
+    assert _port_opts(tool, port) == expected
+
+
+def test_scp_to_host_times_out_instead_of_hanging(tmp_path):
+    """Regression: scp had no timeout, so one wedged transfer stalled the whole
+    cluster fan-out indefinitely."""
+    src = tmp_path / "f.txt"
+    src.write_text("x")
+    with patch("subprocess.run", side_effect=subprocess.TimeoutExpired("scp", 5)):
+        assert scp_to_host("1.2.3.4", "ubuntu", tmp_path / "k", src, "/tmp/f.txt") is False

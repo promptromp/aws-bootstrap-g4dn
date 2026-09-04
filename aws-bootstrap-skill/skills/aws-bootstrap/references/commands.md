@@ -63,6 +63,7 @@ aws-bootstrap launch [OPTIONS]
 **Normal launch:**
 ```json
 {
+  "status": "ready",
   "instance_id": "i-0abc123def456",
   "public_ip": "54.200.1.2",
   "instance_type": "g4dn.xlarge",
@@ -81,7 +82,26 @@ aws-bootstrap launch [OPTIONS]
 }
 ```
 
-The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id` is used. `cuda_version` is present only when remote setup ran and a CUDA version was detected (omitted with `--no-setup` or on non-CUDA/smoke-test instances). `region` is the region the instance actually launched in; `regions_tried` lists all regions attempted in order.
+`status` is the outcome discriminator, present on every non-dry-run `launch` result: `"ready"` on success, `"no-public-ip"` or `"ssh-unavailable"` on an **incomplete launch**. The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id` is used. `cuda_version` is present only when remote setup ran and a CUDA version was detected (omitted with `--no-setup` or on non-CUDA/smoke-test instances). `region` is the region the instance actually launched in; `regions_tried` lists all regions attempted in order.
+
+**Incomplete launch** (exit code 1 — the instance **exists and is billing**, but is unusable):
+```json
+{
+  "status": "ssh-unavailable",
+  "instance_id": "i-0abc123def456",
+  "public_ip": "54.200.1.2",
+  "instance_type": "g4dn.xlarge",
+  "availability_zone": "us-west-2a",
+  "region": "us-west-2",
+  "pricing": "spot",
+  "error": "SSH did not become available within the timeout."
+}
+```
+
+`status` is `"ssh-unavailable"` (instance up, SSH never answered) or `"no-public-ip"` (no
+public IP assigned — check VPC settings). Unlike other failures, stdout is **not** empty:
+the record carries the `instance_id` so the caller can retry the connection or terminate
+the instance rather than leaking it. Branch on `status`, not on the exit code alone.
 
 **Dry run:**
 ```json
@@ -189,12 +209,15 @@ aws-bootstrap terminate [OPTIONS] [INSTANCE_ID_OR_ALIAS]...
 
 Pass instance IDs (e.g. `i-abc123`) or SSH aliases (e.g. `aws-gpu1`) to terminate specific instances. Omit arguments to terminate all aws-bootstrap instances in the region.
 
+**Ownership guard:** explicitly-named instances are checked for the `created-by=aws-bootstrap-g4dn` tag before anything is terminated, and the command fails without terminating if any target lacks it (a wrong id — or the wrong `--region` — would otherwise destroy an unrelated instance). Pass `--force` to override. Terminating *all* instances needs no check: that path already selects by tag.
+
 ### Options
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--yes` / `-y` | flag | false | Skip confirmation prompt (required for `--output json/yaml/table`) |
 | `--keep-ebs` | flag | false | Preserve EBS data volumes instead of deleting |
+| `--force` | flag | false | Terminate explicitly-named instances even without the `created-by` tag |
 
 ### JSON Output
 
@@ -682,6 +705,7 @@ Terminate all nodes of a cluster, remove their SSH aliases, wait for full termin
 
 ## Notes
 
+- **Cluster execution commands** (`prepare`, `test`, `run`) require **every** node to be `running`; they fail with an actionable error if any node is `stopped`/`shutting-down` (a distributed job needs all ranks at the rendezvous, and a reclaimed rank 0 would hang the whole job). `cluster status` still reports every non-terminated node — it is the diagnostic view.
 - **SSH aliases** use sequential numbering (`aws-gpu1`, `aws-gpu2`, etc.) and are managed in `~/.ssh/config`; cluster nodes use deterministic `aws-<cluster-id>-<rank>` aliases (e.g. `aws-ml1-0`)
 - **EBS volumes** are tagged with `created-by=aws-bootstrap-g4dn` for automatic discovery
 - **Spot capacity**: on a fully-exhausted spot sweep (`InsufficientInstanceCapacity` in every `--region`) **without `--wait`**, the launcher offers the on-demand fallback (auto-confirmed in structured modes). With `--wait` it retries with backoff and hard-fails on timeout (never auto-buys on-demand). Quota errors and `SpotMaxPriceTooLow` are **not** auto-fallback triggers — in multi-region mode they warn and skip to the next region, hard-failing only when every region is blocked.

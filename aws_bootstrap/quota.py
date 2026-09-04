@@ -50,9 +50,6 @@ QUOTA_FAMILY_LABELS: dict[str, str] = {
 
 DEFAULT_FAMILY = "gvt"
 
-# Legacy convenience mapping for the default (gvt) family
-QUOTA_TYPES: dict[str, str] = QUOTA_FAMILIES[DEFAULT_FAMILY]
-
 
 def get_quota(sq_client, quota_code: str) -> dict:
     """Get current value for a single service quota.
@@ -87,11 +84,6 @@ def get_family_quotas(sq_client, family: str) -> list[dict]:
         q["family"] = family
         results.append(q)
     return results
-
-
-def get_all_gvt_quotas(sq_client) -> list[dict]:
-    """Get both spot and on-demand G/VT vCPU quotas (convenience wrapper)."""
-    return get_family_quotas(sq_client, DEFAULT_FAMILY)
 
 
 def request_quota_increase(sq_client, quota_code: str, desired_value: float) -> dict:
