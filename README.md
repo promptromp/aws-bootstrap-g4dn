@@ -359,6 +359,11 @@ aws-bootstrap terminate aws-gpu1 i-def456
 # Skip confirmation prompt
 aws-bootstrap terminate --yes
 
+# Named instances are checked for the created-by tag first, so a wrong ID (or the
+# wrong --region) can't destroy an unrelated instance. --force overrides the check.
+aws-bootstrap terminate i-notmine        # -> refuses, explains why
+aws-bootstrap terminate i-notmine --force
+
 # Sync ~/.ssh/config with live instances across ALL regions
 # (removes stale aliases left by spot reclaims / out-of-band terminations).
 aws-bootstrap cleanup
@@ -406,6 +411,7 @@ Key behaviors:
 - New volumes are formatted as ext4; existing volumes are mounted as-is
 - Volumes are tagged for automatic discovery by `status` and `terminate`
 - `terminate` deletes data volumes by default; use `--keep-ebs` to preserve them
+- **Ownership guard** — `terminate` with explicit instance IDs/aliases verifies each target carries the `created-by=aws-bootstrap-g4dn` tag and refuses (without terminating anything) if one doesn't; `--force` overrides. Terminating *all* instances already selects by tag, so it skips the check
 - **Orphan visibility** — `status` always reports orphaned data volumes (detached, linked instance gone) with size, region, and an estimated monthly cost, plus reattach/delete commands — even when you have zero running instances. Orphans bill silently (~$0.08/GB-month for gp3), so this is your safety net after a spot reclaim or a forgotten `--keep-ebs`
 - **Orphan cleanup** — use `aws-bootstrap cleanup --include-ebs` to find and delete orphan volumes (e.g. from spot interruptions or forgotten `--keep-ebs` volumes). Use `--dry-run` to preview
 - **Spot-safe** — data volumes survive spot interruptions. If AWS reclaims your instance, the volume detaches automatically and can be reattached to a new instance with `--ebs-volume-id`

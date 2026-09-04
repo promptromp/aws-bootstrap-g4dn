@@ -4,16 +4,18 @@ from __future__ import annotations
 import os
 import stat
 from pathlib import Path
+from unittest.mock import patch
+
+import pytest
 
 from aws_bootstrap.ssh import (
     _is_instance_id,
     _next_alias,
     _read_ssh_config,
+    _write_ssh_config,
     add_ssh_host,
-    cleanup_stale_ssh_hosts,
     find_drifted_ssh_hosts,
     find_missing_ssh_hosts,
-    find_ssh_alias,
     find_stale_ssh_hosts,
     get_ssh_host_details,
     list_ssh_hosts,
@@ -216,19 +218,6 @@ def test_add_idempotent_preserves_alias(tmp_path):
 # ---------------------------------------------------------------------------
 # Lookup
 # ---------------------------------------------------------------------------
-
-
-def test_find_alias_returns_alias(tmp_path):
-    cfg = _config_path(tmp_path)
-    add_ssh_host("i-abc123", "1.2.3.4", "ubuntu", KEY_PATH, config_path=cfg)
-    assert find_ssh_alias("i-abc123", config_path=cfg) == "aws-gpu1"
-
-
-def test_find_alias_returns_none(tmp_path):
-    cfg = _config_path(tmp_path)
-    cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text("")
-    assert find_ssh_alias("i-missing", config_path=cfg) is None
 
 
 def test_list_hosts_returns_all(tmp_path):
@@ -452,41 +441,6 @@ def test_find_stale_ssh_hosts_empty_config(tmp_path):
     assert stale == []
 
 
-def test_cleanup_stale_ssh_hosts_removes(tmp_path):
-    cfg = _config_path(tmp_path)
-    add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
-    add_ssh_host("i-222bbbb2", "2.2.2.2", "ubuntu", KEY_PATH, config_path=cfg)
-    results = cleanup_stale_ssh_hosts({"i-111aaaa1"}, config_path=cfg)
-    assert len(results) == 1
-    assert results[0].instance_id == "i-222bbbb2"
-    assert results[0].alias == "aws-gpu2"
-    assert results[0].removed is True
-    # Verify it was actually removed from the config
-    content = cfg.read_text()
-    assert "i-222bbbb2" not in content
-    assert "i-111aaaa1" in content
-
-
-def test_cleanup_stale_ssh_hosts_dry_run(tmp_path):
-    cfg = _config_path(tmp_path)
-    add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
-    add_ssh_host("i-222bbbb2", "2.2.2.2", "ubuntu", KEY_PATH, config_path=cfg)
-    results = cleanup_stale_ssh_hosts({"i-111aaaa1"}, config_path=cfg, dry_run=True)
-    assert len(results) == 1
-    assert results[0].removed is False
-    # Verify config is unchanged
-    content = cfg.read_text()
-    assert "i-222bbbb2" in content
-    assert "i-111aaaa1" in content
-
-
-def test_cleanup_stale_ssh_hosts_no_stale(tmp_path):
-    cfg = _config_path(tmp_path)
-    add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
-    results = cleanup_stale_ssh_hosts({"i-111aaaa1"}, config_path=cfg)
-    assert results == []
-
-
 def test_add_ssh_host_explicit_alias(tmp_path):
     cfg = _config_path(tmp_path)
     alias = add_ssh_host("i-123abcde", "1.2.3.4", "ubuntu", KEY_PATH, config_path=cfg, alias="aws-ml1-0")
@@ -529,3 +483,59 @@ def test_find_drifted_none_when_ip_matches(tmp_path):
     add_ssh_host("i-1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
     live = [{"InstanceId": "i-1", "PublicIp": "1.1.1.1"}]
     assert find_drifted_ssh_hosts(live, config_path=cfg) == []
+
+
+# ---------------------------------------------------------------------------
+# Atomic write: the error path must surface the real cause
+# ---------------------------------------------------------------------------
+
+
+def test_write_ssh_config_surfaces_the_real_failure(tmp_path):
+    """Regression: the cleanup handler called os.get_inheritable() on an
+    already-closed fd, replacing the real error with 'Bad file descriptor'."""
+    cfg = tmp_path / "config"
+    with (
+        patch("os.replace", side_effect=PermissionError("read-only fs")),
+        pytest.raises(PermissionError, match="read-only fs"),
+    ):
+        _write_ssh_config(cfg, "Host x\n")
+
+
+def test_write_ssh_config_removes_the_temp_file_on_failure(tmp_path):
+    cfg = tmp_path / "config"
+    with patch("os.replace", side_effect=PermissionError("read-only fs")), pytest.raises(PermissionError):
+        _write_ssh_config(cfg, "Host x\n")
+    assert list(tmp_path.glob(".ssh_config_tmp_*")) == []
+
+
+def test_write_ssh_config_writes_content_and_mode(tmp_path):
+    cfg = tmp_path / "config"
+    _write_ssh_config(cfg, "Host x\n")
+    assert cfg.read_text() == "Host x\n"
+    assert cfg.stat().st_mode & 0o777 == 0o600
+
+
+# ---------------------------------------------------------------------------
+# Blank-line separation before an appended block
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("existing", "expected_prefix"),
+    [
+        ("", ""),
+        ("Host other\n  HostName 9.9.9.9", "Host other\n  HostName 9.9.9.9\n\n"),
+        ("Host other\n", "Host other\n\n"),
+        ("Host other\n\n", "Host other\n\n"),
+    ],
+    ids=["empty", "no-trailing-newline", "one-newline", "already-blank-line"],
+)
+def test_add_ssh_host_separates_block_with_exactly_one_blank_line(tmp_path, existing, expected_prefix):
+    cfg = _config_path(tmp_path)
+    if existing:
+        cfg.parent.mkdir(parents=True, exist_ok=True)
+        cfg.write_text(existing)
+    add_ssh_host("i-111aaaa1", "1.1.1.1", "ubuntu", KEY_PATH, config_path=cfg)
+    content = cfg.read_text()
+    assert content.startswith(expected_prefix)
+    assert "\n\n\n" not in content

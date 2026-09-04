@@ -8,6 +8,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from aws_bootstrap import cluster
+from aws_bootstrap.cluster import master_addr
 from aws_bootstrap.config import LaunchConfig
 from aws_bootstrap.ec2 import RegionContext, RegionLaunch
 
@@ -410,3 +411,9 @@ def test_run_canary_still_passes_after_refactor():
     )
     assert all(r.returncode == 0 for r in results)
     assert all("cluster_canary.py" in c for c in ran)
+
+
+def test_master_addr_rejects_an_empty_node_list():
+    """Better than the bare ValueError min() used to raise from inside a sort key."""
+    with pytest.raises(ValueError, match="no cluster nodes"):
+        master_addr([])

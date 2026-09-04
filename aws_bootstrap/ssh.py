@@ -1,6 +1,7 @@
 """SSH key pair management and SSH config management for EC2 instances."""
 
 from __future__ import annotations
+import contextlib
 import hashlib
 import os
 import re
@@ -17,6 +18,7 @@ from .constants import (
     ALIAS_PREFIX,
     EBS_MOUNT_POINT,
     RES_KEY_PAIR,
+    SCP_TIMEOUT,
     SSH_CONNECT_TIMEOUT,
     SSH_PORT_DEFAULT,
     TAG_CREATED_BY,
@@ -94,16 +96,33 @@ def private_key_path(key_path: Path) -> Path:
     return key_path.with_suffix("") if key_path.suffix == ".pub" else key_path
 
 
-def _ssh_opts(key_path: Path) -> list[str]:
-    """Build common SSH/SCP options: suppress host-key checking and specify identity."""
+def _ssh_opts(key_path: Path, connect_timeout: int = SSH_CONNECT_TIMEOUT) -> list[str]:
+    """Common ssh/scp options: no host-key prompts, never block on a password
+    prompt (``BatchMode``), and a bounded connect time.
+
+    ``BatchMode=yes`` matters for the non-interactive callers: without it an
+    unreachable or key-mismatched host makes ssh/scp sit on a password prompt
+    forever with its stdin inherited from the CLI.
+    """
     return [
         "-o",
         "StrictHostKeyChecking=no",
         "-o",
         "UserKnownHostsFile=/dev/null",
+        "-o",
+        "BatchMode=yes",
+        "-o",
+        f"ConnectTimeout={connect_timeout}",
         "-i",
         str(private_key_path(key_path)),
     ]
+
+
+def _port_opts(tool: str, port: int) -> list[str]:
+    """Port flag for ``ssh`` (``-p``) or ``scp`` (``-P``); empty on the default port."""
+    if port == SSH_PORT_DEFAULT:
+        return []
+    return ["-P" if tool == "scp" else "-p", str(port)]
 
 
 def import_key_pair(ec2_client, key_name: str, key_path: Path) -> str:
@@ -198,7 +217,7 @@ def wait_for_ssh(
     an opaque "not ready".
     """
     base_opts = _ssh_opts(key_path)
-    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
+    port_opts = _port_opts("ssh", port)
     last_err = ""
 
     for attempt in range(1, retries + 1):
@@ -213,18 +232,14 @@ def wait_for_ssh(
             continue
 
         # Port is open, try actual SSH
-        cmd = [
-            "ssh",
-            *base_opts,
-            *port_opts,
-            "-o",
-            f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
-            "-o",
-            "BatchMode=yes",
-            f"{user}@{host}",
-            "echo ok",
-        ]
-        result = subprocess.run(cmd, capture_output=True, text=True)
+        cmd = ["ssh", *base_opts, *port_opts, f"{user}@{host}", "echo ok"]
+        try:
+            result = subprocess.run(cmd, capture_output=True, text=True, timeout=SSH_CONNECT_TIMEOUT + 5)
+        except subprocess.TimeoutExpired:
+            last_err = f"ssh probe timed out after {SSH_CONNECT_TIMEOUT + 5}s"
+            echo("  SSH not ready " + click.style(f"(attempt {attempt}/{retries})", dim=True) + ", waiting...")
+            time.sleep(delay)
+            continue
         if result.returncode == 0:
             secho("  SSH connection established.", fg="green")
             return True
@@ -254,6 +269,19 @@ def wait_for_ssh(
     return False
 
 
+# Files SCP'd to /tmp on the instance before ``remote_setup.sh`` runs; the
+# script picks them up from there. Names are relative to the resources dir.
+SETUP_PAYLOAD: tuple[str, ...] = (
+    "requirements.txt",
+    "gpu_benchmark.py",
+    "gpu_smoke_test.ipynb",
+    "saxpy.cu",
+    "triton_vector_add.py",
+    "launch.json",
+    "tasks.json",
+)
+
+
 def run_remote_setup(
     host: str,
     user: str,
@@ -262,114 +290,26 @@ def run_remote_setup(
     python_version: str | None = None,
     port: int = SSH_PORT_DEFAULT,
 ) -> bool:
-    """SCP the setup script and requirements.txt to the instance and execute."""
-    ssh_opts = _ssh_opts(key_path)
-    scp_port_opts = ["-P", str(port)] if port != SSH_PORT_DEFAULT else []
-    ssh_port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
-    requirements_path = script_path.parent / "requirements.txt"
+    """SCP the setup payload + script to the instance and execute the script.
 
-    # SCP the requirements file
-    echo("  Uploading requirements.txt...")
-    req_result = subprocess.run(
-        ["scp", *ssh_opts, *scp_port_opts, str(requirements_path), f"{user}@{host}:/tmp/requirements.txt"],
-        capture_output=True,
-        text=True,
-    )
-    if req_result.returncode != 0:
-        secho(f"  SCP failed: {req_result.stderr}", fg="red", err=True)
-        return False
-
-    # SCP the GPU benchmark script
-    benchmark_path = script_path.parent / "gpu_benchmark.py"
-    echo("  Uploading gpu_benchmark.py...")
-    bench_result = subprocess.run(
-        ["scp", *ssh_opts, *scp_port_opts, str(benchmark_path), f"{user}@{host}:/tmp/gpu_benchmark.py"],
-        capture_output=True,
-        text=True,
-    )
-    if bench_result.returncode != 0:
-        secho(f"  SCP failed: {bench_result.stderr}", fg="red", err=True)
-        return False
-
-    # SCP the GPU smoke test notebook
-    notebook_path = script_path.parent / "gpu_smoke_test.ipynb"
-    echo("  Uploading gpu_smoke_test.ipynb...")
-    nb_result = subprocess.run(
-        ["scp", *ssh_opts, *scp_port_opts, str(notebook_path), f"{user}@{host}:/tmp/gpu_smoke_test.ipynb"],
-        capture_output=True,
-        text=True,
-    )
-    if nb_result.returncode != 0:
-        secho(f"  SCP failed: {nb_result.stderr}", fg="red", err=True)
-        return False
-
-    # SCP the CUDA example source
-    saxpy_path = script_path.parent / "saxpy.cu"
-    echo("  Uploading saxpy.cu...")
-    saxpy_result = subprocess.run(
-        ["scp", *ssh_opts, *scp_port_opts, str(saxpy_path), f"{user}@{host}:/tmp/saxpy.cu"],
-        capture_output=True,
-        text=True,
-    )
-    if saxpy_result.returncode != 0:
-        secho(f"  SCP failed: {saxpy_result.stderr}", fg="red", err=True)
-        return False
-
-    # SCP the Triton vector add example
-    triton_path = script_path.parent / "triton_vector_add.py"
-    echo("  Uploading triton_vector_add.py...")
-    triton_result = subprocess.run(
-        ["scp", *ssh_opts, *scp_port_opts, str(triton_path), f"{user}@{host}:/tmp/triton_vector_add.py"],
-        capture_output=True,
-        text=True,
-    )
-    if triton_result.returncode != 0:
-        secho(f"  SCP failed: {triton_result.stderr}", fg="red", err=True)
-        return False
-
-    # SCP the VSCode launch.json
-    launch_json_path = script_path.parent / "launch.json"
-    echo("  Uploading launch.json...")
-    launch_result = subprocess.run(
-        ["scp", *ssh_opts, *scp_port_opts, str(launch_json_path), f"{user}@{host}:/tmp/launch.json"],
-        capture_output=True,
-        text=True,
-    )
-    if launch_result.returncode != 0:
-        secho(f"  SCP failed: {launch_result.stderr}", fg="red", err=True)
-        return False
-
-    # SCP the VSCode tasks.json
-    tasks_json_path = script_path.parent / "tasks.json"
-    echo("  Uploading tasks.json...")
-    tasks_result = subprocess.run(
-        ["scp", *ssh_opts, *scp_port_opts, str(tasks_json_path), f"{user}@{host}:/tmp/tasks.json"],
-        capture_output=True,
-        text=True,
-    )
-    if tasks_result.returncode != 0:
-        secho(f"  SCP failed: {tasks_result.stderr}", fg="red", err=True)
-        return False
-
-    # SCP the script
-    echo("  Uploading remote_setup.sh...")
-    scp_result = subprocess.run(
-        ["scp", *ssh_opts, *scp_port_opts, str(script_path), f"{user}@{host}:/tmp/remote_setup.sh"],
-        capture_output=True,
-        text=True,
-    )
-    if scp_result.returncode != 0:
-        secho(f"  SCP failed: {scp_result.stderr}", fg="red", err=True)
-        return False
+    Every file in :data:`SETUP_PAYLOAD` (plus ``remote_setup.sh`` itself) is
+    copied to ``/tmp`` on the instance; the first failure aborts. Returns True
+    if the remote script exited 0.
+    """
+    resources = script_path.parent
+    for name in (*SETUP_PAYLOAD, script_path.name):
+        echo(f"  Uploading {name}...")
+        if not scp_to_host(host, user, key_path, resources / name, f"/tmp/{name}", port=port):
+            return False
 
     # Execute the script, passing PYTHON_VERSION as an inline env var if specified
     echo("  Running remote_setup.sh on instance...")
-    remote_cmd = "chmod +x /tmp/remote_setup.sh && "
+    remote_cmd = f"chmod +x /tmp/{script_path.name} && "
     if python_version:
         remote_cmd += f"PYTHON_VERSION={python_version} "
-    remote_cmd += "/tmp/remote_setup.sh"
+    remote_cmd += f"/tmp/{script_path.name}"
     ssh_result = subprocess.run(
-        ["ssh", *ssh_opts, *ssh_port_opts, f"{user}@{host}", remote_cmd],
+        ["ssh", *_ssh_opts(key_path), *_port_opts("ssh", port), f"{user}@{host}", remote_cmd],
         capture_output=False,
     )
     return ssh_result.returncode == 0
@@ -397,13 +337,17 @@ def _write_ssh_config(config_path: Path, content: str) -> None:
 
     fd, tmp = tempfile.mkstemp(dir=str(ssh_dir), prefix=".ssh_config_tmp_")
     try:
-        os.write(fd, content.encode())
-        os.close(fd)
+        # `with os.fdopen(...)` closes fd exactly once, on both the success and
+        # the error path. The previous hand-rolled cleanup called
+        # os.get_inheritable() on an already-closed fd, which raised
+        # "Bad file descriptor" *over* the real failure (e.g. a chmod/replace
+        # PermissionError) and left the temp file behind.
+        with os.fdopen(fd, "wb") as fh:
+            fh.write(content.encode())
         os.chmod(tmp, 0o600)
         os.replace(tmp, str(config_path))
     except BaseException:
-        os.close(fd) if not os.get_inheritable(fd) else None  # noqa: B018
-        if os.path.exists(tmp):
+        with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
 
@@ -477,11 +421,9 @@ def add_ssh_host(
     alias = alias or existing_alias or _next_alias(content, alias_prefix)
     stanza = _build_stanza(instance_id, alias, hostname, user, key_path, port=port)
 
-    # Ensure a blank line before our block if file has content
-    if content and not content.endswith("\n\n") and not content.endswith("\n"):
-        content += "\n\n"
-    elif content and not content.endswith("\n") or content and content.endswith("\n") and not content.endswith("\n\n"):
-        content += "\n"
+    # Separate our block from whatever precedes it with exactly one blank line.
+    if content and not content.endswith("\n\n"):
+        content += "\n" if content.endswith("\n") else "\n\n"
 
     content += stanza
     _write_ssh_config(config_path, content)
@@ -505,13 +447,6 @@ def remove_ssh_host(instance_id: str, config_path: Path | None = None) -> str | 
     content = _remove_block(content, instance_id)
     _write_ssh_config(config_path, content)
     return alias
-
-
-def find_ssh_alias(instance_id: str, config_path: Path | None = None) -> str | None:
-    """Read-only lookup of alias for a given instance ID."""
-    config_path = config_path or _DEFAULT_SSH_CONFIG
-    content = _read_ssh_config(config_path)
-    return _find_alias_in_content(content, instance_id)
 
 
 def list_ssh_hosts(config_path: Path | None = None) -> dict[str, str]:
@@ -579,25 +514,6 @@ def find_drifted_ssh_hosts(live_instances: list[dict], config_path: Path | None 
     return drifted
 
 
-def cleanup_stale_ssh_hosts(
-    live_instance_ids: set[str],
-    config_path: Path | None = None,
-    dry_run: bool = False,
-) -> list[CleanupResult]:
-    """Remove SSH config entries for terminated/non-existent instances.
-
-    If *dry_run* is ``True``, entries are identified but not removed.
-    Returns a list of :class:`CleanupResult` objects.
-    """
-    stale = find_stale_ssh_hosts(live_instance_ids, config_path)
-    results: list[CleanupResult] = []
-    for iid, alias in stale:
-        if not dry_run:
-            remove_ssh_host(iid, config_path)
-        results.append(CleanupResult(instance_id=iid, alias=alias, removed=not dry_run))
-    return results
-
-
 _INSTANCE_ID_RE = re.compile(r"^i-[0-9a-f]{8,17}$")
 
 
@@ -624,15 +540,6 @@ def resolve_instance_id(value: str, config_path: Path | None = None) -> str | No
         if alias == value:
             return iid
     return None
-
-
-@dataclass
-class CleanupResult:
-    """Result of cleaning up a single stale SSH config entry."""
-
-    instance_id: str
-    alias: str
-    removed: bool
 
 
 @dataclass
@@ -695,8 +602,8 @@ def query_gpu_info(
     Returns ``GpuInfo`` on success, or ``None`` if the SSH connection fails,
     ``nvidia-smi`` is unavailable, or the output is malformed.
     """
-    ssh_opts = _ssh_opts(key_path)
-    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
+    ssh_opts = _ssh_opts(key_path, connect_timeout=timeout)
+    port_opts = _port_opts("ssh", port)
     remote_cmd = (
         "nvidia-smi --query-gpu=driver_version,name,compute_cap --format=csv,noheader,nounits"
         " && nvidia-smi | grep -oP 'CUDA Version: \\K[\\d.]+'"
@@ -706,10 +613,6 @@ def query_gpu_info(
         "ssh",
         *ssh_opts,
         *port_opts,
-        "-o",
-        f"ConnectTimeout={timeout}",
-        "-o",
-        "BatchMode=yes",
         f"{user}@{host}",
         remote_cmd,
     ]
@@ -764,15 +667,11 @@ def query_cuda_version(
     Returns a version string like ``13.2``, or None if absent/unknown (e.g.
     ``--no-setup``, no CUDA detected, or the file isn't there yet).
     """
-    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
+    port_opts = _port_opts("ssh", port)
     cmd = [
         "ssh",
-        *_ssh_opts(key_path),
+        *_ssh_opts(key_path, connect_timeout=timeout),
         *port_opts,
-        "-o",
-        f"ConnectTimeout={timeout}",
-        "-o",
-        "BatchMode=yes",
         f"{user}@{host}",
         "cat ~/.aws-bootstrap-cuda 2>/dev/null",
     ]
@@ -805,15 +704,11 @@ def run_on_host(
     Returns ``(returncode, stdout, stderr)``. A timeout yields a non-zero code
     and an explanatory stderr rather than raising.
     """
-    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
+    port_opts = _port_opts("ssh", port)
     cmd = [
         "ssh",
         *_ssh_opts(key_path),
         *port_opts,
-        "-o",
-        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
-        "-o",
-        "BatchMode=yes",
         f"{user}@{host}",
         command,
     ]
@@ -832,11 +727,16 @@ def scp_to_host(
     remote_path: str,
     *,
     port: int = SSH_PORT_DEFAULT,
+    timeout: int = SCP_TIMEOUT,
 ) -> bool:
     """Copy a local file to a remote host via SCP. Returns True on success."""
-    port_opts = ["-P", str(port)] if port != SSH_PORT_DEFAULT else []
-    cmd = ["scp", *_ssh_opts(key_path), *port_opts, str(local_path), f"{user}@{host}:{remote_path}"]
-    result = subprocess.run(cmd, capture_output=True, text=True)
+    cmd = ["scp", *_ssh_opts(key_path), *_port_opts("scp", port), str(local_path), f"{user}@{host}:{remote_path}"]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        # Unbounded before: a wedged transfer stalled the whole cluster fan-out.
+        secho(f"  SCP to {host} timed out after {timeout}s", fg="red", err=True)
+        return False
     if result.returncode != 0:
         secho(f"  SCP to {host} failed: {result.stderr}", fg="red", err=True)
         return False
@@ -865,7 +765,7 @@ def mount_ebs_volume(
     Returns True on success, False on failure.
     """
     ssh_opts = _ssh_opts(key_path)
-    port_opts = ["-p", str(port)] if port != SSH_PORT_DEFAULT else []
+    port_opts = _port_opts("ssh", port)
 
     # Strip the vol- prefix and hyphen for NVMe serial matching
     vol_serial = volume_id.replace("-", "")
@@ -914,8 +814,6 @@ def mount_ebs_volume(
         "ssh",
         *ssh_opts,
         *port_opts,
-        "-o",
-        f"ConnectTimeout={SSH_CONNECT_TIMEOUT}",
         f"{user}@{host}",
         remote_script,
     ]

@@ -43,6 +43,7 @@ from .ec2 import (
     find_orphan_ebs_volumes_in_regions,
     find_tagged_instances,
     find_tagged_instances_in_regions,
+    find_unowned_instances,
     get_latest_ami,
     get_spot_price,
     instance_type_to_family,
@@ -545,13 +546,38 @@ def launch(
     step(2, total_steps, "Waiting for instance to be ready...")
     instance = wait_instance_ready(ec2, instance_id)
     public_ip = instance.get("PublicIpAddress")
+    az = instance["Placement"]["AvailabilityZone"]
+
+    def _incomplete(status: str, message: str) -> None:
+        """Report a launch that left a running-but-unusable instance.
+
+        The instance exists and is billing, so the id must reach the caller:
+        structured modes emit a partial record (``status`` != ``ready``) and the
+        command exits non-zero, instead of the earlier silent empty-stdout exit 0.
+        """
+        warn(message)
+        if not is_text(ctx):
+            emit(
+                {
+                    "status": status,
+                    "instance_id": instance_id,
+                    "public_ip": public_ip,
+                    "instance_type": config.instance_type,
+                    "availability_zone": az,
+                    "region": active_region,
+                    "pricing": pricing,
+                    "error": message,
+                },
+                ctx=ctx,
+            )
+
     if not public_ip:
-        warn(f"No public IP assigned. Instance ID: {instance_id}")
+        _incomplete("no-public-ip", f"No public IP assigned. Instance ID: {instance_id}")
         info("You may need to assign an Elastic IP or check your VPC settings.")
-        return
+        info(f"Terminate it with: aws-bootstrap terminate {instance_id} --region {active_region}")
+        ctx.exit(1)
 
     val("Public IP", public_ip)
-    az = instance["Placement"]["AvailabilityZone"]
 
     # Step 5.5 (optional): EBS data volume
     ebs_volume_attached = None
@@ -586,13 +612,14 @@ def launch(
     step(ssh_step, total_steps, "Waiting for SSH access...")
     private_key = private_key_path(config.key_path)
     if not wait_for_ssh(public_ip, config.ssh_user, config.key_path, port=config.ssh_port):
-        warn("SSH did not become available within the timeout.")
+        _incomplete("ssh-unavailable", "SSH did not become available within the timeout.")
         port_flag = f" -p {config.ssh_port}" if config.ssh_port != SSH_PORT_DEFAULT else ""
         info(
             f"Instance is running — try connecting manually:"
             f" ssh -i {private_key}{port_flag} {config.ssh_user}@{public_ip}"
         )
-        return
+        info(f"Or terminate it with: aws-bootstrap terminate {instance_id} --region {active_region}")
+        ctx.exit(1)
 
     cuda_version: str | None = None
     if config.run_setup:
@@ -638,6 +665,7 @@ def launch(
     # Structured output for non-text modes
     if not is_text(ctx):
         result_data: dict = {
+            "status": "ready",
             "instance_id": instance_id,
             "public_ip": public_ip,
             "instance_type": config.instance_type,
@@ -1028,9 +1056,15 @@ def status(ctx, region, profile, gpu, instructions):
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.option("--yes", "-y", is_flag=True, default=False, help="Skip confirmation prompt.")
 @click.option("--keep-ebs", is_flag=True, default=False, help="Preserve EBS data volumes instead of deleting them.")
+@click.option(
+    "--force",
+    is_flag=True,
+    default=False,
+    help="Terminate explicitly-named instances even if they are not tagged as created by aws-bootstrap.",
+)
 @click.argument("instance_ids", nargs=-1, metavar="[INSTANCE_ID_OR_ALIAS]...")
 @click.pass_context
-def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
+def terminate(ctx, region, profile, yes, keep_ebs, force, instance_ids):
     """Terminate instances created by aws-bootstrap.
 
     Pass specific instance IDs or SSH aliases (e.g. aws-gpu1) to terminate,
@@ -1059,6 +1093,18 @@ def terminate(ctx, region, profile, yes, keep_ebs, instance_ids):
             if resolved != value:
                 info(f"Resolved alias '{value}' -> {resolved}")
             targets.append(resolved)
+        # An explicit id is accepted verbatim, so without this check a typo (or
+        # an agent passing the wrong id) terminates an unrelated instance. Only
+        # instances this tool tagged are ours to destroy.
+        if not force:
+            unowned = find_unowned_instances(ec2, targets, TAG_VALUE)
+            if unowned:
+                raise CLIError(
+                    "Refusing to terminate instance(s) not created by aws-bootstrap:\n"
+                    + "\n".join(f"    - {i}" for i in unowned)
+                    + f"\n\n  They carry no '{TAG_CREATED_BY}={TAG_VALUE}' tag (or do not exist in {region}).\n"
+                    "  Check the --region, or pass --force to terminate them anyway."
+                )
     else:
         instances = find_tagged_instances(ec2, TAG_VALUE)
         if not instances:
@@ -2135,6 +2181,38 @@ def cluster_terminate(ctx, cluster_id, region, profile, yes):
     emit({"cluster_id": cluster_id, "region": resolved, "terminated": instance_ids}, ctx=ctx)
 
 
+def _running_cluster_nodes(ec2, cluster_id: str, region: str) -> list[dict]:
+    """Nodes of *cluster_id* that can actually take work, or a clear CLIError.
+
+    ``find_cluster_instances`` deliberately reports every non-terminated node so
+    ``status`` can show a stopped or shutting-down one. The execution commands
+    (``prepare``/``test``/``run``) must not: a spot-reclaimed rank 0 would still
+    be handed to ``master_addr``, and every node would then hang waiting to
+    rendezvous against an IP that is going away.
+    """
+    nodes = find_cluster_instances(ec2, cluster_id)
+    if not nodes:
+        raise CLIError(f"No nodes found for cluster '{cluster_id}' in {region}.")
+    running = [n for n in nodes if n["State"] == "running" and n["PrivateIp"]]
+    if not running:
+        states = ", ".join(f"rank {n['Rank']}={n['State']}" for n in nodes)
+        raise CLIError(
+            f"No running nodes in cluster '{cluster_id}' ({region}): {states}.\n"
+            f"  Check `aws-bootstrap cluster status --cluster-id {cluster_id}`."
+        )
+    if len(running) != len(nodes):
+        stale = ", ".join(f"rank {n['Rank']} ({n['State']})" for n in nodes if n not in running)
+        raise CLIError(
+            f"Cluster '{cluster_id}' has {len(nodes) - len(running)} node(s) not running: {stale}.\n"
+            "  A distributed job needs every node up — all ranks must reach the rendezvous.\n"
+            f"  Restore the cluster with:  aws-bootstrap cluster launch --cluster-id {cluster_id} "
+            f"--nodes {len(nodes)} --region {region}\n"
+            f"  Or tear it down with:      aws-bootstrap cluster terminate --cluster-id {cluster_id} "
+            f"--region {region} --yes"
+        )
+    return running
+
+
 def _canary_runners(user, key_path, ssh_port):
     """Build (scp_fn, run_fn) closures over the ssh primitives for cluster nodes."""
 
@@ -2161,9 +2239,7 @@ def cluster_test(ctx, cluster_id, region, profile, key_path, ssh_user, ssh_port)
     """Run the built-in distributed canary across the cluster (verify it works)."""
     resolved = resolve_single_region(region, profile)
     ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
-    nodes = find_cluster_instances(ec2, cluster_id)
-    if not nodes:
-        raise CLIError(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+    nodes = _running_cluster_nodes(ec2, cluster_id, resolved)
 
     key = Path(key_path).expanduser()
     scp_fn, run_fn = _canary_runners(ssh_user, key, ssh_port)
@@ -2208,9 +2284,7 @@ def cluster_prepare(ctx, cluster_id, region, profile, key_path, ssh_user, ssh_po
     """Verify a cluster (reachability, GPU, version consistency) and run a canary."""
     resolved = resolve_single_region(region, profile)
     ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
-    nodes = find_cluster_instances(ec2, cluster_id)
-    if not nodes:
-        raise CLIError(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+    nodes = _running_cluster_nodes(ec2, cluster_id, resolved)
     key = Path(key_path).expanduser()
     total = 2 if not no_canary else 1
 
@@ -2326,9 +2400,7 @@ def cluster_run(
 
     resolved = resolve_single_region(region, profile)
     ec2 = boto3.Session(profile_name=profile, region_name=resolved).client("ec2")
-    nodes = find_cluster_instances(ec2, cluster_id)
-    if not nodes:
-        raise CLIError(f"No nodes found for cluster '{cluster_id}' in {resolved}.")
+    nodes = _running_cluster_nodes(ec2, cluster_id, resolved)
 
     key = Path(key_path).expanduser()
     scp_fn, run_fn = _canary_runners(ssh_user, key, ssh_port)

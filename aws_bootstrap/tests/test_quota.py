@@ -12,7 +12,6 @@ from aws_bootstrap.quota import (
     QUOTA_CODE_ON_DEMAND,
     QUOTA_CODE_SPOT,
     QUOTA_FAMILIES,
-    get_all_gvt_quotas,
     get_family_quotas,
     get_quota,
     get_quota_request_history,
@@ -63,34 +62,6 @@ def test_get_quota_unknown_error_propagates():
 
 
 # ---------------------------------------------------------------------------
-# get_all_gvt_quotas
-# ---------------------------------------------------------------------------
-
-
-def test_get_all_gvt_quotas_returns_both_types():
-    sq = MagicMock()
-
-    def fake_get(ServiceCode, QuotaCode):
-        names = {
-            QUOTA_CODE_SPOT: "All G and VT Spot Instance Requests",
-            QUOTA_CODE_ON_DEMAND: "Running On-Demand G and VT instances",
-        }
-        return {
-            "Quota": {
-                "QuotaCode": QuotaCode,
-                "QuotaName": names[QuotaCode],
-                "Value": 4.0 if QuotaCode == QUOTA_CODE_SPOT else 0.0,
-            }
-        }
-
-    sq.get_service_quota.side_effect = fake_get
-    results = get_all_gvt_quotas(sq)
-    assert len(results) == 2
-    types = {r["quota_type"] for r in results}
-    assert types == {"spot", "on-demand"}
-    assert sq.get_service_quota.call_count == 2
-
-
 # ---------------------------------------------------------------------------
 # request_quota_increase
 # ---------------------------------------------------------------------------
@@ -251,25 +222,6 @@ def test_get_family_quotas_gvt():
     assert all(r["family"] == "gvt" for r in results)
     types = {r["quota_type"] for r in results}
     assert types == {"spot", "on-demand"}
-
-
-def test_get_all_gvt_quotas_delegates_to_get_family_quotas():
-    """get_all_gvt_quotas is a convenience wrapper for get_family_quotas('gvt')."""
-    sq = MagicMock()
-
-    def fake_get(ServiceCode, QuotaCode):
-        return {
-            "Quota": {
-                "QuotaCode": QuotaCode,
-                "QuotaName": "Test",
-                "Value": 4.0,
-            }
-        }
-
-    sq.get_service_quota.side_effect = fake_get
-    results = get_all_gvt_quotas(sq)
-    assert len(results) == 2
-    assert all(r["family"] == "gvt" for r in results)
 
 
 def test_quota_families_has_expected_keys():

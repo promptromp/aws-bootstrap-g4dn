@@ -1,15 +1,59 @@
 ---
 name: aws-bootstrap
 description: >
-  Use when the user wants to provision AWS GPU instances, check GPU instance status,
-  terminate instances, manage EBS data volumes, clean up cloud resources, check GPU vCPU
-  quotas, or request quota increases. Wraps the aws-bootstrap CLI for EC2 GPU instance
-  lifecycle management (launch, status, terminate, cleanup, list, quota).
+  Use when the user wants to provision AWS GPU instances (g4dn/g5/g6/p-series spot or
+  on-demand) for CUDA/PyTorch/ML work, check GPU instance status or cost, SSH into a
+  remote GPU box, terminate instances, manage EBS data volumes, clean up cloud
+  resources, check or request GPU vCPU quotas, or stand up and run a multi-node
+  distributed training cluster (torchrun / DDP / NCCL across several GPU nodes).
+  Wraps the aws-bootstrap CLI for EC2 GPU instance and cluster lifecycle management
+  (launch, status, terminate, cleanup, list, quota, cluster).
 ---
 
 # aws-bootstrap -- AWS GPU Instance Management
 
 You have access to the `aws-bootstrap` CLI tool for provisioning and managing AWS EC2 GPU instances. Use it via the Bash tool. **Always pass `-o json` before the subcommand** (e.g., `aws-bootstrap -o json status`) **when you need to parse results programmatically.** The `--output`/`-o` flag is a global option and must come before the command name — placing it after (e.g., `aws-bootstrap status -o json`) will fail.
+
+## Cost Safety (read this first)
+
+Every instance this tool launches **bills by the second until it is terminated**, and a
+GPU instance is not cheap (a g4dn.xlarge spot instance is roughly $0.15-0.25/hr; a
+p5.48xlarge on-demand is over $50/hr). Nothing here stops on its own.
+
+Hold to these rules:
+
+1. **Never launch without being asked to.** Provisioning is a spending decision — it is
+   the user's, not yours. Say what it will cost per hour before you launch.
+2. **Always confirm what you created.** After `launch`, read back the `instance_id` from
+   the JSON. If the command exits non-zero, an instance may *still* be running — see the
+   incomplete-launch contract below.
+3. **Terminate when the work is done**, and tell the user the instance is gone. If you
+   are leaving one up deliberately, say so explicitly and give the hourly cost.
+4. **Sweep for leaks before you finish a session**: `aws-bootstrap -o json status` lists
+   every live instance across all enabled regions *and* any orphaned EBS volumes (which
+   keep billing at ~$0.08/GB-month with no instance attached).
+5. **Prefer `--on-demand` only when asked.** Spot is the default and is 60-70% cheaper;
+   the tradeoff is that AWS can reclaim the instance. Data on `/data` survives that.
+6. **Beware the silent on-demand fallback**: without `--wait`, a `launch` whose spot pass
+   is exhausted **auto-buys on-demand in structured output modes** (there is no prompt to
+   answer). If you want spot or nothing, pass `--wait` — it retries with backoff and hard-
+   fails on timeout rather than upgrading your bill.
+
+## Exit Codes and Error Shape
+
+Check the exit code before parsing stdout.
+
+- **Exit 0** — success. stdout holds the JSON/YAML result.
+- **Non-zero** — failure. The message goes to **stderr** as `Error: ...`; stdout is
+  usually empty, so `json.loads(stdout)` will raise. Read stderr for the reason — it
+  carries actionable remediation (region-pinned quota commands, key-mismatch hints).
+- **`launch` is the exception**: an *incomplete* launch (instance created but unusable)
+  exits non-zero **and** writes a JSON record to stdout with `"status"` set to
+  `"no-public-ip"` or `"ssh-unavailable"`, plus the `instance_id`. **That instance is
+  running and billing** — either fix it or terminate it. A fully successful launch has
+  `"status": "ready"`. So: branch on `status`, not on exit code alone.
+- `cluster prepare` / `test` / `run` exit non-zero when any node fails, but still emit
+  their full result on stdout — read `succeeded` / `passed` and the per-node `returncode`s.
 
 ## Prerequisites
 
@@ -131,6 +175,13 @@ aws-bootstrap status --gpu
 aws-bootstrap -o json status
 ```
 
+With no `--region`, `status` queries **every region enabled for the account** (~20-30
+parallel API calls) — right for a leak sweep, wasteful in a poll loop. When you already
+know where the instance is, pin it: `aws-bootstrap -o json status -r us-west-2`.
+
+`status` always reports `orphan_volumes` (detached EBS volumes still billing) even when
+there are zero instances — check it before declaring an account clean.
+
 ### Connect to an Instance
 
 After launch, use the SSH alias printed in the output:
@@ -155,6 +206,10 @@ ssh aws-gpu1 '~/venv/bin/python ~/gpu_benchmark.py'
 ```bash
 # Terminate by alias
 aws-bootstrap terminate aws-gpu1
+
+# By instance ID (refused unless the instance carries this tool's created-by tag —
+# guards against a wrong id destroying an unrelated instance; --force overrides)
+aws-bootstrap -o json terminate --yes i-0abc123def456
 
 # Terminate all instances (with confirmation)
 aws-bootstrap terminate

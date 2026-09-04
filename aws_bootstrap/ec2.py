@@ -40,9 +40,9 @@ class CLIError(click.ClickException):
     """A ClickException that displays the error message in red."""
 
     def show(self, file=None):  # type: ignore[no-untyped-def]
-        if file is None:
-            file = click.get_text_stream("stderr")
-        click.secho(f"Error: {self.format_message()}", file=file, fg="red")
+        # `file=None` + `err=True` lets click resolve stderr itself; the explicit
+        # `click.get_text_stream("stderr")` it replaces is deprecated in Click 8.5.
+        click.secho(f"Error: {self.format_message()}", file=file, err=True, fg="red")
 
 
 # Well-known AMI owners by name prefix
@@ -86,6 +86,45 @@ def get_latest_ami(ec2_client, ami_filter: str) -> dict:
     return images[0]
 
 
+def _has_ssh_ingress(permissions: list[dict], ssh_port: int) -> bool:
+    """True if *permissions* already open *ssh_port* to :data:`SSH_INGRESS_CIDR`."""
+    for perm in permissions:
+        if perm.get("IpProtocol") != "tcp":
+            continue
+        from_port, to_port = perm.get("FromPort"), perm.get("ToPort")
+        if from_port is None or to_port is None or not (from_port <= ssh_port <= to_port):
+            continue
+        if any(r.get("CidrIp") == SSH_INGRESS_CIDR for r in perm.get("IpRanges", [])):
+            return True
+    return False
+
+
+def _ensure_ssh_ingress(ec2_client, sg_id: str, permissions: list[dict], ssh_port: int) -> None:
+    """Add the SSH ingress rule for *ssh_port* to *sg_id* if it isn't there yet.
+
+    Idempotent: a concurrent add (``InvalidPermission.Duplicate``) is success.
+    """
+    if _has_ssh_ingress(permissions, ssh_port):
+        return
+    try:
+        ec2_client.authorize_security_group_ingress(
+            GroupId=sg_id,
+            IpPermissions=[
+                {
+                    "IpProtocol": "tcp",
+                    "FromPort": ssh_port,
+                    "ToPort": ssh_port,
+                    "IpRanges": [{"CidrIp": SSH_INGRESS_CIDR, "Description": "SSH access"}],
+                }
+            ],
+        )
+    except botocore.exceptions.ClientError as e:
+        if e.response["Error"]["Code"] != "InvalidPermission.Duplicate":
+            raise
+        return
+    secho(f"  Opened SSH port {ssh_port} on security group {sg_id}.", fg="green")
+
+
 def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int = SSH_PORT_DEFAULT) -> str:
     """Find or create a security group with SSH ingress in the default VPC."""
     # Find default VPC
@@ -102,9 +141,15 @@ def ensure_security_group(ec2_client, name: str, tag_value: str, ssh_port: int =
         ]
     )
     if existing["SecurityGroups"]:
-        sg_id = existing["SecurityGroups"][0]["GroupId"]
+        group = existing["SecurityGroups"][0]
+        sg_id = group["GroupId"]
         msg = "  Security group " + click.style(f"'{name}'", fg="bright_white")
         echo(msg + f" already exists ({sg_id}), reusing.")
+        # A reused group was created for whatever --ssh-port the *first* launch
+        # used. Without this, `launch --ssh-port 2222` against an existing group
+        # silently has no ingress on 2222 and only fails much later, as an opaque
+        # "SSH did not become available" timeout.
+        _ensure_ssh_ingress(ec2_client, sg_id, group.get("IpPermissions", []), ssh_port)
         return sg_id
 
     # Create new SG
@@ -372,49 +417,6 @@ def _run_instances(
     return response["Instances"][0]
 
 
-def launch_instance(ec2_client, config: LaunchConfig, ami_id: str, sg_id: str) -> dict:
-    """Launch a single instance in one region (spot, with interactive on-demand fallback).
-
-    Back-compat single-region primitive. Multi-region and ``--wait`` retries
-    go through :func:`launch_with_retry`.
-    """
-    region = config.region
-    placement_az = resolve_ebs_placement_az(ec2_client, config.ebs_volume_id, region) if config.ebs_volume_id else None
-    try:
-        try:
-            return _run_instances(ec2_client, config, ami_id, sg_id, region, config.spot, config.key_name, placement_az)
-        except CapacityError:
-            if not config.spot:
-                raise CLIError(
-                    f"Insufficient capacity for {config.instance_type} in {region}.\n\n"
-                    "  The requested instance type is not currently available.\n"
-                    "  Try a different region, availability zone, or instance type."
-                ) from None
-            secho(f"\n  Spot request failed: insufficient capacity in {region}.", fg="yellow")
-            if not is_text() or click.confirm("  Retry as on-demand instance?"):
-                try:
-                    return _run_instances(
-                        ec2_client,
-                        config,
-                        ami_id,
-                        sg_id,
-                        region,
-                        spot=False,
-                        key_name=config.key_name,
-                        placement_az=placement_az,
-                    )
-                except CapacityError:
-                    raise CLIError(
-                        f"Insufficient capacity for {config.instance_type} (on-demand) in {region}.\n\n"
-                        "  Neither spot nor on-demand capacity is currently available.\n"
-                        "  Try a different region, availability zone, or instance type."
-                    ) from None
-            raise CLIError("Launch cancelled.") from None
-    except RegionFatalError as e:
-        # Single-region path: quota / spot-price problems are terminal.
-        raise CLIError(e.message) from None
-
-
 def _describe_failures(regions: tuple[str, ...], failures: dict[str, tuple[str, str]], market: str) -> str:
     """One '- region: reason' line per region, in attempt order."""
     reason = {
@@ -642,10 +644,6 @@ def _quota_error_message(code: str, config: LaunchConfig, region: str | None = N
     )
 
 
-def _raise_quota_error(code: str, config: LaunchConfig, region: str | None = None) -> None:
-    raise CLIError(_quota_error_message(code, config, region))
-
-
 def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
     """Find all non-terminated instances with the created-by tag."""
     response = ec2_client.describe_instances(
@@ -680,6 +678,25 @@ def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
 
 
 _CLUSTER_STATES = ["pending", "running", "stopping", "stopped", "shutting-down"]
+
+
+def find_unowned_instances(ec2_client, instance_ids: list[str], tag_value: str) -> list[str]:
+    """Of *instance_ids*, those NOT tagged ``created-by=<tag_value>`` in this region.
+
+    Used by ``terminate`` to refuse destroying instances this tool never created
+    (an explicit instance id bypasses tag-based discovery entirely). An id that
+    does not exist in the queried region counts as unowned — terminating it would
+    fail anyway, and a wrong ``--region`` is the likelier explanation.
+
+    Filters by tag only (no ``InstanceIds``): passing an id AWS has never seen
+    makes ``describe_instances`` raise ``InvalidInstanceID.NotFound`` for the
+    whole call, which is exactly the case this check has to answer for.
+    """
+    if not instance_ids:
+        return []
+    response = ec2_client.describe_instances(Filters=[{"Name": f"tag:{TAG_CREATED_BY}", "Values": [tag_value]}])
+    owned = {inst["InstanceId"] for reservation in response["Reservations"] for inst in reservation["Instances"]}
+    return [i for i in instance_ids if i not in owned]
 
 
 def _cluster_node_dict(inst: dict) -> dict:
@@ -1012,13 +1029,6 @@ def attach_ebs_volume(ec2_client, volume_id: str, instance_id: str, device_name:
         Device=device_name,
     )
     waiter = ec2_client.get_waiter("volume_in_use")
-    waiter.wait(VolumeIds=[volume_id], WaiterConfig=EBS_VOLUME_WAITER)
-
-
-def detach_ebs_volume(ec2_client, volume_id: str) -> None:
-    """Detach an EBS volume and wait for it to become available."""
-    ec2_client.detach_volume(VolumeId=volume_id)
-    waiter = ec2_client.get_waiter("volume_available")
     waiter.wait(VolumeIds=[volume_id], WaiterConfig=EBS_VOLUME_WAITER)
 
 
