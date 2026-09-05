@@ -46,6 +46,7 @@ from .ec2 import (
     find_unowned_instances,
     get_latest_ami,
     get_spot_price,
+    instance_type_architecture,
     instance_type_to_family,
     launch_with_retry,
     list_amis,
@@ -423,7 +424,10 @@ def launch(
         try:
             if is_text():
                 click.echo(f"  {_rtag(region)} " + click.style("looking up AMI…", dim=True))
-            ami_r = get_latest_ami(ec2r, config.ami_filter)
+            # An AMI must match its instance type's CPU architecture; not every
+            # GPU family is x86 (g5g is arm64), so ask EC2 rather than assume.
+            arch = instance_type_architecture(ec2r, config.instance_type)
+            ami_r = get_latest_ami(ec2r, config.ami_filter, architecture=arch)
             if is_text():
                 click.echo(f"  {_rtag(region)} " + click.style(f"AMI {ami_r['ImageId']}", dim=True))
             effective_key = import_key_pair(ec2r, config.key_name, config.key_path)
@@ -1405,7 +1409,12 @@ def list_cmd():
 
 
 @list_cmd.command(name="instance-types")
-@click.option("--prefix", default="g4dn", show_default=True, help="Instance type family prefix to filter on.")
+@click.option(
+    "--prefix",
+    default="g4dn",
+    show_default=True,
+    help="Instance type family prefix to filter on (prefix match: 'p6' also matches p6-b200, 'g6' matches g6/g6e/g6f).",
+)
 @click.option(
     "--region",
     "-r",
@@ -1456,7 +1465,7 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
 
     multi = len(regions) > 1
     for r, types in per_region:
-        _region_block_header(r, multi, f"{len(types)} instance type(s) matching '{prefix}.*':")
+        _region_block_header(r, multi, f"{len(types)} instance type(s) matching '{prefix}*':")
         if not types:
             click.echo("  " + click.style("(none)", dim=True))
             continue
@@ -1478,7 +1487,7 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
     click.echo(
         "  "
         + click.style("Tip: ", fg="bright_black")
-        + click.style("use --prefix to list other families (e.g. --prefix p5, --prefix g5)", fg="bright_black")
+        + click.style("use --prefix to list other families (e.g. --prefix p6, --prefix g6)", fg="bright_black")
     )
 
     # Suggested next steps: check/raise the GPU vCPU quota for this family. AWS
@@ -1489,7 +1498,7 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
     if fam:
         hint_region = regions[0]
         click.echo()
-        click.secho(f"  Next steps — {prefix}.* draws from the '{fam}' vCPU quota family:", bold=True, fg="cyan")
+        click.secho(f"  Next steps — {prefix}* draws from the '{fam}' vCPU quota family:", bold=True, fg="cyan")
         click.echo("    Check your vCPU quota:")
         click.echo("      " + _cmd(f"aws-bootstrap quota show --family {fam} --region {hint_region}"))
         click.echo("    Request a quota increase (adjust --desired-value to your needs):")
@@ -1503,6 +1512,12 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
 @list_cmd.command(name="amis")
 @click.option("--filter", "ami_filter", default=DEFAULT_AMI_PREFIX, show_default=True, help="AMI name pattern.")
 @click.option(
+    "--arch",
+    type=click.Choice(["x86_64", "arm64"]),
+    default=None,
+    help="Restrict to one CPU architecture. Default: all (the Arch column shows each result's).",
+)
+@click.option(
     "--region",
     "-r",
     multiple=True,
@@ -1511,15 +1526,17 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
 )
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
-def list_amis_cmd(ctx, ami_filter, region, profile):
+def list_amis_cmd(ctx, ami_filter, arch, region, profile):
     """List available AMIs matching a name pattern.
 
     AMI IDs are region-specific, so each result is labelled with its region.
+    Results span every CPU architecture unless --arch narrows them, so ARM64
+    Deep Learning AMIs (needed by arm64 types such as g5g) are discoverable here.
     """
     regions = resolve_region_list(region, profile)
     session = boto3.Session(profile_name=profile)
 
-    per_region = [(r, list_amis(session.client("ec2", region_name=r), ami_filter)) for r in regions]
+    per_region = [(r, list_amis(session.client("ec2", region_name=r), ami_filter, architecture=arch)) for r in regions]
 
     if not is_text(ctx):
         structured = [
@@ -1976,7 +1993,8 @@ def cluster_launch(
 
     def prepare_region(r: str) -> RegionContext:
         if shared["ami"] is None:
-            shared["ami"] = get_latest_ami(ec2, config.ami_filter)
+            arch = instance_type_architecture(ec2, config.instance_type)
+            shared["ami"] = get_latest_ami(ec2, config.ami_filter, architecture=arch)
         if shared["key"] is None:
             shared["key"] = import_key_pair(ec2, config.key_name, config.key_path)
         return RegionContext(

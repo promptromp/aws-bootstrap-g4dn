@@ -72,8 +72,8 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 | `aws-bootstrap status` | List running instances (all enabled regions by default) with region, IPs, pricing; also reports orphaned EBS data volumes (detached, still billed) with cost estimates | `--gpu` (CUDA info), `--region/-r` (repeatable), `--no-instructions` |
 | `aws-bootstrap terminate` | Terminate instances and clean up | `[ID_OR_ALIAS...]`, `--keep-ebs`, `--yes` |
 | `aws-bootstrap cleanup` | Sync `~/.ssh/config` with live instances across ALL regions (remove stale; `--sync` adds missing / repairs drifted) | `--sync`, `--include-ebs`, `--dry-run`, `--yes` |
-| `aws-bootstrap list instance-types` | Browse GPU instance types (+ suggested quota commands) | `--prefix` (default: g4dn), `--region/-r` (repeatable) |
-| `aws-bootstrap list amis` | Browse Deep Learning AMIs (region-labelled; IDs differ per region) | `--filter`, `--region/-r` (repeatable) |
+| `aws-bootstrap list instance-types` | Browse GPU instance types (+ suggested quota commands) | `--prefix` (default: g4dn; prefix match — `p6` finds p6-b200/p6-b300), `--region/-r` (repeatable) |
+| `aws-bootstrap list amis` | Browse Deep Learning AMIs (region-labelled; IDs differ per region) | `--filter`, `--arch` (x86_64/arm64; default all), `--region/-r` (repeatable) |
 | `aws-bootstrap quota show` | Show GPU vCPU quotas (all families) | `--family`, `--region/-r` (repeatable) |
 | `aws-bootstrap quota request` | Request a quota increase (per region) | `--family`, `--type`, `--desired-value`, `--region/-r` (repeatable), `--yes` |
 | `aws-bootstrap quota history` | Show quota increase request history | `--family`, `--type`, `--status`, `--region/-r` (repeatable) |
@@ -291,6 +291,7 @@ The `/data` volume is **not lost on spot interruption** — when AWS reclaims th
 
 - **Spot capacity errors** (`InsufficientInstanceCapacity`): prefer multiple `--region` values (tried in order) and/or `--wait --wait-timeout` over manual retry loops — the CLI handles bounded backoff internally. Without `--wait`, an exhausted spot pass auto-falls back to on-demand in structured modes. `--wait` hard-fails on timeout (it does not auto-buy on-demand).
 - **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`) and `SpotMaxPriceTooLow`: never retried by `--wait`, but in multi-region mode the launcher warns (with a region-pinned hint) and tries the next `--region`; it fails hard only when every region is blocked. Quotas are per-region — the suggested `aws-bootstrap quota show` / `quota request` commands are auto-pinned to `--region <failed-region>`. Run them as-is; other families: `--family p` (P2-P6), `--family dl`.
+- **`No arm64 AMI found matching filter: ...`**: the instance type is arm64 (`g5g`) but `--ami-filter` matches only x86_64 images — the default Deep Learning AMI is x86_64-only. Retry with the ARM64 filter the error prints (`--ami-filter "Deep Learning ARM64 AMI OSS Nvidia Driver GPU PyTorch*(Ubuntu 24.04)*"`). Changing `--region` will **not** help. Every other current GPU family is x86_64.
 - **SSH key handling**: a missing local `--key-path` is auto-generated (ed25519); if an AWS key pair with the target `--key-name` exists but is a *different* key, the existing one is left untouched and the local key is imported under a derived name `<key-name>-<fp8>` so the instance is always reachable.
 - **SSH auth failure**: `launch` fails fast (no long retry loop) and surfaces the real `ssh` error (e.g. `Permission denied (publickey)`) instead of a generic "SSH not ready" — indicates a key mismatch; relaunch with the correct `--key-name`/`--key-path`.
 - **SSH timeouts**: Instance may still be initializing -- check `aws-bootstrap status`

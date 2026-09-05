@@ -55,35 +55,82 @@ _OWNER_HINTS = {
 }
 
 
-def get_latest_ami(ec2_client, ami_filter: str) -> dict:
-    """Find the latest AMI matching the filter pattern.
+def _ami_owner_hint(ami_filter: str) -> list[str] | None:
+    """Owner account IDs implied by an AMI name filter, or None to search all."""
+    for prefix, owner_ids in _OWNER_HINTS.items():
+        if ami_filter.startswith(prefix):
+            return owner_ids
+    return None
+
+
+def instance_type_architecture(ec2_client, instance_type: str) -> str:
+    """CPU architecture an instance type requires (``x86_64`` / ``arm64``).
+
+    An AMI must match its instance type's architecture, and not every GPU family
+    is x86: ``g5g`` (T4g) is arm64-only, as are the Grace-based P-series. Asking
+    EC2 rather than hardcoding a family list keeps this correct as AWS adds types.
+
+    Falls back to ``x86_64`` if the type is unknown in this region — the launch
+    itself then surfaces the authoritative error, and this preserves the previous
+    behaviour for every x86 family.
+    """
+    try:
+        types = ec2_client.describe_instance_types(InstanceTypes=[instance_type])["InstanceTypes"]
+    except botocore.exceptions.ClientError:
+        return "x86_64"
+    if not types:
+        return "x86_64"
+    arches = types[0].get("ProcessorInfo", {}).get("SupportedArchitectures", [])
+    # Prefer x86_64 when a type supports both, so mixed-arch types keep using
+    # the (much more widely published) x86 AMIs.
+    return "x86_64" if "x86_64" in arches or not arches else arches[0]
+
+
+def get_latest_ami(ec2_client, ami_filter: str, architecture: str = "x86_64") -> dict:
+    """Find the latest AMI matching the filter pattern and CPU architecture.
 
     Infers the owner from the filter prefix when possible,
     otherwise searches all public AMIs.
     """
-    owners = None
-    for prefix, owner_ids in _OWNER_HINTS.items():
-        if ami_filter.startswith(prefix):
-            owners = owner_ids
-            break
-
     params: dict = {
         "Filters": [
             {"Name": "name", "Values": [ami_filter]},
             {"Name": "state", "Values": ["available"]},
-            {"Name": "architecture", "Values": ["x86_64"]},
+            {"Name": "architecture", "Values": [architecture]},
         ],
     }
+    owners = _ami_owner_hint(ami_filter)
     if owners:
         params["Owners"] = owners
 
     response = ec2_client.describe_images(**params)
     images = response["Images"]
     if not images:
-        raise CLIError(f"No AMI found matching filter: {ami_filter}\nTry adjusting --ami-filter or check the region.")
+        raise CLIError(_no_ami_message(ami_filter, architecture))
 
     images.sort(key=lambda x: x["CreationDate"], reverse=True)
     return images[0]
+
+
+def _no_ami_message(ami_filter: str, architecture: str) -> str:
+    """Actionable 'no AMI' error, naming the architecture that was required.
+
+    The arm64 case is the one that actually bites: the default Deep Learning AMI
+    filter is published for x86_64 only, so an arm64 instance type (g5g, Grace-based
+    P-series) finds nothing and the user has no way to guess why from the filter alone.
+    """
+    msg = f"No {architecture} AMI found matching filter: {ami_filter}"
+    if architecture == "arm64":
+        return (
+            f"{msg}\n\n"
+            "  This instance type is arm64, but the AMI filter matches no arm64 image.\n"
+            "  The default 'Deep Learning Base OSS Nvidia Driver GPU AMI' is x86_64-only;\n"
+            "  AWS publishes separate ARM64 Deep Learning AMIs. Try:\n"
+            '    --ami-filter "Deep Learning ARM64 AMI OSS Nvidia Driver GPU PyTorch*(Ubuntu 24.04)*"\n\n'
+            "  List what is available in the region with:\n"
+            '    aws-bootstrap list amis --filter "Deep Learning ARM64 AMI*" --arch arm64'
+        )
+    return f"{msg}\nTry adjusting --ami-filter or check the region."
 
 
 def _has_ssh_ingress(permissions: list[dict], ssh_port: int) -> bool:
@@ -857,14 +904,20 @@ def get_spot_price(ec2_client, instance_type: str, availability_zone: str) -> fl
 
 
 def list_instance_types(ec2_client, name_prefix: str = "g4dn") -> list[dict]:
-    """List EC2 instance types matching a name prefix (e.g. 'g4dn', 'p3').
+    """List EC2 instance types matching a family name prefix (e.g. 'g4dn', 'p6').
+
+    The filter is a true *prefix* match (``{prefix}*.*``). The previous
+    ``{prefix}.*`` was an exact-family match, which silently returned nothing for
+    every family AWS names with a hyphenated suffix — ``--prefix p6`` found neither
+    ``p6-b200.48xlarge`` nor ``p6-b300.48xlarge``. As a side effect a broader prefix
+    now works too: ``g6`` matches g6/g6e/g6f, and ``g`` matches every G family.
 
     Returns a list of dicts with InstanceType, vCPUs, MemoryMiB, and GPUs info,
     sorted by instance type name.
     """
     paginator = ec2_client.get_paginator("describe_instance_types")
     pages = paginator.paginate(
-        Filters=[{"Name": "instance-type", "Values": [f"{name_prefix}.*"]}],
+        Filters=[{"Name": "instance-type", "Values": [f"{name_prefix}*.*"]}],
     )
     results = []
     for page in pages:
@@ -887,25 +940,26 @@ def list_instance_types(ec2_client, name_prefix: str = "g4dn") -> list[dict]:
     return results
 
 
-def list_amis(ec2_client, ami_filter: str) -> list[dict]:
+def list_amis(ec2_client, ami_filter: str, architecture: str | None = None) -> list[dict]:
     """List available AMIs matching a name filter pattern.
+
+    ``architecture`` restricts the search (``x86_64`` / ``arm64``); ``None`` — the
+    default — searches every architecture. This is a discovery command and each
+    row already reports its Architecture, so filtering to x86_64 by default only
+    hid the ARM64 Deep Learning AMIs that an arm64 instance type needs.
 
     Returns a list of dicts with ImageId, Name, CreationDate, and Architecture,
     sorted by creation date (newest first). Limited to the 20 most recent.
     """
-    owners = None
-    for prefix, owner_ids in _OWNER_HINTS.items():
-        if ami_filter.startswith(prefix):
-            owners = owner_ids
-            break
-
     params: dict = {
         "Filters": [
             {"Name": "name", "Values": [ami_filter]},
             {"Name": "state", "Values": ["available"]},
-            {"Name": "architecture", "Values": ["x86_64"]},
         ],
     }
+    if architecture:
+        params["Filters"].append({"Name": "architecture", "Values": [architecture]})
+    owners = _ami_owner_hint(ami_filter)
     if owners:
         params["Owners"] = owners
 

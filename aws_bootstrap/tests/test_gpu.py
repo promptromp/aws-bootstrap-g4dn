@@ -84,6 +84,12 @@ def test_gpu_architecture_mapping():
     assert _GPU_ARCHITECTURES["8.9"] == "Ada Lovelace"
     assert _GPU_ARCHITECTURES["9.0"] == "Hopper"
     assert _GPU_ARCHITECTURES["7.0"] == "Volta"
+    # Blackwell datacenter parts backing the current P6 families:
+    # sm_100 = GB100/B200 (p6-b200), sm_103 = GB300 "Blackwell Ultra"/B300 (p6-b300).
+    assert _GPU_ARCHITECTURES["10.0"] == "Blackwell"
+    assert _GPU_ARCHITECTURES["10.3"] == "Blackwell"
+    # sm_120 = GB20x, the RTX PRO 4500/6000 Blackwell parts behind g7/g7e.
+    assert _GPU_ARCHITECTURES["12.0"] == "Blackwell"
 
 
 @patch("aws_bootstrap.ssh.subprocess.run")

@@ -22,7 +22,10 @@ def _not_found_msg(sq_client, quota_code: str) -> str:
     return f"Quota {quota_code} not found{where}. Quotas are per-region — check the --region and quota code."
 
 
-# G/VT family (g4dn, g5, g6, vt1) — default for this tool
+# G/VT family (g4dn, g5, g6, g7, vt1, …) — default for this tool.
+# Quota codes verified against the live Service Quotas API (`list-service-quotas
+# --service-code ec2`): "All G and VT Spot Instance Requests" / "Running
+# On-Demand G and VT instances".
 QUOTA_CODE_SPOT = "L-3819A6DF"
 QUOTA_CODE_ON_DEMAND = "L-DB2E81BA"
 
@@ -42,10 +45,15 @@ QUOTA_FAMILIES: dict[str, dict[str, str]] = {
     },
 }
 
+# Human-readable family lists. Kept in sync with the EC2 instance-type catalog
+# (`describe-instance-types`); retired families (g3, p2, p3, dl1) are dropped and
+# current ones added. These are display hints only — the authoritative mapping is
+# `ec2.instance_type_to_family`, which is prefix-based and needs no updating when
+# AWS ships a new family.
 QUOTA_FAMILY_LABELS: dict[str, str] = {
-    "gvt": "G and VT (g3, g4dn, g5, g5g, g6, g6e, vt1)",
-    "p": "P (p2, p3, p4d, p4de, p5, p5e, p5en, p6)",
-    "dl": "DL (dl1, dl2q)",
+    "gvt": "G and VT (g4dn, g5, g5g, g6, g6e, g6f, gr6, gr6f, g7, g7e, vt1)",
+    "p": "P (p3dn, p4d, p4de, p5, p5e, p5en, p6-b200, p6-b300, p6e-gb200)",
+    "dl": "DL (dl2q)",
 }
 
 DEFAULT_FAMILY = "gvt"
