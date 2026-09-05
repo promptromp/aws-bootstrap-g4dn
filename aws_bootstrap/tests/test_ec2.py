@@ -31,6 +31,7 @@ from aws_bootstrap.ec2 import (
     find_unowned_instances,
     get_latest_ami,
     get_spot_price,
+    instance_type_architecture,
     launch_with_retry,
     list_amis,
     list_clusters,
@@ -71,8 +72,73 @@ def test_get_latest_ami_picks_newest():
 def test_get_latest_ami_no_results():
     ec2 = MagicMock()
     ec2.describe_images.return_value = {"Images": []}
-    with pytest.raises(click.ClickException, match="No AMI found"):
+    with pytest.raises(click.ClickException, match="No x86_64 AMI found"):
         get_latest_ami(ec2, "nonexistent*")
+
+
+# ---------------------------------------------------------------------------
+# Instance-type architecture / architecture-aware AMI selection
+#
+# An AMI must match its instance type's CPU architecture. get_latest_ami used to
+# hardcode x86_64, so an arm64 GPU type (g5g / Grace-based P-series) silently got
+# an x86_64 AMI and failed minutes later inside run_instances.
+# ---------------------------------------------------------------------------
+
+
+def _instance_type_response(arches: list[str]) -> dict:
+    return {"InstanceTypes": [{"ProcessorInfo": {"SupportedArchitectures": arches}}]}
+
+
+@pytest.mark.parametrize(
+    "arches,expected",
+    [
+        (["x86_64"], "x86_64"),
+        (["arm64"], "arm64"),
+        # Mixed-arch types keep x86_64: far more AMIs are published for it.
+        (["arm64", "x86_64"], "x86_64"),
+        ([], "x86_64"),
+    ],
+)
+def test_instance_type_architecture(arches, expected):
+    ec2 = MagicMock()
+    ec2.describe_instance_types.return_value = _instance_type_response(arches)
+    assert instance_type_architecture(ec2, "g5g.xlarge") == expected
+
+
+def test_instance_type_architecture_falls_back_when_type_unknown():
+    """An unknown type in this region must not abort the launch sweep."""
+    ec2 = MagicMock()
+    ec2.describe_instance_types.side_effect = _make_client_error("InvalidInstanceType")
+    assert instance_type_architecture(ec2, "made-up.xlarge") == "x86_64"
+
+
+def test_instance_type_architecture_falls_back_on_empty_response():
+    ec2 = MagicMock()
+    ec2.describe_instance_types.return_value = {"InstanceTypes": []}
+    assert instance_type_architecture(ec2, "made-up.xlarge") == "x86_64"
+
+
+@pytest.mark.parametrize("arch", ["x86_64", "arm64"])
+def test_get_latest_ami_filters_on_requested_architecture(arch):
+    ec2 = MagicMock()
+    ec2.describe_images.return_value = {
+        "Images": [{"ImageId": "ami-1", "Name": "n", "CreationDate": "2025-06-01T00:00:00Z"}]
+    }
+    get_latest_ami(ec2, "DL AMI*", architecture=arch)
+    filters = ec2.describe_images.call_args.kwargs["Filters"]
+    assert {"Name": "architecture", "Values": [arch]} in filters
+
+
+def test_get_latest_ami_arm64_miss_explains_the_arch_mismatch():
+    """The default DLAMI is x86_64-only — the error must say so, not just 'no AMI'."""
+    ec2 = MagicMock()
+    ec2.describe_images.return_value = {"Images": []}
+    with pytest.raises(click.ClickException) as exc:
+        get_latest_ami(ec2, "Deep Learning Base OSS Nvidia Driver GPU AMI*", architecture="arm64")
+    msg = exc.value.format_message()
+    assert "arm64" in msg
+    assert "Deep Learning ARM64 AMI" in msg
+    assert "--ami-filter" in msg
 
 
 def _make_client_error(code: str, message: str = "test") -> botocore.exceptions.ClientError:
@@ -564,6 +630,24 @@ def test_list_instance_types_no_gpu():
     assert results[0]["GpuSummary"] == ""
 
 
+@pytest.mark.parametrize(
+    "prefix,expected",
+    [
+        # A hyphenated family (p6-b200) is only reachable via a true prefix match;
+        # the old "{prefix}.*" filter returned nothing for --prefix p6.
+        ("p6", "p6*.*"),
+        ("g4dn", "g4dn*.*"),
+        ("g", "g*.*"),
+    ],
+)
+def test_list_instance_types_uses_prefix_match(prefix, expected):
+    ec2 = MagicMock()
+    ec2.get_paginator.return_value.paginate.return_value = [{"InstanceTypes": []}]
+    list_instance_types(ec2, prefix)
+    filters = ec2.get_paginator.return_value.paginate.call_args.kwargs["Filters"]
+    assert filters == [{"Name": "instance-type", "Values": [expected]}]
+
+
 def test_list_instance_types_empty():
     ec2 = MagicMock()
     paginator = MagicMock()
@@ -600,6 +684,23 @@ def test_list_amis_sorted_newest_first():
     assert len(results) == 2
     assert results[0]["ImageId"] == "ami-new"
     assert results[1]["ImageId"] == "ami-old"
+
+
+def test_list_amis_searches_all_architectures_by_default():
+    """No architecture filter by default — otherwise ARM64 DLAMIs are invisible."""
+    ec2 = MagicMock()
+    ec2.describe_images.return_value = {"Images": []}
+    list_amis(ec2, "Deep Learning*")
+    filters = ec2.describe_images.call_args.kwargs["Filters"]
+    assert not any(f["Name"] == "architecture" for f in filters)
+
+
+def test_list_amis_architecture_narrows_the_search():
+    ec2 = MagicMock()
+    ec2.describe_images.return_value = {"Images": []}
+    list_amis(ec2, "Deep Learning*", architecture="arm64")
+    filters = ec2.describe_images.call_args.kwargs["Filters"]
+    assert {"Name": "architecture", "Values": ["arm64"]} in filters
 
 
 def test_list_amis_empty():

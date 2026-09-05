@@ -501,6 +501,32 @@ def test_launch_output_shows_ssh_alias(
     mock_add_ssh.assert_called_once()
 
 
+@pytest.mark.parametrize(
+    "instance_type,arch",
+    [("g4dn.xlarge", "x86_64"), ("g5g.xlarge", "arm64")],
+)
+@patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.get_latest_ami")
+@patch("aws_bootstrap.cli.instance_type_architecture")
+@patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")
+@patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123")
+def test_launch_looks_up_ami_for_the_instance_type_architecture(
+    mock_sg, mock_import, mock_arch, mock_ami, mock_session, tmp_path, instance_type, arch
+):
+    """g5g is arm64: the AMI lookup must be told, or the launch picks an x86_64 image."""
+    mock_arch.return_value = arch
+    mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
+
+    key_path = tmp_path / "id_ed25519.pub"
+    key_path.write_text("ssh-ed25519 AAAA test@host")
+
+    runner = CliRunner()
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--instance-type", instance_type, "--dry-run"])
+    assert result.exit_code == 0
+    assert mock_arch.call_args.args[1] == instance_type
+    assert mock_ami.call_args.kwargs["architecture"] == arch
+
+
 @patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.get_latest_ami")
 @patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key")

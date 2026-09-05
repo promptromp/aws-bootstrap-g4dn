@@ -295,13 +295,22 @@ Supported formats: `text` (default, human-readable with color), `json`, `yaml`, 
 aws-bootstrap list instance-types
 
 # List a different instance family
-aws-bootstrap list instance-types --prefix p3
+aws-bootstrap list instance-types --prefix g6
+
+# --prefix is a *prefix* match, so it also finds hyphenated families:
+#   p6  -> p6-b200.48xlarge, p6-b300.48xlarge
+#   g6  -> g6, g6e and g6f types
+aws-bootstrap list instance-types --prefix p6
 
 # List Deep Learning AMIs (default filter) — each AMI is labelled with its region
 aws-bootstrap list amis
 
 # List AMIs with a custom filter
 aws-bootstrap list amis --filter "ubuntu/images/hvm-ssd-gp3/ubuntu-noble*"
+
+# Results cover every CPU architecture; --arch narrows them. ARM64 Deep Learning
+# AMIs are what arm64 GPU types (g5g) need — see "ARM64 instance types" below.
+aws-bootstrap list amis --filter "Deep Learning ARM64 AMI*" --arch arm64
 
 # Use a specific region (the active region is shown in the output header)
 aws-bootstrap list instance-types --region us-east-1
@@ -319,6 +328,23 @@ look like your `--prefix`. The output then ends with copy-paste **Next steps**
 for that family — a `quota show` and a `quota request` command pinned to the
 queried region — so you can go straight from "is this type available?" to
 checking and raising your vCPU quota.
+
+#### ARM64 instance types
+
+An AMI must match its instance type's CPU architecture, and not every GPU family
+is x86_64 — `g5g` (NVIDIA T4g) is arm64-only. `launch` reads the architecture
+from the instance type and looks up an AMI for it, so the default
+x86_64-only Deep Learning AMI is no longer silently paired with an arm64
+instance (which used to fail late, inside `run_instances`). AWS publishes ARM64
+Deep Learning AMIs under a different name, so pass a matching `--ami-filter`:
+
+```bash
+aws-bootstrap launch --instance-type g5g.xlarge \
+  --ami-filter "Deep Learning ARM64 AMI OSS Nvidia Driver GPU PyTorch*(Ubuntu 24.04)*"
+```
+
+If the filter matches no image for the required architecture, the error says so
+and prints this command, rather than a generic "no AMI found".
 
 ### 🖥️ Managing Instances
 

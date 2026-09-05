@@ -12,9 +12,10 @@ _GPU_ARCHITECTURES: dict[str, str] = {
     "8.7": "Ampere",
     "8.9": "Ada Lovelace",
     "9.0": "Hopper",
-    "10.0": "Blackwell",
+    "10.0": "Blackwell",  # GB100 — B200 (p6-b200)
     "10.1": "Blackwell",
-    "12.0": "Blackwell",
+    "10.3": "Blackwell",  # GB300 "Blackwell Ultra" — B300 (p6-b300), sm_103 (CUDA 12.9+)
+    "12.0": "Blackwell",  # GB20x — RTX PRO 4500/6000 Blackwell (g7, g7e)
     "12.1": "Blackwell",
 }
 

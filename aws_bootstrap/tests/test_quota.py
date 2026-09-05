@@ -12,6 +12,7 @@ from aws_bootstrap.quota import (
     QUOTA_CODE_ON_DEMAND,
     QUOTA_CODE_SPOT,
     QUOTA_FAMILIES,
+    QUOTA_FAMILY_LABELS,
     get_family_quotas,
     get_quota,
     get_quota_request_history,
@@ -231,6 +232,24 @@ def test_quota_families_has_expected_keys():
     for family in QUOTA_FAMILIES.values():
         assert "spot" in family
         assert "on-demand" in family
+
+
+def test_quota_family_labels_cover_current_ec2_families():
+    """Labels are display hints, but they must not omit currently-offered families.
+
+    Guards against the drift that had them still advertising retired families
+    (g3, p2, p3, dl1) while missing g6f/gr6/gr6f/g7/g7e and p6-b200/p6-b300.
+    """
+    assert set(QUOTA_FAMILY_LABELS) == set(QUOTA_FAMILIES)
+    gvt = QUOTA_FAMILY_LABELS["gvt"]
+    for fam in ("g4dn", "g5", "g5g", "g6", "g6e", "g6f", "gr6", "gr6f", "g7", "g7e", "vt1"):
+        assert fam in gvt, f"{fam} missing from the gvt label"
+    p = QUOTA_FAMILY_LABELS["p"]
+    for fam in ("p4d", "p5", "p5e", "p5en", "p6-b200", "p6-b300"):
+        assert fam in p, f"{fam} missing from the p label"
+    # Retired families should no longer be advertised.
+    for retired in ("g3,", "p2,", "p3,", "dl1"):
+        assert retired not in gvt + p + QUOTA_FAMILY_LABELS["dl"]
 
 
 # ---------------------------------------------------------------------------

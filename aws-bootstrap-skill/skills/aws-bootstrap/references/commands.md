@@ -293,6 +293,30 @@ There is no `--region` flag — `cleanup` always scans all enabled regions (an S
 
 ---
 
+## Instance-type CPU architecture
+
+An AMI must match its instance type's CPU architecture. `launch` and `cluster
+launch` read the architecture from the instance type and select an AMI for it,
+so you do not normally need to think about this — **except** that the default
+`--ami-filter` (Deep Learning Base OSS Nvidia Driver GPU AMI) is published for
+`x86_64` only.
+
+`g5g` (NVIDIA T4g) is arm64. Launching it needs an ARM64 Deep Learning AMI:
+
+```bash
+aws-bootstrap launch --instance-type g5g.xlarge \
+  --ami-filter "Deep Learning ARM64 AMI OSS Nvidia Driver GPU PyTorch*(Ubuntu 24.04)*"
+```
+
+If the filter matches nothing for the required architecture the command exits
+non-zero with an error naming the architecture and printing the filter to use —
+so on that error, retry with the suggested `--ami-filter` rather than a
+different region. Discover what exists with
+`aws-bootstrap -o json list amis --filter "Deep Learning ARM64 AMI*" --arch arm64`.
+
+Every other current GPU family (g4dn, g5, g6/g6e/g6f, gr6/gr6f, g7/g7e, p4d,
+p5/p5e/p5en, p6-b200/p6-b300) is x86_64 and needs no special handling.
+
 ## `aws-bootstrap list instance-types`
 
 List EC2 instance types matching a family prefix.
@@ -305,7 +329,7 @@ aws-bootstrap list instance-types [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--prefix` | string | `g4dn` | Instance type family prefix to filter on |
+| `--prefix` | string | `g4dn` | Instance type family prefix. **Prefix match**, so `p6` also matches `p6-b200`/`p6-b300`, `g6` matches g6/g6e/g6f, and `g` matches every G family. |
 | `--region` / `-r` | string (repeatable) | env/profile, then `us-west-2` | Region(s) to query. Each record is tagged with its `region`. |
 
 The table includes a **Quota Family** column (`gvt`/`p`/`dl`) — the AWS vCPU quota
@@ -348,6 +372,7 @@ aws-bootstrap list amis [OPTIONS]
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
 | `--filter` | string | `Deep Learning Base OSS Nvidia Driver GPU AMI*` | AMI name pattern |
+| `--arch` | `x86_64` \| `arm64` | *(all)* | Restrict to one CPU architecture. Results span both by default; the `architecture` field reports each one. |
 | `--region` / `-r` | string (repeatable) | env/profile, then `us-west-2` | Region(s) to query. Each record is tagged with its `region`. |
 
 ### JSON Output

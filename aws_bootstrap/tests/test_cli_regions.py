@@ -218,7 +218,7 @@ def test_list_instance_types_suggests_quota_commands(runner, cli_session, instan
         result = runner.invoke(main, ["list", "instance-types", "--prefix", prefix])
     assert result.exit_code == 0
     # The next-steps header names the derived quota family so the gvt<->g5 mapping is explicit.
-    assert f"{prefix}.* draws from the '{family}' vCPU quota family" in result.output
+    assert f"{prefix}* draws from the '{family}' vCPU quota family" in result.output
     assert f"aws-bootstrap quota show --family {family} --region us-west-2" in result.output
     request_hint = f"aws-bootstrap quota request --family {family} --type spot --desired-value 8 --region us-west-2"
     assert request_hint in result.output

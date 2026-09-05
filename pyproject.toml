@@ -77,10 +77,13 @@ no-lines-before = ["standard-library"]
 quote-style = "double"
 
 [dependency-groups]
+# Dev-tool floors track the versions CI and pre-commit actually run: ruff's lint
+# rules and formatting change between minors, so a lower floor would let a
+# contributor format the tree differently than `ruff format --check` in CI.
 dev = [
-    "mypy>=2.1",
-    "pytest>=9.0.3",
-    "ruff>=0.15.13",
-    "types-pyyaml>=6.0.12.20260518",
+    "mypy>=2.3.1",
+    "pytest>=9.1.1",
+    "ruff>=0.16.6",
+    "types-pyyaml>=6.0.12.20260815",
     "types-tabulate>=0.10.0.20260508",
 ]
