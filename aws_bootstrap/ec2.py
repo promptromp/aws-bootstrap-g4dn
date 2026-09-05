@@ -83,7 +83,9 @@ def instance_type_architecture(ec2_client, instance_type: str) -> str:
     arches = types[0].get("ProcessorInfo", {}).get("SupportedArchitectures", [])
     # Prefer x86_64 when a type supports both, so mixed-arch types keep using
     # the (much more widely published) x86 AMIs.
-    return "x86_64" if "x86_64" in arches or not arches else arches[0]
+    if not arches or "x86_64" in arches:
+        return "x86_64"
+    return arches[0]
 
 
 def get_latest_ami(ec2_client, ami_filter: str, architecture: str = "x86_64") -> dict:
