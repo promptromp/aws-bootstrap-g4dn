@@ -22,7 +22,7 @@ jobs:
         # setuptools-scm derives the version from git history during `uv sync`.
         fetch-depth: 0
     - name: Install uv and set the python version
-      uses: astral-sh/setup-uv@v10.3.0
+      uses: astral-sh/setup-uv@v10.3.1
       with:
         python-version: "3.13"
         version: "latest"
@@ -51,7 +51,7 @@ jobs:
         # setuptools-scm derives the version from git history during `uv sync`.
         fetch-depth: 0
     - name: Install uv and set the python version
-      uses: astral-sh/setup-uv@v10.3.0
+      uses: astral-sh/setup-uv@v10.3.1
       with:
         python-version: ${{ matrix.python-version }}
         version: "latest"
