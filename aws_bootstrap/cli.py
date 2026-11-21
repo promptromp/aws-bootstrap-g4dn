@@ -155,11 +155,15 @@ def _region_rule(region: str) -> None:
 
 
 def _emit_region_fatal(region: str, kind: str, message: str, more_regions: bool) -> None:
-    """Render a quota/price skip: bold-yellow verdict, copy-paste commands in
-    bright-cyan so they stand out of the warning block."""
+    """Render a region skip (quota / price / unsupported): bold-yellow verdict,
+    copy-paste commands in bright-cyan so they stand out of the warning block."""
     if not is_text():
         return
-    label = "spot quota exceeded" if kind == "quota" else "spot price too low"
+    label = {
+        "quota": "spot quota exceeded",
+        "price": "spot price too low",
+        "unsupported": "launch not supported in the requested AZ(s)",
+    }.get(kind, kind)
     click.secho(f"\n  ✗ {region}: {label} — skipping", fg="yellow", bold=True, err=True)
     for line in message.splitlines():
         s = line.strip()
@@ -555,17 +559,20 @@ def launch(
             az_prices={o.zone: o.spot_price for o in plan if o.spot_price is not None},
         )
 
+    # Plan every region's AZs up front (read-only), so a bad --availability-zone in a
+    # later region fails before anything is created or launched in an earlier one.
+    if az_map or config.cheapest_az:
+        for r in config.regions:
+            try:
+                az_plan(r, region_client(r))
+            except CLIError as e:
+                raise CLIError(f"[{r}] {e.format_message()}") from None
+
     if config.dry_run:
         ctx0 = prepare_region(config.regions[0])
         ami = ctx0.ami
-        # The AZ plan of every region (read-only calls), not only the one prepared above.
-        dry_plans: dict[str, list[AzOption]] = {}
-        if az_map or config.cheapest_az:
-            for r in config.regions:
-                try:
-                    dry_plans[r] = az_plan(r, ctx0.ec2_client if r == ctx0.region else region_client(r))
-                except CLIError as e:
-                    raise CLIError(f"[{r}] {e.format_message()}") from None
+        # Only with AZ flags: without them prepare_region caches an empty plan ("EC2 picks").
+        dry_plans: dict[str, list[AzOption]] = dict(az_plans) if (az_map or config.cheapest_az) else {}
         if is_text(ctx):
             click.echo()
             click.secho("--- Dry Run Summary ---", bold=True, fg="yellow")
@@ -659,8 +666,8 @@ def launch(
             )
             if skipped:
                 click.secho(
-                    f"     (not retried — quota/price blocked: {', '.join(skipped)}; "
-                    "fix quota then re-run to include them)",
+                    f"     (not retried — blocked by quota/price/unsupported AZs: {', '.join(skipped)}; "
+                    "fix that, then re-run to include them)",
                     fg="yellow",
                     dim=True,
                 )
@@ -689,7 +696,8 @@ def launch(
     # lookup (never raises — the instance already exists and is billing).
     spot_price: float | None = None
     if pricing == "spot" and az:
-        spot_price = launched.context.az_prices.get(az) or spot_price_or_none(ec2, config.instance_type, az)
+        # A fresh lookup first (a plan's price can be an hour old after a long --wait).
+        spot_price = spot_price_or_none(ec2, config.instance_type, az) or launched.context.az_prices.get(az)
     val("Instance ID", instance_id)
     val("Region", active_region)
     val("Pricing", pricing)
@@ -2154,9 +2162,20 @@ def cluster_launch(
     key = Path(key_path).expanduser()
     if not key.exists():
         generate_ssh_keypair(key)
-    # Before creating anything: every node would be unreachable with a key ssh can't use unprompted.
+    # Before creating anything (only read-only calls so far): every node would be
+    # unreachable with a key ssh can't use unprompted.
     if not skip_key_check:
         check_key_usable(key)
+
+    # A new cluster's first node may get an AZ plan (--availability-zone / --cheapest-az).
+    # Planned (read-only) before anything is created, so a bad AZ leaves nothing behind.
+    first_plan: list[AzOption] = []
+    if not existing_az and (az_flag or cheapest_az):
+        try:
+            first_plan = plan_azs(ec2, region, instance_type, explicit=az_flag, cheapest=cheapest_az)
+        except CLIError as e:
+            raise CLIError(f"[{region}] {e.format_message()}") from None
+        info(f"AZs to try for the first node: {_az_plan_label(first_plan, 'spot' if spot else 'on-demand')}")
 
     pg_name = cluster_mod.placement_group_name(cluster_id)
     ensure_cluster_placement_group(ec2, pg_name, TAG_VALUE)
@@ -2181,16 +2200,8 @@ def cluster_launch(
         config.profile = profile
 
     # AZ is captured from the first launched node and pinned for the rest;
-    # AMI/key are looked up once and reused across nodes. A new cluster's first
-    # node may get an AZ plan (--availability-zone / --cheapest-az) to try in order.
+    # AMI/key are looked up once and reused across nodes.
     shared: dict = {"az": existing_az, "ami": None, "key": None}
-    first_plan: list[AzOption] = []
-    if not existing_az and (az_flag or cheapest_az):
-        try:
-            first_plan = plan_azs(ec2, region, instance_type, explicit=az_flag, cheapest=cheapest_az)
-        except CLIError as e:
-            raise CLIError(f"[{region}] {e.format_message()}") from None
-        info(f"AZs to try for the first node: {_az_plan_label(first_plan, 'spot' if spot else 'on-demand')}")
 
     def prepare_region(r: str) -> RegionContext:
         if shared["ami"] is None:

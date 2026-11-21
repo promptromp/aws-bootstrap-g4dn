@@ -35,10 +35,12 @@ def resolve_regions(explicit: tuple[str, ...], session_region: str | None) -> tu
     return (DEFAULT_REGION,)
 
 
-# The region an AZ belongs to, from its name: "us-west-2b" and the Local Zone
-# "us-west-2-lax-1a" are both in "us-west-2". Used only to route an AZ to the
+# The region an AZ belongs to, from its name: the region is everything up to the first
+# "-<number>" ("us-west-2b", the Local Zone "us-west-2-lax-1a" and the Wavelength Zone
+# "us-east-1-wl1-bos-wlz-1" are in "us-west-2"/"us-east-1"; "us-gov-west-1a" and
+# "eusc-de-east-1a" route to their partitions' regions). Used only to route an AZ to the
 # region to query; the AZ itself is then confirmed against describe_availability_zones.
-_AZ_REGION_RE = re.compile(r"^([a-z]{2}(?:-gov|-iso[a-z]*)?-[a-z]+-\d+)(?:[a-z]|-[a-z0-9-]+)$")
+_AZ_REGION_RE = re.compile(r"^([a-z]+(?:-[a-z]+)+-\d+)(?:[a-z]|-[a-z0-9-]+)$")
 
 
 def region_of_az(az: str) -> str:

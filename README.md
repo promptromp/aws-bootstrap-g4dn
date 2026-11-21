@@ -111,13 +111,14 @@ aws-bootstrap launch --key-path ~/.ssh/my_other_key.pub
 - **Missing local key** — if `--key-path` doesn't exist, `launch` auto-generates an Ed25519 key pair there (instead of aborting).
 - **Name collision with a different key** — if an AWS key pair already exists with the target `--key-name` but its public key differs from your local key (e.g. created from another machine), the existing AWS key pair is **left untouched** and your local key is imported under a deterministic derived name `aws-bootstrap-key-<fp8>`, which the instance is launched with. You always hold the matching private key.
 - **Unreachable instance** — if SSH still fails with an authentication/host-key error, `launch` **stops immediately** and prints the real `ssh` error (no more silent 5-minute "SSH not ready" loop masking a `Permission denied (publickey)`).
-- **Passphrase-protected key** — the CLI connects with `BatchMode=yes` (it never prompts), so before
-  any AWS call `launch` / `cluster launch` (including `--dry-run`) check that the key works without
-  a prompt: no passphrase, or loaded in ssh-agent. If not, they stop *before* creating a billed
-  instance setup could never reach, and print the fix (`ssh-add --apple-use-keychain <key>` on
-  macOS, `ssh-add <key>` elsewhere). With `UseKeychain yes` in `~/.ssh/config` the macOS Keychain
-  may supply the passphrase, which can't be checked, so the CLI only warns. `--skip-key-check`
-  turns the check off (e.g. for a passphrase supplied by an `IdentityAgent` it can't see).
+- **Passphrase-protected key** — the CLI connects with `BatchMode=yes` (it never prompts). So
+  `launch` / `cluster launch` (including `--dry-run`) check, before creating anything, that the key
+  works without a prompt: either the agent ssh would use holds it (it honours `IdentityAgent`, e.g.
+  1Password, even with no private key file on disk), or the key has no passphrase. If neither, they
+  stop *before* creating a billed instance setup could never reach, and print the fix
+  (`ssh-add --apple-use-keychain <key>` on macOS, `ssh-add <key>` elsewhere).
+  On macOS, with `UseKeychain yes` in `~/.ssh/config`, the Keychain may supply the passphrase; that
+  can't be checked, so the CLI only warns. `--skip-key-check` turns the check off.
 
 ## Usage
 
@@ -211,8 +212,9 @@ matters with `--ebs-storage`: the new volume is created in the instance's AZ, an
 `--ebs-volume-id` reattach is pinned there.
 
 - **`--cheapest-az`** (spot only) ranks each region's AZs that offer the type (and have a default
-  subnet) by **current spot price** and tries them cheapest-first. A capacity miss moves to the next
-  AZ in the same region before the next region.
+  subnet) by **current spot price** and tries them cheapest-first. A capacity miss (or a spot price
+  over the maximum, or an AZ that doesn't support the launch) moves to the next AZ in the same region
+  before the next region. Every region's plan is checked before anything launches.
 - **`--availability-zone AZ`** / **`--az AZ`** (repeatable) restricts the launch to those AZs, tried in
   the order given. An AZ implies its region: without `--region`, the regions are the AZs' own. With
   `--cheapest-az` too, only the listed AZs are ranked.

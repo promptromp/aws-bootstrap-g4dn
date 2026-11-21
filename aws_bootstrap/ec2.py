@@ -496,18 +496,27 @@ def _run_instances(
                 "  Waiting will not help — retry with --on-demand or a different instance type.",
             ) from None
         if code == "Unsupported" and placement_az:
-            # The type isn't offered in this AZ: another AZ in the region may still work.
-            raise AzUnsupportedError(f"{config.instance_type} is not supported in {placement_az}.") from None
+            # Often the type isn't offered in this AZ, so another AZ of the region may
+            # work; the sweep decides (a hard pin re-raises the original error).
+            aws_msg = e.response["Error"].get("Message", "")
+            raise AzUnsupportedError(f"{placement_az}: {aws_msg or 'request unsupported'}", e) from None
         raise
     return response["Instances"][0]
 
 
 class AzUnsupportedError(Exception):
-    """The instance type isn't supported in the requested AZ: try the region's next AZ.
+    """EC2 returned ``Unsupported`` for a launch pinned to an AZ (message keeps AWS's text).
 
-    Unlike :class:`CapacityError` it never justifies a ``--wait`` sleep; if every
-    AZ of a region raises it, the region is dropped like a quota/price failure.
+    With other AZs to try, the sweep moves on to the next one; if every AZ of a
+    region raises it, the region is dropped like a quota/price failure. For a hard
+    pin (one AZ: an ``--ebs-volume-id``, a cluster's AZ, a single ``--az``) the
+    sweep re-raises :attr:`client_error`, AWS's own error, as before AZ selection.
+    Never justifies a ``--wait`` sleep.
     """
+
+    def __init__(self, message: str, client_error: botocore.exceptions.ClientError) -> None:
+        super().__init__(message)
+        self.client_error = client_error
 
 
 def _describe_failures(
@@ -547,12 +556,18 @@ def _aggregated_error(
     body = _describe_failures(regions, failures, market, azs_tried)
     hints: list[str] = []
     for region in regions:
-        if region in failures and failures[region][0] in ("quota", "price"):
+        if region in failures and failures[region][0] in ("quota", "price", "unsupported"):
             msg = failures[region][1]
             if msg not in hints:
                 hints.append(msg)
     if hints:
         tail = "\n\n" + "\n\n".join(f"  {h}" for h in hints)
+        if all(kind == "unsupported" for kind, _ in failures.values()):
+            family = config.instance_type.split(".")[0]
+            tail += (
+                "\n\n  The AZs tried don't support this launch: pick other AZs (or drop --availability-zone);"
+                f"\n  `aws-bootstrap list instance-types --prefix {family}` shows where it runs."
+            )
     else:
         tail = "\n\n  Try --wait, more --region values, --on-demand, or a different instance type."
     return CLIError(header + body + tail)
@@ -585,9 +600,14 @@ def launch_with_retry(
 
     ``prepare_region`` builds region-scoped prerequisites (client, AMI, SG, and
     the AZs to try); it is invoked at most once per region and cached. Within a
-    region, each AZ in ``ctx.placement_azs`` is tried in order (none: EC2 picks);
-    a capacity miss moves to the next AZ before the next region, and the region
-    counts as capacity-limited only once every AZ has missed.
+    region, each AZ in ``ctx.placement_azs`` is tried in order (none: EC2 picks).
+    A capacity miss, a spot price above the maximum, or ``Unsupported`` moves to
+    the next AZ before the next region (all three can differ by AZ); quota is
+    region-wide and drops the region at once. The region counts as
+    capacity-limited once every AZ has missed and at least one missed on
+    capacity; if every AZ failed on price/unsupported it is dropped. A single AZ
+    is a hard pin and keeps the pre-AZ-selection behaviour (``Unsupported``
+    re-raises AWS's error; a price failure drops the region).
     ``on_attempt(region, market, attempt, az)``'s ``attempt`` is the 0-based
     ``--wait`` backoff-cycle index; it stays ``0`` outside the wait loop (no-wait
     pass and on-demand fallback). ``az`` is the AZ requested, or None.
@@ -622,11 +642,15 @@ def launch_with_retry(
         for region in candidates:
             ctx = ctx_for(region)
             azs: tuple[str | None, ...] = ctx.placement_azs or (None,)
-            if ctx.placement_azs:
-                azs_tried[region] = list(ctx.placement_azs)
+            # One AZ is a hard pin (or EC2's choice): its errors keep their old meaning.
+            pinned = len(azs) == 1
             capacity_miss: CapacityError | None = None
-            unsupported: list[str] = []
+            az_failures: list[tuple[str, str]] = []  # AZ-level (kind, message): price / unsupported
             for az in azs:
+                if az:
+                    tried = azs_tried.setdefault(region, [])
+                    if az not in tried:
+                        tried.append(az)
                 if on_attempt:
                     on_attempt(region, mkt, attempt, az)
                 try:
@@ -645,18 +669,26 @@ def launch_with_retry(
                     capacity_miss = e
                     continue
                 except AzUnsupportedError as e:
-                    unsupported.append(str(e))
+                    if pinned:
+                        raise e.client_error from None
+                    az_failures.append(("unsupported", f"{config.instance_type}: {e}"))
                     continue
                 except RegionFatalError as e:
-                    # Quota / price is region-wide: no point trying the other AZs.
+                    if e.kind == "price" and not pinned:
+                        # Spot prices differ by AZ: another AZ may be under the maximum.
+                        az_failures.append(("price", e.message))
+                        continue
+                    # Quota is region-wide: the region's other AZs would only repeat it.
                     mark_fatal(region, e.kind, e.message, failures, fatal)
                     break
                 return RegionLaunch(region, ctx, inst, mkt)
             else:
                 if capacity_miss is not None:
                     failures[region] = ("capacity", str(capacity_miss))
-                elif unsupported:
-                    mark_fatal(region, "unsupported", " ".join(unsupported), failures, fatal)
+                elif az_failures:
+                    kind = "price" if any(k == "price" for k, _ in az_failures) else "unsupported"
+                    message = "\n  ".join(dict.fromkeys(m for k, m in az_failures if k == kind))
+                    mark_fatal(region, kind, message, failures, fatal)
         return None
 
     # --- Primary market (spot unless --on-demand), with optional wait loop ---
@@ -692,7 +724,8 @@ def launch_with_retry(
         break
 
     # --- No-wait on-demand fallback (spot was the primary market) ---
-    if primary_spot:
+    # Not when every region failed as "unsupported": on-demand would hit the same AZs.
+    if primary_spot and any(kind != "unsupported" for kind, _ in failures.values()):
         secho(
             f"\n  No spot capacity for {config.instance_type} in {', '.join(regions)}.",
             fg="yellow",
@@ -712,7 +745,7 @@ def launch_with_retry(
             return result
         raise _aggregated_error(config, regions, od_failures, "on-demand", azs_tried=azs_tried)
 
-    raise _aggregated_error(config, regions, failures, "on-demand", azs_tried=azs_tried)
+    raise _aggregated_error(config, regions, failures, market, azs_tried=azs_tried)
 
 
 _UBUNTU_AMI = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
@@ -1068,7 +1101,12 @@ def plan_azs(
         zones = list(explicit)
     else:
         zones = sorted(usable)
-    prices = spot_prices_by_az(ec2_client, instance_type)
+    try:
+        prices = spot_prices_by_az(ec2_client, instance_type)
+    except botocore.exceptions.ClientError:
+        if cheapest:
+            raise  # the ranking needs prices
+        prices = {}  # explicit AZs: prices are only for display
     options = [AzOption(z, prices.get(z)) for z in zones]
     if cheapest:
         options.sort(key=lambda o: (o.spot_price is None, o.spot_price or 0.0))  # stable: ties keep order

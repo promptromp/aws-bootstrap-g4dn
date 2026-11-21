@@ -109,8 +109,11 @@ _PROBE_HOST = "203.0.113.1"
 
 
 def key_fingerprint(pub_path: Path) -> str:
-    """The key's OpenSSH SHA256 fingerprint (``SHA256:…``), as ``ssh-keygen -lf`` and ``ssh-add -l`` print it."""
-    blob = base64.b64decode(_pubkey_blob(pub_path.read_text()))
+    """The key's OpenSSH SHA256 fingerprint (``SHA256:…``), as ``ssh-keygen -lf`` and ``ssh-add -l`` print it.
+
+    Raises ``ValueError`` when *pub_path* isn't an OpenSSH public key.
+    """
+    blob = base64.b64decode(_pubkey_blob(pub_path.read_text()), validate=True)
     return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
 
 
@@ -121,16 +124,24 @@ def _run_key_tool(cmd: list[str], env: dict[str, str] | None = None) -> subproce
 
 
 def _agent_sockets() -> list[str]:
-    """Agents ssh would ask: ``$SSH_AUTH_SOCK``, plus an ``IdentityAgent`` from the ssh config (e.g. 1Password)."""
-    sockets = []
-    if os.environ.get("SSH_AUTH_SOCK"):
-        sockets.append(os.environ["SSH_AUTH_SOCK"])
-    result = _run_key_tool(["ssh", "-G", _PROBE_HOST])
-    for line in result.stdout.splitlines():
+    """The agent ssh would ask, as ``ssh -G`` resolves it for the hosts this tool connects to.
+
+    ``IdentityAgent`` overrides ``$SSH_AUTH_SOCK`` (ssh_config(5)): ``none`` disables
+    agents, the literal ``SSH_AUTH_SOCK`` means the environment's socket, anything
+    else is a socket path (``~`` and ``$VAR`` expanded, e.g. 1Password's). Without an
+    ``identityagent`` line, ssh uses ``$SSH_AUTH_SOCK``.
+    """
+    env_sock = os.environ.get("SSH_AUTH_SOCK")
+    for line in _run_key_tool(["ssh", "-G", _PROBE_HOST]).stdout.splitlines():
         key, _, value = line.partition(" ")
-        if key == "identityagent" and value and value.lower() not in ("none", "ssh_auth_sock"):
-            sockets.append(os.path.expanduser(value.strip('"')))
-    return list(dict.fromkeys(sockets))
+        if key != "identityagent" or not value:
+            continue
+        if value.lower() == "none":
+            return []
+        if value == "SSH_AUTH_SOCK":
+            return [env_sock] if env_sock else []
+        return [os.path.expandvars(os.path.expanduser(value))]
+    return [env_sock] if env_sock else []
 
 
 def _agent_has_key(fingerprint: str) -> bool:
@@ -144,7 +155,9 @@ def _agent_has_key(fingerprint: str) -> bool:
 def _uses_macos_keychain(ssh_config: Path) -> bool:
     """``UseKeychain yes`` in the ssh config: macOS may then supply the passphrase without a prompt.
 
-    Apple's ``ssh -G`` doesn't report UseKeychain, so the config file is read directly.
+    Apple's ``ssh -G`` doesn't report UseKeychain, so the config file is read directly
+    (``Include``d files and the system config are not followed; ``--skip-key-check``
+    covers those).
     """
     try:
         text = ssh_config.read_text()
@@ -158,20 +171,28 @@ def check_key_usable(key_path: Path, ssh_config: Path | None = None) -> None:
 
     Every ssh/scp call runs with ``BatchMode=yes`` (:func:`_ssh_opts`), which never
     prompts. A passphrase-protected key that nothing unlocks would leave a launched,
-    billing instance that setup can never reach. Passes when the key has no
-    passphrase, or an agent holds it. Only warns when ``UseKeychain`` is configured
-    (the macOS Keychain may hold the passphrase, which can't be checked without
-    side effects), or when the ssh tools needed to check are missing.
+    billing instance that setup can never reach. Passes when the agent ssh would use
+    holds the key (even with no private key file on disk, as with 1Password), or the
+    private key has no passphrase. On macOS, only warns when ``UseKeychain`` is
+    configured (the Keychain may hold the passphrase, which can't be checked without
+    side effects). Also only warns when the ssh tools needed to check are missing.
     """
     priv = private_key_path(key_path)
-    if not priv.exists():
-        raise CLIError(
-            f"SSH private key not found: {priv}\n"
-            f"  {key_path} would be imported to AWS, but without its private key the instance is unreachable.\n"
-            "  Pass --key-path to a public key whose private key is next to it (same name without .pub)."
-        )
     load = f"ssh-add --apple-use-keychain {priv}" if platform.system() == "Darwin" else f"ssh-add {priv}"
     try:
+        try:
+            in_agent = key_path.exists() and _agent_has_key(key_fingerprint(key_path))
+        except ValueError:
+            raise CLIError(f"{key_path} is not an OpenSSH public key (pass --key-path to a .pub file).") from None
+        if in_agent:
+            return  # ssh uses the agent's copy; the file's passphrase doesn't matter
+        if not priv.exists():
+            raise CLIError(
+                f"SSH private key not found: {priv}, and no ssh-agent holds {key_path}.\n"
+                "  The key would be imported to AWS, but ssh could never authenticate to the instance.\n"
+                "  Pass --key-path to a public key whose private key is next to it (same name without .pub),\n"
+                "  or load the key into your agent."
+            )
         probe = _run_key_tool(["ssh-keygen", "-y", "-P", "", "-f", str(priv)])
         if probe.returncode == 0:
             return  # no passphrase
@@ -179,12 +200,10 @@ def check_key_usable(key_path: Path, ssh_config: Path | None = None) -> None:
             raise CLIError(
                 f"SSH private key {priv} is readable by others, so ssh will refuse it.\n  Fix: chmod 600 {priv}"
             )
-        if key_path.exists() and _agent_has_key(key_fingerprint(key_path)):
-            return
     except (OSError, subprocess.TimeoutExpired) as e:
         click.echo(f"  WARNING: could not check whether {priv} works without a prompt ({e}); continuing.", err=True)
         return
-    if _uses_macos_keychain(ssh_config or _DEFAULT_SSH_CONFIG):
+    if platform.system() == "Darwin" and _uses_macos_keychain(ssh_config or _DEFAULT_SSH_CONFIG):
         click.echo(
             click.style("  WARNING: ", fg="yellow", bold=True)
             + f"{priv} has a passphrase and isn't loaded in ssh-agent. Relying on the macOS Keychain\n"

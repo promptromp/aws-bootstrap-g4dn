@@ -27,11 +27,18 @@ def _client_error(code: str, message: str = "test") -> botocore.exceptions.Clien
     return botocore.exceptions.ClientError({"Error": {"Code": code, "Message": message}}, "Op")
 
 
-def _ts(hour: int) -> datetime:
-    return datetime(2026, 11, 21, hour, tzinfo=UTC)
+CAPACITY = _client_error("InsufficientInstanceCapacity")
+QUOTA = _client_error("MaxSpotInstanceCountExceeded")
+PRICE = _client_error("SpotMaxPriceTooLow")
+UNSUPPORTED = _client_error("Unsupported", "Your requested instance type is not supported in your requested AZ.")
 
 
-def _ec2(*, prices=None, offered=None, subnets=None, zones_error=None, opt_in=None) -> MagicMock:
+# ---------------------------------------------------------------------------
+# helpers: spot prices, offerings, default subnets
+# ---------------------------------------------------------------------------
+
+
+def _ec2(*, prices=None, offered=None, subnets=None, zones_error=None, opt_in=None, price_error=None) -> MagicMock:
     """A fake EC2 client whose paginators return the given pages.
 
     prices: [(az, price, hour)]; offered / subnets: [az]; opt_in: {az: status}.
@@ -41,7 +48,8 @@ def _ec2(*, prices=None, offered=None, subnets=None, zones_error=None, opt_in=No
         "describe_spot_price_history": [
             {
                 "SpotPriceHistory": [
-                    {"AvailabilityZone": az, "SpotPrice": str(p), "Timestamp": _ts(h)} for az, p, h in (prices or [])
+                    {"AvailabilityZone": az, "SpotPrice": str(p), "Timestamp": datetime(2026, 11, 21, h, tzinfo=UTC)}
+                    for az, p, h in (prices or [])
                 ]
             }
         ],
@@ -51,7 +59,10 @@ def _ec2(*, prices=None, offered=None, subnets=None, zones_error=None, opt_in=No
 
     def paginator(name):
         pag = MagicMock()
-        pag.paginate.return_value = pages[name]
+        if name == "describe_spot_price_history" and price_error:
+            pag.paginate.side_effect = price_error
+        else:
+            pag.paginate.return_value = pages[name]
         return pag
 
     ec2.get_paginator.side_effect = paginator
@@ -70,11 +81,6 @@ USW2 = ["us-west-2a", "us-west-2b", "us-west-2c", "us-west-2d"]
 USW2_PRICES = [("us-west-2a", 2.2122, 13), ("us-west-2b", 0.9911, 19), ("us-west-2c", 2.2122, 16)]
 
 
-# ---------------------------------------------------------------------------
-# helpers
-# ---------------------------------------------------------------------------
-
-
 def test_spot_prices_by_az_keeps_the_latest_record_per_az():
     ec2 = _ec2(prices=[("us-west-2a", 2.5, 10), ("us-west-2a", 2.2, 13), ("us-west-2b", 0.99, 19)])
     assert spot_prices_by_az(ec2, "g6e.2xlarge") == {"us-west-2a": 2.2, "us-west-2b": 0.99}
@@ -86,14 +92,20 @@ def test_offered_and_default_subnet_azs():
     assert default_subnet_azs(ec2) == {"us-west-2a", "us-west-2b"}
 
 
-def test_spot_price_or_none_swallows_api_errors():
+@pytest.mark.parametrize(
+    "side_effect",
+    [_client_error("UnauthorizedOperation"), botocore.exceptions.EndpointConnectionError(endpoint_url="x")],
+    ids=["client-error", "botocore-error"],
+)
+def test_spot_price_or_none_swallows_api_errors(side_effect):
     """Called after RunInstances: a denied/throttled lookup must not abort and lose the instance record."""
     ec2 = MagicMock()
-    ec2.describe_spot_price_history.side_effect = _client_error("UnauthorizedOperation")
+    ec2.describe_spot_price_history.side_effect = side_effect
     assert spot_price_or_none(ec2, "g6e.2xlarge", "us-west-2b") is None
-    ec2.describe_spot_price_history.side_effect = botocore.exceptions.EndpointConnectionError(endpoint_url="x")
-    assert spot_price_or_none(ec2, "g6e.2xlarge", "us-west-2b") is None
-    ec2.describe_spot_price_history.side_effect = None
+
+
+def test_spot_price_or_none_returns_the_price():
+    ec2 = MagicMock()
     ec2.describe_spot_price_history.return_value = {"SpotPriceHistory": [{"SpotPrice": "0.9911"}]}
     assert spot_price_or_none(ec2, "g6e.2xlarge", "us-west-2b") == pytest.approx(0.9911)
 
@@ -103,61 +115,57 @@ def test_spot_price_or_none_swallows_api_errors():
 # ---------------------------------------------------------------------------
 
 
-def test_plan_azs_cheapest_orders_by_price_unknown_last():
-    ec2 = _ec2(prices=USW2_PRICES, offered=USW2, subnets=USW2)
-    plan = plan_azs(ec2, "us-west-2", "g6e.2xlarge", cheapest=True)
-    assert [o.zone for o in plan] == ["us-west-2b", "us-west-2a", "us-west-2c", "us-west-2d"]
-    assert plan[0] == AzOption("us-west-2b", pytest.approx(0.9911))
-    assert plan[-1].spot_price is None  # us-west-2d: offered, no price record
+@pytest.mark.parametrize(
+    "plan_kwargs,subnets,expected",
+    [
+        ({"cheapest": True}, USW2, ["us-west-2b", "us-west-2a", "us-west-2c", "us-west-2d"]),  # 2d: no price, last
+        ({"explicit": ("us-west-2c", "us-west-2b")}, USW2, ["us-west-2c", "us-west-2b"]),  # given order kept
+        ({"explicit": ("us-west-2c", "us-west-2b"), "cheapest": True}, USW2, ["us-west-2b", "us-west-2c"]),
+        ({"cheapest": True}, ["us-west-2a", "us-west-2c"], ["us-west-2a", "us-west-2c"]),  # default VPC subnets only
+        ({"cheapest": True}, [], ["us-west-2b", "us-west-2a", "us-west-2c", "us-west-2d"]),  # no default subnets
+    ],
+    ids=["cheapest", "explicit-order", "explicit-cheapest", "default-subnet-filter", "no-default-subnets"],
+)
+def test_plan_azs(plan_kwargs, subnets, expected):
+    plan = plan_azs(_ec2(prices=USW2_PRICES, offered=USW2, subnets=subnets), "us-west-2", "g6e.2xlarge", **plan_kwargs)
+    assert [o.zone for o in plan] == expected
+    prices = {az: p for az, p, _ in USW2_PRICES}
+    assert all(o == AzOption(o.zone, prices.get(o.zone)) for o in plan)
 
 
-def test_plan_azs_explicit_keeps_the_given_order_with_prices():
-    ec2 = _ec2(prices=USW2_PRICES, offered=USW2, subnets=USW2)
-    plan = plan_azs(ec2, "us-west-2", "g6e.2xlarge", explicit=("us-west-2c", "us-west-2b"))
-    assert [(o.zone, o.spot_price) for o in plan] == [("us-west-2c", 2.2122), ("us-west-2b", 0.9911)]
+@pytest.mark.parametrize(
+    "ec2_kwargs,plan_kwargs,match",
+    [
+        (
+            {"offered": ["us-west-2a", "us-west-2b"]},
+            {"explicit": ("us-west-2d",)},
+            "Usable AZs in us-west-2: us-west-2a",
+        ),
+        (
+            {"offered": USW2, "zones_error": _client_error("InvalidParameterValue", "Invalid AZ")},
+            {"explicit": ("us-west-2z",)},
+            "Unknown availability zone in us-west-2: us-west-2z",
+        ),
+        (
+            {"offered": USW2, "opt_in": {"us-west-2-lax-1a": "not-opted-in"}},
+            {"explicit": ("us-west-2-lax-1a",)},
+            "not opted in",
+        ),
+        ({"offered": []}, {"cheapest": True}, "not offered in any availability zone of us-west-2"),
+    ],
+    ids=["unusable-explicit", "unknown-az", "not-opted-in", "type-not-offered"],
+)
+def test_plan_azs_errors(ec2_kwargs, plan_kwargs, match):
+    with pytest.raises(CLIError, match=match):
+        plan_azs(_ec2(prices=USW2_PRICES, subnets=USW2, **ec2_kwargs), "us-west-2", "g6e.2xlarge", **plan_kwargs)
 
 
-def test_plan_azs_explicit_with_cheapest_ranks_only_the_given_azs():
-    ec2 = _ec2(prices=USW2_PRICES, offered=USW2, subnets=USW2)
-    plan = plan_azs(ec2, "us-west-2", "g6e.2xlarge", explicit=("us-west-2c", "us-west-2b"), cheapest=True)
-    assert [o.zone for o in plan] == ["us-west-2b", "us-west-2c"]
-
-
-def test_plan_azs_limits_candidates_to_azs_with_a_default_subnet():
-    """The tool launches into the default VPC, so an AZ without a default subnet can't be used."""
-    ec2 = _ec2(prices=USW2_PRICES, offered=USW2, subnets=["us-west-2a", "us-west-2c"])
-    assert [o.zone for o in plan_azs(ec2, "us-west-2", "g6e.2xlarge", cheapest=True)] == ["us-west-2a", "us-west-2c"]
-
-
-def test_plan_azs_no_default_subnets_at_all_does_not_filter():
-    ec2 = _ec2(prices=USW2_PRICES, offered=USW2, subnets=[])
-    assert len(plan_azs(ec2, "us-west-2", "g6e.2xlarge", cheapest=True)) == 4
-
-
-def test_plan_azs_explicit_unusable_az_names_the_usable_ones():
-    ec2 = _ec2(prices=USW2_PRICES, offered=["us-west-2a", "us-west-2b"], subnets=USW2)
-    with pytest.raises(CLIError) as exc:
-        plan_azs(ec2, "us-west-2", "g6e.2xlarge", explicit=("us-west-2d",))
-    msg = exc.value.format_message()
-    assert "us-west-2d" in msg
-    assert "Usable AZs in us-west-2: us-west-2a, us-west-2b" in msg
-
-
-def test_plan_azs_unknown_az_is_confirmed_with_ec2():
-    ec2 = _ec2(offered=USW2, subnets=USW2, zones_error=_client_error("InvalidParameterValue", "Invalid AZ"))
-    with pytest.raises(CLIError, match="Unknown availability zone in us-west-2: us-west-2z"):
-        plan_azs(ec2, "us-west-2", "g6e.2xlarge", explicit=("us-west-2z",))
-
-
-def test_plan_azs_rejects_a_zone_not_opted_in():
-    ec2 = _ec2(offered=USW2, subnets=USW2, opt_in={"us-west-2-lax-1a": "not-opted-in"})
-    with pytest.raises(CLIError, match="not opted in"):
-        plan_azs(ec2, "us-west-2", "g6e.2xlarge", explicit=("us-west-2-lax-1a",))
-
-
-def test_plan_azs_type_not_offered_in_region():
-    with pytest.raises(CLIError, match="not offered in any availability zone of us-west-2"):
-        plan_azs(_ec2(offered=[]), "us-west-2", "p6-b300.48xlarge", cheapest=True)
+def test_plan_azs_explicit_tolerates_a_denied_price_lookup():
+    """--az without --cheapest-az only shows prices; it mustn't need DescribeSpotPriceHistory."""
+    ec2 = _ec2(offered=USW2, subnets=USW2, price_error=_client_error("UnauthorizedOperation"))
+    assert plan_azs(ec2, "us-west-2", "g6e.2xlarge", explicit=("us-west-2b",)) == [AzOption("us-west-2b", None)]
+    with pytest.raises(botocore.exceptions.ClientError):
+        plan_azs(ec2, "us-west-2", "g6e.2xlarge", cheapest=True)  # the ranking needs prices
 
 
 # ---------------------------------------------------------------------------
@@ -165,114 +173,132 @@ def test_plan_azs_type_not_offered_in_region():
 # ---------------------------------------------------------------------------
 
 
-def test_run_instances_unsupported_in_pinned_az_is_az_level():
+@pytest.mark.parametrize(
+    "placement_az,raised", [("us-west-2d", AzUnsupportedError), (None, botocore.exceptions.ClientError)]
+)
+def test_run_instances_unsupported(placement_az, raised):
     ec2 = MagicMock()
-    ec2.run_instances.side_effect = _client_error("Unsupported")
-    with pytest.raises(AzUnsupportedError, match="us-west-2d"):
-        _run_instances(ec2, LaunchConfig(), "ami", "sg", "us-west-2", True, "k", placement_az="us-west-2d")
-
-
-def test_run_instances_unsupported_without_az_is_unchanged():
-    ec2 = MagicMock()
-    ec2.run_instances.side_effect = _client_error("Unsupported")
-    with pytest.raises(botocore.exceptions.ClientError):
-        _run_instances(ec2, LaunchConfig(), "ami", "sg", "us-west-2", True, "k")
+    ec2.run_instances.side_effect = UNSUPPORTED
+    with pytest.raises(raised) as exc:
+        _run_instances(ec2, LaunchConfig(), "ami", "sg", "us-west-2", True, "k", placement_az=placement_az)
+    assert "not supported in your requested AZ" in str(exc.value)  # AWS's own message is kept
 
 
 # ---------------------------------------------------------------------------
-# launch_with_retry: AZ fallthrough
+# launch_with_retry: the AZ loop inside the region sweep
 # ---------------------------------------------------------------------------
 
 
 def _ctx(region: str, azs: tuple[str, ...], outcomes: dict[str | None, object]) -> RegionContext:
-    """Region context whose run_instances outcome depends on the requested AZ."""
+    """Region context whose run_instances outcome depends on the requested AZ (default: no capacity)."""
     client = MagicMock()
 
     def run(**params):
         az = params.get("Placement", {}).get("AvailabilityZone")
-        outcome = outcomes.get(az, _client_error("InsufficientInstanceCapacity"))
+        outcome = outcomes.get(az, CAPACITY)
         if isinstance(outcome, Exception):
             raise outcome
         return {"Instances": [{"InstanceId": outcome, "Placement": {"AvailabilityZone": az}}]}
 
     client.run_instances.side_effect = run
     return RegionContext(
-        region=region,
-        ec2_client=client,
-        ami={"ImageId": "ami-1"},
-        sg_id="sg-1",
-        key_name="k",
-        placement_azs=azs,
+        region=region, ec2_client=client, ami={"ImageId": "ami-1"}, sg_id="sg-1", key_name="k", placement_azs=azs
     )
 
 
-def test_capacity_miss_tries_the_next_az_before_the_next_region():
-    contexts = {
-        "us-west-2": _ctx("us-west-2", ("us-west-2b", "us-west-2a"), {"us-west-2a": "i-a"}),
-        "us-east-1": _ctx("us-east-1", (), {None: "i-east"}),
-    }
-    attempts: list[tuple[str, str | None]] = []
-    result = launch_with_retry(
-        LaunchConfig(regions=("us-west-2", "us-east-1")),
-        lambda r: contexts[r],
-        on_attempt=lambda region, market, attempt, az: attempts.append((region, az)),
-    )
-    assert result.region == "us-west-2"
-    assert result.instance["InstanceId"] == "i-a"
-    assert attempts == [("us-west-2", "us-west-2b"), ("us-west-2", "us-west-2a")]
+W2 = ("us-west-2b", "us-west-2a")
 
 
-def test_every_az_missing_falls_through_to_the_next_region():
-    contexts = {
-        "us-west-2": _ctx("us-west-2", ("us-west-2b", "us-west-2a"), {}),
-        "us-east-1": _ctx("us-east-1", (), {None: "i-east"}),
-    }
-    attempts: list[tuple[str, str | None]] = []
-    result = launch_with_retry(
-        LaunchConfig(regions=("us-west-2", "us-east-1")),
-        lambda r: contexts[r],
-        on_attempt=lambda region, market, attempt, az: attempts.append((region, az)),
-    )
-    assert result.region == "us-east-1"
-    assert attempts == [("us-west-2", "us-west-2b"), ("us-west-2", "us-west-2a"), ("us-east-1", None)]
-
-
-def test_region_fatal_in_one_az_skips_the_regions_other_azs():
-    """Quota / spot price is region-wide: trying the other AZs would only repeat it."""
-    quota = _client_error("MaxSpotInstanceCountExceeded")
-    contexts = {
-        "us-west-2": _ctx("us-west-2", ("us-west-2b", "us-west-2a"), {"us-west-2b": quota, "us-west-2a": "i-a"}),
-        "us-east-1": _ctx("us-east-1", (), {None: "i-east"}),
-    }
+@pytest.mark.parametrize(
+    "w2_outcomes,expected_region,expected_attempts,expected_fatal",
+    [
+        ({"us-west-2a": "i-a"}, "us-west-2", ["us-west-2b", "us-west-2a"], []),
+        ({}, "us-east-1", ["us-west-2b", "us-west-2a", None], []),
+        ({"us-west-2b": QUOTA, "us-west-2a": "i-a"}, "us-east-1", ["us-west-2b", None], [("us-west-2", "quota")]),
+        ({"us-west-2b": PRICE, "us-west-2a": "i-a"}, "us-west-2", ["us-west-2b", "us-west-2a"], []),
+        ({"us-west-2b": UNSUPPORTED, "us-west-2a": "i-a"}, "us-west-2", ["us-west-2b", "us-west-2a"], []),
+        (
+            {"us-west-2b": PRICE, "us-west-2a": UNSUPPORTED},
+            "us-east-1",
+            ["us-west-2b", "us-west-2a", None],
+            [("us-west-2", "price")],
+        ),
+        (
+            {"us-west-2b": UNSUPPORTED, "us-west-2a": UNSUPPORTED},
+            "us-east-1",
+            ["us-west-2b", "us-west-2a", None],
+            [("us-west-2", "unsupported")],
+        ),
+    ],
+    ids=[
+        "capacity-tries-next-az",
+        "all-azs-miss-next-region",
+        "quota-skips-other-azs",
+        "price-tries-next-az",
+        "unsupported-tries-next-az",
+        "price-and-unsupported-drop-region",
+        "all-unsupported-drop-region",
+    ],
+)
+def test_az_sweep(w2_outcomes, expected_region, expected_attempts, expected_fatal):
+    contexts = {"us-west-2": _ctx("us-west-2", W2, w2_outcomes), "us-east-1": _ctx("us-east-1", (), {None: "i-east"})}
+    attempts: list[str | None] = []
     fatal: list[tuple[str, str]] = []
     result = launch_with_retry(
         LaunchConfig(regions=("us-west-2", "us-east-1")),
         lambda r: contexts[r],
+        on_attempt=lambda region, market, attempt, az: attempts.append(az),
         on_region_fatal=lambda region, kind, msg: fatal.append((region, kind)),
     )
-    assert result.region == "us-east-1"
-    assert fatal == [("us-west-2", "quota")]
-    assert contexts["us-west-2"].ec2_client.run_instances.call_count == 1
+    assert result.region == expected_region
+    assert attempts == expected_attempts
+    assert fatal == expected_fatal
 
 
-def test_unsupported_in_every_az_drops_the_region():
-    unsupported = _client_error("Unsupported")
-    contexts = {
-        "us-west-2": _ctx("us-west-2", ("us-west-2d",), {"us-west-2d": unsupported}),
-        "us-east-1": _ctx("us-east-1", (), {None: "i-east"}),
-    }
-    fatal: list[tuple[str, str]] = []
-    result = launch_with_retry(
-        LaunchConfig(regions=("us-west-2", "us-east-1")),
-        lambda r: contexts[r],
-        on_region_fatal=lambda region, kind, msg: fatal.append((region, kind)),
-    )
-    assert result.region == "us-east-1"
-    assert fatal == [("us-west-2", "unsupported")]
+def test_hard_pinned_az_keeps_the_pre_az_selection_behaviour():
+    """One AZ (an EBS volume's, a cluster's, a single --az): Unsupported surfaces AWS's own error."""
+    contexts = {"us-west-2": _ctx("us-west-2", ("us-west-2d",), {"us-west-2d": UNSUPPORTED})}
+    with pytest.raises(botocore.exceptions.ClientError) as exc:
+        launch_with_retry(LaunchConfig(regions=("us-west-2",)), lambda r: contexts[r])
+    assert exc.value.response["Error"]["Code"] == "Unsupported"
+
+
+def test_hard_pinned_az_price_failure_drops_the_region():
+    contexts = {"us-west-2": _ctx("us-west-2", ("us-west-2d",), {"us-west-2d": PRICE})}
+    fatal: list[str] = []
+    with pytest.raises(CLIError):
+        launch_with_retry(
+            LaunchConfig(regions=("us-west-2",), spot=False),
+            lambda r: contexts[r],
+            on_region_fatal=lambda region, kind, msg: fatal.append(kind),
+        )
+    assert fatal == ["price"]
+
+
+def test_all_unsupported_skips_the_on_demand_fallback():
+    """On-demand would hit the same unsupported AZs: fail with AWS's reason, don't offer it."""
+    contexts = {"us-west-2": _ctx("us-west-2", W2, {"us-west-2b": UNSUPPORTED, "us-west-2a": UNSUPPORTED})}
+    confirm = MagicMock(return_value=True)
+    with pytest.raises(CLIError) as exc:
+        launch_with_retry(LaunchConfig(regions=("us-west-2",)), lambda r: contexts[r], confirm_on_demand=confirm)
+    confirm.assert_not_called()
+    msg = exc.value.format_message()
+    assert "Could not launch g4dn.xlarge (spot)" in msg
+    assert "not supported in your requested AZ" in msg
+    assert "list instance-types --prefix g4dn" in msg
+
+
+def test_failure_names_only_the_azs_actually_tried():
+    contexts = {"us-west-2": _ctx("us-west-2", ("us-west-2b", "us-west-2a", "us-west-2c"), {"us-west-2b": QUOTA})}
+    with pytest.raises(CLIError) as exc:
+        launch_with_retry(
+            LaunchConfig(regions=("us-west-2",), spot=False), lambda r: contexts[r], confirm_on_demand=lambda: False
+        )
+    assert "(tried us-west-2b)" in exc.value.format_message()
 
 
 def test_wait_resweeps_the_azs_and_the_final_error_names_them():
-    contexts = {"us-west-2": _ctx("us-west-2", ("us-west-2b", "us-west-2a"), {})}
+    contexts = {"us-west-2": _ctx("us-west-2", W2, {})}
     clock = iter([0.0, 10.0, 10.0, 99999.0, 99999.0])
     attempts: list[str | None] = []
     with pytest.raises(CLIError) as exc:
@@ -285,11 +311,3 @@ def test_wait_resweeps_the_azs_and_the_final_error_names_them():
         )
     assert attempts[:4] == ["us-west-2b", "us-west-2a", "us-west-2b", "us-west-2a"]
     assert "us-west-2: no spot capacity (tried us-west-2b, us-west-2a)" in exc.value.format_message()
-
-
-def test_no_azs_lets_ec2_choose():
-    contexts = {"us-west-2": _ctx("us-west-2", (), {None: "i-any"})}
-    result = launch_with_retry(LaunchConfig(regions=("us-west-2",)), lambda r: contexts[r])
-    assert result.instance["InstanceId"] == "i-any"
-    params = contexts["us-west-2"].ec2_client.run_instances.call_args.kwargs
-    assert "Placement" not in params

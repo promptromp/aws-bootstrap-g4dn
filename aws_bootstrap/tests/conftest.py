@@ -8,7 +8,7 @@ from click.testing import CliRunner
 
 
 @pytest.fixture(autouse=True)
-def _stub_key_check(request):
+def key_check_stub(request):
     """Stub the CLI's pre-launch SSH key check.
 
     Most launch tests write only a ``.pub`` into tmp_path, so the real check

@@ -17,6 +17,8 @@ from aws_bootstrap.ec2 import CLIError
 
 pytestmark = pytest.mark.skipif(shutil.which("ssh-keygen") is None, reason="needs ssh-keygen")
 
+REAL_AGENT_SOCKETS = ssh._agent_sockets  # captured before the autouse fixture replaces it
+
 
 @pytest.fixture(autouse=True)
 def _no_real_agent(monkeypatch):
@@ -33,135 +35,174 @@ def _keygen(tmp_path: Path, name: str, passphrase: str = "") -> Path:
 
 
 @pytest.fixture
-def no_keychain(tmp_path) -> Path:
-    cfg = tmp_path / "ssh_config"
-    cfg.write_text("Host *\n  ServerAliveInterval 60\n")
-    return cfg
+def plain_key(tmp_path) -> Path:
+    return _keygen(tmp_path, "plain")
 
 
 @pytest.fixture
-def keychain(tmp_path) -> Path:
-    cfg = tmp_path / "ssh_config_keychain"
-    cfg.write_text("Host *\n  AddKeysToAgent yes\n  UseKeychain yes\n")
-    return cfg
+def locked_key(tmp_path) -> Path:
+    return _keygen(tmp_path, "locked", "s3cret")
 
 
-def test_key_without_passphrase_passes(tmp_path, no_keychain):
-    ssh.check_key_usable(_keygen(tmp_path, "plain"), ssh_config=no_keychain)
+@pytest.fixture
+def ssh_config(tmp_path):
+    """Write an ssh config with the given lines; returns its path."""
+
+    def write(*lines: str) -> Path:
+        cfg = tmp_path / "ssh_config"
+        cfg.write_text("Host *\n" + "".join(f"  {line}\n" for line in lines))
+        return cfg
+
+    return write
 
 
-def test_passphrase_key_outside_any_agent_fails_with_the_fix(tmp_path, no_keychain, monkeypatch):
-    monkeypatch.setattr(ssh.platform, "system", lambda: "Darwin")
+@pytest.fixture
+def fake_agent(monkeypatch):
+    """Make an agent at a fake socket list the given fingerprints (``ssh-add -l``)."""
+
+    def install(*fingerprints: str) -> None:
+        monkeypatch.setattr(ssh, "_agent_sockets", lambda: ["/tmp/fake-agent.sock"])
+        real_run = ssh._run_key_tool
+
+        def run(cmd, env=None):
+            if cmd[0] != "ssh-add":
+                return real_run(cmd, env)
+            assert env["SSH_AUTH_SOCK"] == "/tmp/fake-agent.sock"
+            out = "".join(f"256 {fp} key (ED25519)\n" for fp in fingerprints)
+            return subprocess.CompletedProcess(cmd, 0 if fingerprints else 1, stdout=out, stderr="")
+
+        monkeypatch.setattr(ssh, "_run_key_tool", run)
+
+    return install
+
+
+# ---------------------------------------------------------------------------
+# check_key_usable
+# ---------------------------------------------------------------------------
+
+
+def test_key_without_passphrase_passes(plain_key, ssh_config):
+    ssh.check_key_usable(plain_key, ssh_config=ssh_config())
+
+
+@pytest.mark.parametrize(
+    "system,fix,absent",
+    [("Darwin", "ssh-add --apple-use-keychain", None), ("Linux", "ssh-add", "--apple-use-keychain")],
+)
+def test_passphrase_key_outside_any_agent_fails_with_the_fix(locked_key, ssh_config, monkeypatch, system, fix, absent):
+    monkeypatch.setattr(ssh.platform, "system", lambda: system)
     with pytest.raises(CLIError) as exc:
-        ssh.check_key_usable(_keygen(tmp_path, "locked", "s3cret"), ssh_config=no_keychain)
+        ssh.check_key_usable(locked_key, ssh_config=ssh_config())
     msg = exc.value.format_message()
     assert "has a passphrase and isn't loaded in ssh-agent" in msg
     assert "BatchMode=yes" in msg
-    assert f"ssh-add --apple-use-keychain {tmp_path / 'locked'}" in msg
+    assert f"{fix} {locked_key.with_suffix('')}" in msg
     assert "--skip-key-check" in msg
+    if absent:
+        assert absent not in msg
 
 
-def test_the_fix_is_plain_ssh_add_off_macos(tmp_path, no_keychain, monkeypatch):
-    monkeypatch.setattr(ssh.platform, "system", lambda: "Linux")
-    with pytest.raises(CLIError) as exc:
-        ssh.check_key_usable(_keygen(tmp_path, "locked", "s3cret"), ssh_config=no_keychain)
-    assert f"ssh-add {tmp_path / 'locked'}" in exc.value.format_message()
-    assert "--apple-use-keychain" not in exc.value.format_message()
+@pytest.mark.parametrize("holds_it", [True, False], ids=["agent-holds-key", "agent-holds-other-keys"])
+def test_passphrase_key_and_the_agent(locked_key, ssh_config, fake_agent, holds_it):
+    fake_agent(ssh.key_fingerprint(locked_key) if holds_it else "SHA256:someoneelse")
+    if holds_it:
+        ssh.check_key_usable(locked_key, ssh_config=ssh_config())
+    else:
+        with pytest.raises(CLIError):
+            ssh.check_key_usable(locked_key, ssh_config=ssh_config())
 
 
-def test_passphrase_key_held_by_an_agent_passes(tmp_path, no_keychain, monkeypatch):
-    pub = _keygen(tmp_path, "locked", "s3cret")
-    fingerprint = ssh.key_fingerprint(pub)
-    monkeypatch.setattr(ssh, "_agent_sockets", lambda: ["/tmp/fake-agent.sock"])
-    real_run = ssh._run_key_tool
-
-    def fake_run(cmd, env=None):
-        if cmd[0] == "ssh-add":
-            assert env["SSH_AUTH_SOCK"] == "/tmp/fake-agent.sock"
-            return subprocess.CompletedProcess(cmd, 0, stdout=f"256 {fingerprint} locked (ED25519)\n", stderr="")
-        return real_run(cmd, env)
-
-    monkeypatch.setattr(ssh, "_run_key_tool", fake_run)
-    ssh.check_key_usable(pub, ssh_config=no_keychain)
+@pytest.mark.parametrize("system,warns", [("Darwin", True), ("Linux", False)])
+def test_usekeychain_only_warns_on_macos(locked_key, ssh_config, monkeypatch, capsys, system, warns):
+    """The Keychain may supply the passphrase on macOS (undecidable: warn); elsewhere nothing will."""
+    monkeypatch.setattr(ssh.platform, "system", lambda: system)
+    cfg = ssh_config("IgnoreUnknown UseKeychain", "UseKeychain yes")
+    if warns:
+        ssh.check_key_usable(locked_key, ssh_config=cfg)
+        assert "Relying on the macOS Keychain" in capsys.readouterr().err
+    else:
+        with pytest.raises(CLIError):
+            ssh.check_key_usable(locked_key, ssh_config=cfg)
 
 
-def test_agent_holding_other_keys_does_not_count(tmp_path, no_keychain, monkeypatch):
-    pub = _keygen(tmp_path, "locked", "s3cret")
-    monkeypatch.setattr(ssh, "_agent_sockets", lambda: ["/tmp/fake-agent.sock"])
-    real_run = ssh._run_key_tool
-
-    def fake_run(cmd, env=None):
-        if cmd[0] == "ssh-add":
-            return subprocess.CompletedProcess(cmd, 0, stdout="256 SHA256:someoneelse other (ED25519)\n", stderr="")
-        return real_run(cmd, env)
-
-    monkeypatch.setattr(ssh, "_run_key_tool", fake_run)
-    with pytest.raises(CLIError):
-        ssh.check_key_usable(pub, ssh_config=no_keychain)
+@pytest.mark.parametrize("in_agent", [False, True], ids=["no-agent", "agent-holds-key"])
+def test_missing_private_key(plain_key, ssh_config, fake_agent, in_agent):
+    """Only the agent's copy can work without the file (e.g. 1Password): pass then, fail otherwise."""
+    plain_key.with_suffix("").unlink()
+    fake_agent(*([ssh.key_fingerprint(plain_key)] if in_agent else []))
+    if in_agent:
+        ssh.check_key_usable(plain_key, ssh_config=ssh_config())
+    else:
+        with pytest.raises(CLIError, match="SSH private key not found"):
+            ssh.check_key_usable(plain_key, ssh_config=ssh_config())
 
 
-def test_usekeychain_only_warns(tmp_path, keychain, capsys):
-    """macOS may supply the passphrase from the Keychain without a prompt: undecidable, so warn."""
-    ssh.check_key_usable(_keygen(tmp_path, "locked", "s3cret"), ssh_config=keychain)
-    err = capsys.readouterr().err
-    assert "Relying on the macOS Keychain" in err
-    assert "ssh-add" in err
-
-
-def test_missing_private_key_fails(tmp_path, no_keychain):
-    pub = _keygen(tmp_path, "plain")
-    (tmp_path / "plain").unlink()
-    with pytest.raises(CLIError, match="SSH private key not found"):
-        ssh.check_key_usable(pub, ssh_config=no_keychain)
-
-
-def test_world_readable_private_key_fails_with_chmod_hint(tmp_path, no_keychain):
-    pub = _keygen(tmp_path, "loose")
-    (tmp_path / "loose").chmod(0o644)
+def test_world_readable_private_key_fails_with_chmod_hint(plain_key, ssh_config):
+    plain_key.with_suffix("").chmod(0o644)
     with pytest.raises(CLIError, match="chmod 600"):
-        ssh.check_key_usable(pub, ssh_config=no_keychain)
+        ssh.check_key_usable(plain_key, ssh_config=ssh_config())
 
 
-def test_missing_ssh_tools_warn_and_continue(tmp_path, no_keychain, monkeypatch, capsys):
+def test_not_an_openssh_public_key(tmp_path, ssh_config):
+    bogus = tmp_path / "id.pub"
+    bogus.write_text("-----BEGIN PUBLIC KEY-----\nnot*base64\n")
+    with pytest.raises(CLIError, match="not an OpenSSH public key"):
+        ssh.check_key_usable(bogus, ssh_config=ssh_config())
+
+
+def test_missing_ssh_tools_warn_and_continue(locked_key, ssh_config, monkeypatch, capsys):
     """Can't decide without ssh-keygen: don't block a launch on that."""
-    pub = _keygen(tmp_path, "locked", "s3cret")
 
     def no_tool(cmd, env=None):
         raise FileNotFoundError(cmd[0])
 
     monkeypatch.setattr(ssh, "_run_key_tool", no_tool)
-    ssh.check_key_usable(pub, ssh_config=no_keychain)
+    ssh.check_key_usable(locked_key, ssh_config=ssh_config())
     assert "could not check" in capsys.readouterr().err
 
 
-def test_key_fingerprint_matches_ssh_keygen(tmp_path):
-    pub = _keygen(tmp_path, "plain")
-    out = subprocess.run(["ssh-keygen", "-l", "-E", "sha256", "-f", str(pub)], capture_output=True, text=True)
-    assert ssh.key_fingerprint(pub) == out.stdout.split()[1]
+def test_key_fingerprint_matches_ssh_keygen(plain_key):
+    out = subprocess.run(["ssh-keygen", "-l", "-E", "sha256", "-f", str(plain_key)], capture_output=True, text=True)
+    assert ssh.key_fingerprint(plain_key) == out.stdout.split()[1]
 
 
-def test_agent_sockets_include_an_identity_agent_from_ssh_config(monkeypatch):
-    """1Password-style setups point ssh at an agent via IdentityAgent, not $SSH_AUTH_SOCK."""
-    monkeypatch.undo()  # use the real _agent_sockets (the autouse fixture replaced it)
+# ---------------------------------------------------------------------------
+# which agent ssh asks (ssh_config(5): IdentityAgent overrides $SSH_AUTH_SOCK)
+# ---------------------------------------------------------------------------
+
+
+GROUP_CONTAINER_SOCK = "/Users/me/Library/Group Containers/2BUA8C4S2C.com.1password/t/agent.sock"
+
+
+@pytest.mark.parametrize(
+    "ssh_g_line,expected",
+    [
+        (None, ["/run/env.sock"]),
+        (f"identityagent {GROUP_CONTAINER_SOCK}", [GROUP_CONTAINER_SOCK]),
+        ("identityagent none", []),
+        ("identityagent SSH_AUTH_SOCK", ["/run/env.sock"]),
+        ("identityagent $MY_SOCK", ["/run/my.sock"]),
+    ],
+    ids=["no-identityagent", "path-with-spaces", "none", "literal-ssh-auth-sock", "env-var"],
+)
+def test_agent_sockets_follow_ssh_precedence(monkeypatch, ssh_g_line, expected):
     monkeypatch.setenv("SSH_AUTH_SOCK", "/run/env.sock")
-
-    def fake_run(cmd, env=None):
-        assert cmd[:2] == ["ssh", "-G"]
-        return subprocess.CompletedProcess(cmd, 0, stdout='user me\nidentityagent "~/agent.sock"\n', stderr="")
-
-    monkeypatch.setattr(ssh, "_run_key_tool", fake_run)
-    assert ssh._agent_sockets() == ["/run/env.sock", str(Path("~/agent.sock").expanduser())]
+    monkeypatch.setenv("MY_SOCK", "/run/my.sock")
+    out = "user me\n" + (f"{ssh_g_line}\n" if ssh_g_line else "")
+    monkeypatch.setattr(ssh, "_run_key_tool", lambda cmd, env=None: subprocess.CompletedProcess(cmd, 0, out, ""))
+    assert REAL_AGENT_SOCKETS() == expected
 
 
 @pytest.mark.parametrize(
     "line,expected",
-    [("  UseKeychain yes", True), ("UseKeychain=true", True), ("# UseKeychain yes", False), ("UseKeychain no", False)],
+    [
+        ("UseKeychain yes", True),
+        ("UseKeychain=true", True),
+        ("# UseKeychain yes", False),
+        ("UseKeychain no", False),
+        (None, False),  # no config file at all
+    ],
 )
-def test_uses_macos_keychain(tmp_path, line, expected):
-    cfg = tmp_path / "cfg"
-    cfg.write_text(f"Host *\n{line}\n")
+def test_uses_macos_keychain(tmp_path, ssh_config, line, expected):
+    cfg = ssh_config(line) if line else tmp_path / "missing"
     assert ssh._uses_macos_keychain(cfg) is expected
-
-
-def test_uses_macos_keychain_missing_config(tmp_path):
-    assert ssh._uses_macos_keychain(tmp_path / "nope") is False

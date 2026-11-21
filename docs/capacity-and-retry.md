@@ -140,11 +140,19 @@ for each backoff cycle (--wait):        # outer
 - **`--availability-zone AZ`** (repeatable): only those AZs, tried in the order
   given. Each AZ implies its region. Unknown or not-opted-in zones are rejected
   up front.
-- **Per AZ:** a capacity miss (or `Unsupported` in that AZ) moves to the next
-  AZ in the same region. A quota or price error is region-wide, so it skips the
-  region's remaining AZs. The region counts as capacity-limited, and so
-  re-swept by `--wait`, only once **every** AZ in its plan has missed. The
-  final error names the AZs tried.
+- **Per AZ:** a capacity miss, a `SpotMaxPriceTooLow`, or `Unsupported` moves
+  to the next AZ in the same region, since spot price and support differ by AZ.
+  A quota error is region-wide, so it skips the region's remaining AZs. The
+  region counts as capacity-limited, and so is re-swept by `--wait`, once
+  **every** AZ in its plan has missed and at least one missed on capacity. If
+  every AZ failed on price or support, the region is dropped. The final error
+  names the AZs actually tried. When every failure was `Unsupported`, there is
+  no on-demand fallback, because on-demand would hit the same AZs.
+- **A single AZ is a hard pin** (an `--ebs-volume-id`, a cluster's AZ, one
+  `--availability-zone`), and its errors keep their usual meaning: AWS's
+  `Unsupported` error is shown as-is, and a price error drops the region.
+- **Every region's plan is computed before anything launches**, so a bad AZ in
+  a later region fails up front.
 - **Plans are computed once per region** and reused across `--wait` cycles.
   Prices move slowly, and re-ranking mid-wait would reshuffle the order.
 
