@@ -200,6 +200,7 @@ def test_default_ami_filter_spans_architectures_but_not_other_images(name, match
         ("MaxSpotInstanceCountExceeded", True, "Spot instance quota exceeded", "spot"),
         ("VcpuLimitExceeded", False, "On-demand vCPU quota exceeded", "on-demand"),
     ],
+    ids=["spot", "on-demand"],
 )
 def test_quota_message_label_and_type(code, spot, label, quota_type):
     msg = _quota_error_message(code, LaunchConfig(spot=spot), "us-west-2")
@@ -287,7 +288,6 @@ def test_run_instances_reraises_unknown_client_error(ec2):
             id="az-and-group",
         ),
         pytest.param(None, "aws-bootstrap-cluster-ml1", {"GroupName": "aws-bootstrap-cluster-ml1"}, id="group-only"),
-        pytest.param(None, None, None, id="none"),
     ],
 )
 def test_run_instances_placement(ec2, placement_az, placement_group, expected):
@@ -307,11 +307,14 @@ def test_run_instances_placement(ec2, placement_az, placement_group, expected):
     )
     # _run_instances no longer resolves the AZ itself — it is passed in.
     ec2.describe_volumes.assert_not_called()
-    params = ec2.run_instances.call_args[1]
-    if expected is None:
-        assert "Placement" not in params
-    else:
-        assert params["Placement"] == expected
+    assert ec2.run_instances.call_args[1]["Placement"] == expected
+
+
+def test_run_instances_omits_placement_without_az_or_group(ec2):
+    """No Placement key at all: an empty/None one is a parameter-validation error."""
+    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-test"}]}
+    _run_instances(ec2, LaunchConfig(spot=True), "ami-test", "sg-test", "us-east-1", True, "key-test")
+    assert "Placement" not in ec2.run_instances.call_args[1]
 
 
 # ---------------------------------------------------------------------------
@@ -512,10 +515,11 @@ def test_launch_with_retry_declined_on_demand_cancels():
         launch_with_retry(config, lambda r: ctx, confirm_on_demand=lambda: False)
 
 
-def test_launch_with_retry_prepares_each_region_once():
+def test_launch_with_retry_prepares_each_region_once_across_wait_sweeps():
+    capacity = _make_client_error("InsufficientInstanceCapacity")
     contexts = {
-        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
-        "us-east-1": _region_ctx("us-east-1", [_ok_instance()]),
+        "us-west-2": _region_ctx("us-west-2", capacity),  # never has capacity
+        "us-east-1": _region_ctx("us-east-1", [capacity, _ok_instance()]),  # frees up on the 2nd sweep
     }
     prep_calls: list[str] = []
 
@@ -524,9 +528,10 @@ def test_launch_with_retry_prepares_each_region_once():
         return contexts[region]
 
     config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True, wait=True, wait_timeout=600)
-    result = launch_with_retry(config, prepare, clock=lambda: 0.0)
+    result = launch_with_retry(config, prepare, sleeper=lambda _s: None, clock=lambda: 0.0, rng=random.Random(0))
     assert result.region == "us-east-1"
-    assert sorted(prep_calls) == ["us-east-1", "us-west-2"]  # each region prepared exactly once
+    assert contexts["us-east-1"].ec2_client.run_instances.call_count == 2  # two sweeps happened
+    assert sorted(prep_calls) == ["us-east-1", "us-west-2"]  # ...but each region was prepared once
 
 
 @pytest.mark.parametrize(
@@ -620,7 +625,9 @@ def test_find_tagged_instances_exposes_cluster_tags(ec2, tags, cluster_id, rank)
     assert inst["Rank"] == rank
 
 
-@pytest.mark.parametrize("history,expected", [([{"SpotPrice": "0.1578"}], 0.1578), ([], None)])
+@pytest.mark.parametrize(
+    "history,expected", [([{"SpotPrice": "0.1578"}], 0.1578), ([], None)], ids=["latest-price", "no-history"]
+)
 def test_get_spot_price(ec2, history, expected):
     ec2.describe_spot_price_history.return_value = {"SpotPriceHistory": history}
     assert get_spot_price(ec2, "g4dn.xlarge", "us-west-2a") == expected
@@ -720,6 +727,7 @@ def test_list_instance_types_uses_prefix_match(ec2, prefix, expected):
         ({"Count": 0, "GpuPartitionSize": 0.5, "Name": "L4", "MemoryInfo": {"SizeInMiB": 11444}}, "1/2 L4 (11444 MiB)"),
         ({"Name": "X"}, "?x X (0 MiB)"),
     ],
+    ids=["whole-gpus", "eighth-partition", "half-partition", "missing-fields"],
 )
 def test_gpu_summary(gpu, expected):
     assert _gpu_summary({"Gpus": [gpu]}) == expected
@@ -997,31 +1005,48 @@ _SSH_22 = _tcp_rule(22, 22)
 
 
 @pytest.mark.parametrize(
-    "permissions,port,owned,authorizes",
+    "permissions,port",
     [
         # Regression: --ssh-port against an existing SG left it with no ingress,
         # surfacing only much later as an opaque 'SSH never became available'.
-        pytest.param(_SSH_22, 2222, True, True, id="opens-a-missing-port"),
-        pytest.param(_SSH_22, 22, True, False, id="existing-rule-not-re-added"),
-        pytest.param(_tcp_rule(20, 30), 22, True, False, id="port-range-covers-it"),
+        pytest.param(_SSH_22, 2222, id="missing-port"),
         # A rule open only to some other CIDR does not make our port reachable.
-        pytest.param(_tcp_rule(22, 22, "10.0.0.0/8"), 22, True, True, id="other-cidr-ignored"),
-        # `--security-group` is user-supplied and the lookup matches on name + VPC
-        # alone, so a pre-existing restricted group can share the name. Punching
-        # 0.0.0.0/0 into it would be a security change nobody asked for.
-        pytest.param(_tcp_rule(22, 22, "10.0.0.0/8"), 2222, False, False, id="never-widens-an-unowned-group"),
-        # Nothing to do and nothing to warn about — the port is already reachable.
-        pytest.param(_SSH_22, 22, False, False, id="unowned-with-ingress-is-silent"),
+        pytest.param(_tcp_rule(22, 22, "10.0.0.0/8"), 22, id="other-cidr-only"),
     ],
 )
-def test_reused_sg_ingress(permissions, port, owned, authorizes):
-    ec2 = _sg_client(permissions, owned=owned)
+def test_reused_owned_sg_opens_an_unreachable_port(permissions, port):
+    ec2 = _sg_client(permissions)
     assert ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=port) == "sg-1"
-    assert ec2.authorize_security_group_ingress.called is authorizes
-    if authorizes:
-        ec2.authorize_security_group_ingress.assert_called_once()
-        perm = ec2.authorize_security_group_ingress.call_args.kwargs["IpPermissions"][0]
-        assert perm["FromPort"] == perm["ToPort"] == port
+    ec2.authorize_security_group_ingress.assert_called_once()
+    perm = ec2.authorize_security_group_ingress.call_args.kwargs["IpPermissions"][0]
+    assert perm["FromPort"] == perm["ToPort"] == port
+
+
+@pytest.mark.parametrize(
+    "permissions,port",
+    [pytest.param(_SSH_22, 22, id="exact-rule"), pytest.param(_tcp_rule(20, 30), 22, id="port-range-covers-it")],
+)
+def test_reused_owned_sg_does_not_re_add_an_existing_rule(permissions, port):
+    ec2 = _sg_client(permissions)
+    assert ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=port) == "sg-1"
+    ec2.authorize_security_group_ingress.assert_not_called()
+
+
+def test_reused_sg_never_widens_a_group_this_tool_did_not_create():
+    """`--security-group` is user-supplied and the lookup matches on name + VPC
+    alone, so a pre-existing restricted group can share the name. Punching
+    0.0.0.0/0 into it would be a security change nobody asked for."""
+    ec2 = _sg_client(_tcp_rule(22, 22, "10.0.0.0/8"), owned=False)
+    assert ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=2222) == "sg-1"
+    ec2.authorize_security_group_ingress.assert_not_called()
+
+
+def test_unowned_sg_that_already_has_ingress_is_silent(capsys):
+    """Nothing to do and nothing to warn about — the port is already reachable."""
+    ec2 = _sg_client(_SSH_22, owned=False)
+    assert ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=22) == "sg-1"
+    ec2.authorize_security_group_ingress.assert_not_called()
+    assert "not tagged" not in capsys.readouterr().err
 
 
 def test_reused_sg_tolerates_a_concurrent_duplicate_add():

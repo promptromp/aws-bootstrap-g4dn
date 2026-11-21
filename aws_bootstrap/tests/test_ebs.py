@@ -84,7 +84,11 @@ def test_validate_ebs_volume_rejects(ec2, describe, match):
         validate_ebs_volume(ec2, "vol-abc123", "us-west-2a")
 
 
-@pytest.mark.parametrize("kwargs,device", [({}, EBS_DEVICE_NAME), ({"device_name": "/dev/sdg"}, "/dev/sdg")])
+@pytest.mark.parametrize(
+    "kwargs,device",
+    [({}, EBS_DEVICE_NAME), ({"device_name": "/dev/sdg"}, "/dev/sdg")],
+    ids=["default-device", "custom-device"],
+)
 def test_attach_ebs_volume(ec2, kwargs, device):
     attach_ebs_volume(ec2, "vol-abc123", "i-test123", **kwargs)
     ec2.attach_volume.assert_called_once_with(VolumeId="vol-abc123", InstanceId="i-test123", Device=device)

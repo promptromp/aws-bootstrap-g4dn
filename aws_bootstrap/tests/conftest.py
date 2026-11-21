@@ -81,15 +81,17 @@ def region_launch():
 def launch_aws(cli_session):
     """Patch the per-region setup ``launch`` does before it launches (all a ``--dry-run`` needs).
 
-    ``instance_type_architecture`` is deliberately left real: against the mocked
-    client it falls back to ``x86_64``.
+    ``instance_type_architecture`` is pinned to ``x86_64`` (``arch``): left real, it
+    would return whatever the mocked client's ``describe_instance_types`` yields (a
+    MagicMock), not a real architecture. Set ``arch.return_value`` to test arm64.
     """
     with (
         patch("aws_bootstrap.cli.get_latest_ami", return_value={"ImageId": "ami-123", "Name": "TestAMI"}) as ami,
+        patch("aws_bootstrap.cli.instance_type_architecture", return_value="x86_64") as arch,
         patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key") as import_key,
         patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123") as sg,
     ):
-        yield SimpleNamespace(session=cli_session, ami=ami, import_key=import_key, sg=sg)
+        yield SimpleNamespace(session=cli_session, ami=ami, arch=arch, import_key=import_key, sg=sg)
 
 
 @pytest.fixture

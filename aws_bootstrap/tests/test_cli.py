@@ -136,6 +136,7 @@ def test_launch_missing_key_autogenerates_on_real_launch(mock_gen, runner, launc
     assert result.exit_code == 0
     mock_gen.assert_called_once()
     assert "generating a new ed25519 key pair" in result.output
+    launched.setup.assert_not_called()  # --no-setup
 
 
 # ---------------------------------------------------------------------------
@@ -217,11 +218,11 @@ def test_launch_dry_run_json(runner, launch_aws, key_path, args, session_region,
 @pytest.mark.parametrize("instance_type,arch", [("g4dn.xlarge", "x86_64"), ("g5g.xlarge", "arm64")])
 def test_launch_looks_up_ami_for_the_instance_type_architecture(runner, launch_aws, key_path, instance_type, arch):
     """g5g is arm64: the AMI lookup must be told, or the launch picks an x86_64 image."""
-    with patch("aws_bootstrap.cli.instance_type_architecture", return_value=arch) as mock_arch:
-        args = ["launch", "--key-path", str(key_path), "--instance-type", instance_type, "--dry-run"]
-        result = runner.invoke(main, args)
+    launch_aws.arch.return_value = arch
+    args = ["launch", "--key-path", str(key_path), "--instance-type", instance_type, "--dry-run"]
+    result = runner.invoke(main, args)
     assert result.exit_code == 0
-    assert mock_arch.call_args.args[1] == instance_type
+    assert launch_aws.arch.call_args.args[1] == instance_type
     assert launch_aws.ami.call_args.kwargs["architecture"] == arch
 
 
@@ -236,6 +237,11 @@ def test_launch_output_shows_ssh_alias(runner, launched, key_path):
     assert "ssh aws-gpu1" in result.output
     assert "SSH alias: aws-gpu1" in result.output
     launched.add_ssh.assert_called_once()
+    # --no-setup skips remote setup (and the CUDA query that follows it); the SSH
+    # readiness wait still runs, since the alias is only useful once sshd answers.
+    launched.setup.assert_not_called()
+    launched.cuda.assert_not_called()
+    launched.ssh_ready.assert_called_once()
 
 
 def test_launch_benchmark_hint_uses_venv_python(runner, launched, key_path):
@@ -246,6 +252,7 @@ def test_launch_benchmark_hint_uses_venv_python(runner, launched, key_path):
     assert result.exit_code == 0
     assert "~/venv/bin/python ~/gpu_benchmark.py" in result.output
     assert "'python ~/gpu_benchmark.py'" not in result.output
+    launched.setup.assert_not_called()
 
 
 def test_launch_text_output_shows_resolved_region(runner, launched, region_launch, key_path):
@@ -255,6 +262,7 @@ def test_launch_text_output_shows_resolved_region(runner, launched, region_launc
     result = runner.invoke(main, args)
     assert result.exit_code == 0
     assert "Region: us-east-1" in result.output
+    launched.setup.assert_not_called()
 
 
 def test_launch_python_version_passed_to_setup(runner, launched, key_path):
@@ -285,23 +293,28 @@ def ebs_ops():
         yield SimpleNamespace(create=create, validate=val, attach=attach, mount=mount)
 
 
-@pytest.mark.parametrize(
-    "args,new_volume",
-    [(["--ebs-storage", "96"], True), (["--ebs-volume-id", "vol-existing"], False)],
-    ids=["new-volume", "existing-volume"],
-)
-def test_launch_with_ebs_full_flow(runner, launched, ebs_ops, key_path, args, new_volume):
-    """A new volume is created and formatted; an existing one is validated and mounted as-is."""
-    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--no-setup", *args])
+def test_launch_with_new_ebs_volume_creates_attaches_and_formats(runner, launched, ebs_ops, key_path):
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--no-setup", "--ebs-storage", "96"])
     assert result.exit_code == 0
-    if new_volume:
-        assert "vol-new123" in result.output
-        ebs_ops.create.assert_called_once()
-    else:
-        ebs_ops.validate.assert_called_once()
+    assert "vol-new123" in result.output
+    ebs_ops.create.assert_called_once()
+    ebs_ops.validate.assert_not_called()
     ebs_ops.attach.assert_called_once()
     ebs_ops.mount.assert_called_once()
-    assert ebs_ops.mount.call_args[1]["format_volume"] is new_volume
+    assert ebs_ops.mount.call_args[1]["format_volume"] is True
+    launched.setup.assert_not_called()
+
+
+def test_launch_with_existing_ebs_volume_validates_and_mounts_as_is(runner, launched, ebs_ops, key_path):
+    args = ["launch", "--key-path", str(key_path), "--no-setup", "--ebs-volume-id", "vol-existing"]
+    result = runner.invoke(main, args)
+    assert result.exit_code == 0
+    ebs_ops.validate.assert_called_once()
+    ebs_ops.create.assert_not_called()
+    ebs_ops.attach.assert_called_once()
+    ebs_ops.mount.assert_called_once()
+    assert ebs_ops.mount.call_args[1]["format_volume"] is False  # never reformat existing data
+    launched.setup.assert_not_called()
 
 
 def test_launch_ebs_mount_failure_warns(runner, launched, ebs_ops, key_path):
@@ -310,6 +323,7 @@ def test_launch_ebs_mount_failure_warns(runner, launched, ebs_ops, key_path):
     # Should succeed despite mount failure (just a warning)
     assert result.exit_code == 0
     assert "WARNING" in result.output or "Failed to mount" in result.output
+    launched.setup.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -409,8 +423,9 @@ def status_aws(cli_session):
         patch("aws_bootstrap.cli.get_spot_price", return_value=0.15) as spot,
         patch("aws_bootstrap.cli.list_ssh_hosts", return_value={}) as hosts,
         patch("aws_bootstrap.cli.get_ssh_host_details", return_value=None) as details,
+        patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[]) as ebs,
     ):
-        yield SimpleNamespace(session=cli_session, find=find, spot=spot, hosts=hosts, details=details)
+        yield SimpleNamespace(session=cli_session, find=find, spot=spot, hosts=hosts, details=details, ebs=ebs)
 
 
 @pytest.fixture
@@ -477,9 +492,8 @@ def test_status_shows_alias(runner, status_aws):
 
 def test_status_shows_ebs_volumes(runner, status_aws):
     status_aws.find.return_value = [_instance()]
-    volume = {"VolumeId": "vol-data1", "Size": 96, "Device": "/dev/sdf", "State": "in-use"}
-    with patch("aws_bootstrap.cli.find_ebs_volumes_for_instance", return_value=[volume]):
-        result = runner.invoke(main, STATUS)
+    status_aws.ebs.return_value = [{"VolumeId": "vol-data1", "Size": 96, "Device": "/dev/sdf", "State": "in-use"}]
+    result = runner.invoke(main, STATUS)
     assert result.exit_code == 0
     assert "vol-data1" in result.output
     assert "96 GB" in result.output
@@ -664,21 +678,37 @@ def test_status_json_no_orphans_empty_list(runner, status_aws, orphans):
     assert json.loads(result.output)["orphan_volumes"] == []
 
 
-@pytest.mark.parametrize("with_orphans", [True, False], ids=["orphans", "no-orphans"])
-@pytest.mark.parametrize("fmt", ["json", "yaml", "table"])
-def test_status_renders_in_each_structured_format(runner, status_aws, orphans, fmt, with_orphans):
-    """Every structured format must render both the instances and the orphans."""
+@pytest.mark.parametrize("fmt,load", [("json", json.loads), ("yaml", yaml.safe_load)], ids=["json", "yaml"])
+def test_status_structured_output_carries_instances_and_orphans(runner, status_aws, orphans, fmt, load):
+    """json/yaml keep both lists in the single result."""
     status_aws.find.return_value = [_instance()]
-    orphans.return_value = [dict(_ORPHAN_VOLUME)] if with_orphans else []
+    orphans.return_value = [dict(_ORPHAN_VOLUME)]
     result = runner.invoke(main, ["-o", fmt, *STATUS])
     assert result.exit_code == 0, result.output
+    data = load(result.output)
+    assert data["instances"][0]["instance_id"] == "i-abc123"
+    assert data["orphan_volumes"][0]["volume_id"] == "vol-orphan1"
+
+
+def test_status_table_renders_orphans_in_their_own_table(runner, status_aws, orphans):
+    """table mode renders one list per emit, so the orphans get a second table."""
+    status_aws.find.return_value = [_instance()]
+    orphans.return_value = [dict(_ORPHAN_VOLUME)]
+    result = runner.invoke(main, ["-o", "table", *STATUS])
+    assert result.exit_code == 0, result.output
+    assert "Instance ID" in result.output
     assert "i-abc123" in result.output
-    assert ("vol-orphan1" in result.output) is with_orphans
-    if fmt == "yaml":
-        assert yaml.safe_load(result.output)["instances"][0]["instance_id"] == "i-abc123"
-    if fmt == "table":
-        assert "Instance ID" in result.output
-        assert ("Volume ID" in result.output) is with_orphans  # orphan volumes get their own table
+    assert "Volume ID" in result.output
+    assert "vol-orphan1" in result.output
+
+
+def test_status_table_without_orphans_has_no_volume_table(runner, status_aws, orphans):
+    status_aws.find.return_value = [_instance()]
+    result = runner.invoke(main, ["-o", "table", *STATUS])
+    assert result.exit_code == 0, result.output
+    assert "Instance ID" in result.output
+    assert "i-abc123" in result.output
+    assert "Volume ID" not in result.output
 
 
 # --- all enabled regions (no --region) ------------------------------------------
@@ -856,18 +886,22 @@ def terminate_aws(cli_session):
         )
 
 
-@pytest.mark.parametrize("fmt", ["text", "json"])
-def test_terminate_no_instances(runner, terminate_aws, fmt):
+def test_terminate_no_instances_reports_and_never_prompts(runner, terminate_aws):
     terminate_aws.find.return_value = []
-    result = runner.invoke(main, ["-o", fmt, "terminate", "--yes"])
+    result = runner.invoke(main, ["terminate"])  # no --yes and no stdin: a prompt would abort
     assert result.exit_code == 0
-    if fmt == "json":
-        assert json.loads(result.output) == {"terminated": []}
-    else:
-        assert "No active" in result.output
+    assert "No active" in result.output
+    assert "Terminate" not in result.output
 
 
-def test_terminate_all_with_yes(runner, terminate_aws):
+def test_terminate_no_instances_json(runner, terminate_aws):
+    terminate_aws.find.return_value = []
+    result = runner.invoke(main, ["-o", "json", "terminate", "--yes"])
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"terminated": []}
+
+
+def test_terminate_all_removes_aliases_and_skips_the_ownership_check(runner, terminate_aws):
     terminate_aws.remove.return_value = "aws-gpu1"
     result = runner.invoke(main, ["terminate", "--yes"])
     assert result.exit_code == 0
@@ -909,23 +943,22 @@ def test_terminate_json_requires_yes(runner, terminate_aws):
     assert "--yes is required" in result.output
 
 
-@pytest.mark.parametrize(
-    "target,shows_resolution",
-    [("aws-gpu1", True), ("i-abc123", False)],
-    ids=["alias", "instance-id-passthrough"],
-)
-def test_terminate_by_target(runner, terminate_aws, target, shows_resolution):
-    """An alias is resolved (and says so); an instance id passes through silently."""
-    terminate_aws.resolve.side_effect = None
-    terminate_aws.resolve.return_value = "i-abc123"
-    result = runner.invoke(main, ["terminate", "--yes", target])
+def test_terminate_by_alias_reports_the_resolution(runner, terminate_aws):
+    terminate_aws.resolve.side_effect = lambda value: "i-abc123"
+    result = runner.invoke(main, ["terminate", "--yes", "aws-gpu1"])
     assert result.exit_code == 0
-    if shows_resolution:
-        assert "Resolved alias 'aws-gpu1' -> i-abc123" in result.output
-    else:
-        assert "Resolved alias" not in result.output
+    assert "Resolved alias 'aws-gpu1' -> i-abc123" in result.output
     assert "Terminated 1" in result.output
-    terminate_aws.resolve.assert_called_once_with(target)
+    terminate_aws.resolve.assert_called_once_with("aws-gpu1")
+    assert terminate_aws.terminate.call_args[0][1] == ["i-abc123"]
+
+
+def test_terminate_by_instance_id_passes_through_silently(runner, terminate_aws):
+    result = runner.invoke(main, ["terminate", "--yes", "i-abc123"])
+    assert result.exit_code == 0
+    assert "Resolved alias" not in result.output
+    assert "Terminated 1" in result.output
+    terminate_aws.resolve.assert_called_once_with("i-abc123")
     assert terminate_aws.terminate.call_args[0][1] == ["i-abc123"]
 
 
@@ -1010,7 +1043,7 @@ def cleanup_env(cli_session, tmp_path, key_path):
         )
 
 
-def test_cleanup_nothing_to_do(runner, cleanup_env):
+def test_cleanup_in_sync_reports_nothing_and_skips_the_orphan_scan(runner, cleanup_env):
     with patch("aws_bootstrap.cli.find_orphan_ebs_volumes_in_regions") as mock_orphans:
         result = runner.invoke(main, ["cleanup"])
     assert result.exit_code == 0
@@ -1381,15 +1414,18 @@ def test_quota_history_json(runner, cli_session, history_rows):
     assert requests[0]["request_id"] == "req-123"
 
 
-@pytest.mark.parametrize("fmt", ["text", "json"])
-def test_quota_history_empty(runner, cli_session, fmt):
+def test_quota_history_empty_text(runner, cli_session):
     with patch("aws_bootstrap.cli.get_quota_request_history", return_value=[]):
-        result = runner.invoke(main, ["-o", fmt, *HISTORY])
+        result = runner.invoke(main, HISTORY)
     assert result.exit_code == 0
-    if fmt == "json":
-        assert json.loads(result.output) == {"requests": []}
-    else:
-        assert "No quota increase requests found" in result.output
+    assert "No quota increase requests found" in result.output
+
+
+def test_quota_history_empty_json(runner, cli_session):
+    with patch("aws_bootstrap.cli.get_quota_request_history", return_value=[]):
+        result = runner.invoke(main, ["-o", "json", *HISTORY])
+    assert result.exit_code == 0
+    assert json.loads(result.output) == {"requests": []}
 
 
 def test_quota_history_all_families(runner, cli_session):

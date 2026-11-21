@@ -69,24 +69,20 @@ def test_get_quota_happy_path(sq):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(
-    "case_id,expected_case_id",
-    [("", None), ("case-789", "case-789")],
-    ids=["no-case-omitted", "case-opened"],
-)
-def test_request_quota_increase_success(sq, case_id, expected_case_id):
-    status = "CASE_OPENED" if case_id else "PENDING"
-    sq.request_service_quota_increase.return_value = {
-        "RequestedQuota": _requested("req-123", status, 8.0, case_id=case_id)
-    }
+def test_request_quota_increase_success(sq):
+    sq.request_service_quota_increase.return_value = {"RequestedQuota": _requested("req-123", "PENDING", 8.0)}
     result = request_quota_increase(sq, QUOTA_CODE_SPOT, 8.0)
     assert result["request_id"] == "req-123"
-    assert result["status"] == status
+    assert result["status"] == "PENDING"
     assert result["desired_value"] == 8.0
-    if expected_case_id is None:
-        assert "case_id" not in result  # an empty CaseId is omitted
-    else:
-        assert result["case_id"] == expected_case_id
+    assert "case_id" not in result  # an empty CaseId is omitted
+
+
+def test_request_quota_increase_with_case_id(sq):
+    sq.request_service_quota_increase.return_value = {
+        "RequestedQuota": _requested("req-456", "CASE_OPENED", 16.0, case_id="case-789")
+    }
+    assert request_quota_increase(sq, QUOTA_CODE_SPOT, 16.0)["case_id"] == "case-789"
 
 
 # ---------------------------------------------------------------------------
@@ -114,6 +110,15 @@ _CALLS = {
         ("request", "InternalServiceException", botocore.exceptions.ClientError, None),
         ("history", "NoSuchResourceException", CLIError, "not found"),
     ],
+    ids=[
+        "get-quota-not-found",
+        "get-quota-unknown-propagates",
+        "request-not-found",
+        "request-already-pending",
+        "request-invalid-argument",
+        "request-unknown-propagates",
+        "history-not-found",
+    ],
 )
 def test_api_errors_are_mapped(sq, call, code, raises, match):
     method, invoke = _CALLS[call]
@@ -138,15 +143,16 @@ def test_get_quota_request_history_sorted(sq):
     assert [r["request_id"] for r in results] == ["req-new", "req-old"]  # newest first
 
 
-@pytest.mark.parametrize("status_filter", ["APPROVED", None])
-def test_get_quota_request_history_status_filter(sq, status_filter):
+def test_get_quota_request_history_status_filter(sq):
     sq.list_requested_service_quota_change_history_by_quota.return_value = {"RequestedQuotas": []}
-    assert get_quota_request_history(sq, QUOTA_CODE_SPOT, status_filter=status_filter) == []
-    call_kwargs = sq.list_requested_service_quota_change_history_by_quota.call_args[1]
-    if status_filter is None:
-        assert "Status" not in call_kwargs
-    else:
-        assert call_kwargs["Status"] == status_filter
+    get_quota_request_history(sq, QUOTA_CODE_SPOT, status_filter="APPROVED")
+    assert sq.list_requested_service_quota_change_history_by_quota.call_args[1]["Status"] == "APPROVED"
+
+
+def test_get_quota_request_history_no_status_filter_by_default(sq):
+    sq.list_requested_service_quota_change_history_by_quota.return_value = {"RequestedQuotas": []}
+    assert get_quota_request_history(sq, QUOTA_CODE_SPOT) == []
+    assert "Status" not in sq.list_requested_service_quota_change_history_by_quota.call_args[1]
 
 
 # ---------------------------------------------------------------------------

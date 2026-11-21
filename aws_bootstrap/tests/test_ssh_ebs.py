@@ -23,15 +23,20 @@ def _mount(**kwargs):
     return mount_ebs_volume("1.2.3.4", "ubuntu", KEY_PATH, "vol-abc123", **kwargs)
 
 
-@pytest.mark.parametrize("format_volume", [True, False], ids=["new-volume", "existing-volume"])
-def test_mount_ebs_volume_formats_only_new_volumes(ssh_run, format_volume):
-    assert _mount(format_volume=format_volume) is True
+def test_mount_ebs_volume_formats_a_new_volume(ssh_run):
+    assert _mount(format_volume=True) is True
     ssh_run.assert_called_once()
     script = ssh_run.call_args[0][0][-1]
-    assert ("mkfs" in script) is format_volume
-    if format_volume:
-        assert "mkfs.ext4" in script
-        assert "volabc123" in script  # stripped vol- hyphen
+    assert "mkfs.ext4" in script
+    assert "/data" in script
+    assert "volabc123" in script  # stripped vol- hyphen
+
+
+def test_mount_ebs_volume_never_formats_an_existing_volume(ssh_run):
+    assert _mount(format_volume=False) is True
+    ssh_run.assert_called_once()
+    script = ssh_run.call_args[0][0][-1]
+    assert "mkfs" not in script
     assert "/data" in script
 
 

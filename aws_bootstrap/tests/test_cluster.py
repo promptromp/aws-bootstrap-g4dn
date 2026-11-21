@@ -62,25 +62,32 @@ def _fake_launch(rank_holder):
     return launch_fn
 
 
-@pytest.mark.parametrize(
-    "count,start_rank,ranks,with_on_node",
-    [(3, 0, [0, 1, 2], True), (2, 2, [2, 3], False)],
-    ids=["from-zero-with-callback", "incremental-offset-no-callback"],
-)
-def test_launch_cluster_nodes_assigns_sequential_ranks(count, start_rank, ranks, with_on_node):
+def test_launch_cluster_nodes_assigns_sequential_ranks_and_reports_each_node():
     seen = []
     results = cluster.launch_cluster_nodes(
         LaunchConfig(regions=("us-east-1",)),
         prepare_region=lambda r: None,
-        count=count,
-        start_rank=start_rank,
+        count=3,
+        start_rank=0,
         launch_fn=_fake_launch({"n": 0}),
-        on_node=(lambda rank, launch: seen.append((rank, launch.instance["InstanceId"]))) if with_on_node else None,
+        on_node=lambda rank, launch: seen.append((rank, launch.instance["InstanceId"])),
     )
-    ids = [f"i-{i}" for i in range(count)]
-    assert [r.rank for r in results] == ranks
-    assert [r.launch.instance["InstanceId"] for r in results] == ids
-    assert seen == (list(zip(ranks, ids, strict=True)) if with_on_node else [])
+    assert [r.rank for r in results] == [0, 1, 2]
+    assert [r.launch.instance["InstanceId"] for r in results] == ["i-0", "i-1", "i-2"]
+    assert seen == [(0, "i-0"), (1, "i-1"), (2, "i-2")]
+
+
+def test_launch_cluster_nodes_starts_at_offset_without_a_callback():
+    """An incremental launch continues the existing ranks; on_node is optional."""
+    results = cluster.launch_cluster_nodes(
+        LaunchConfig(regions=("us-east-1",)),
+        prepare_region=lambda r: None,
+        count=2,
+        start_rank=2,
+        launch_fn=_fake_launch({"n": 0}),
+    )
+    assert [r.rank for r in results] == [2, 3]
+    assert [r.launch.instance["InstanceId"] for r in results] == ["i-0", "i-1"]
 
 
 # ---------------------------------------------------------------------------
@@ -175,6 +182,7 @@ def test_node_env_contract():
         ({"i-0": "12.4", "i-1": "12.1"}, False),
         ({"i-0": "12.4"}, True),
     ],
+    ids=["consistent", "skewed", "single-node"],
 )
 def test_detect_version_skew(versions, expected_ok):
     mismatches = cluster.detect_version_skew(versions)
@@ -211,12 +219,6 @@ class _Recorder:
         return self._outcome(node, command)
 
 
-def _rank1_raises(node, command):
-    if node["Rank"] == 1:
-        raise RuntimeError("kaboom")
-    return (0, "ok", "")
-
-
 def test_run_on_all_nodes_collects_results_in_order():
     results = cluster.run_on_all_nodes(
         TWO_NODES, lambda node: "echo hi", run_fn=lambda node, cmd: (0, f"out-{node['InstanceId']}", "")
@@ -226,19 +228,25 @@ def test_run_on_all_nodes_collects_results_in_order():
     assert results[0].stdout == "out-i-0"
 
 
-@pytest.mark.parametrize(
-    "run_fn,stderr",
-    [
-        pytest.param(lambda node, cmd: (node["Rank"], "", "boom" if node["Rank"] else ""), "boom", id="nonzero-exit"),
-        # One node raising must not abort the whole sweep; it's a rank-labeled failure.
-        pytest.param(_rank1_raises, "kaboom", id="run-fn-raises"),
-    ],
-)
-def test_run_on_all_nodes_reports_a_failing_node(run_fn, stderr):
+def test_run_on_all_nodes_reports_failures():
+    def run_fn(node, command):
+        return (node["Rank"], "", "boom" if node["Rank"] else "")
+
     results = cluster.run_on_all_nodes(TWO_NODES, lambda node: "x", run_fn=run_fn)
-    assert results[0].returncode == 0
-    assert results[1].returncode == 1
-    assert stderr in results[1].stderr
+    assert [r.returncode for r in results] == [0, 1]
+    assert results[1].stderr == "boom"  # the node's own stderr, untouched
+
+
+def test_run_on_all_nodes_survives_raising_run_fn():
+    def run_fn(node, command):
+        if node["Rank"] == 1:
+            raise RuntimeError("kaboom")
+        return (0, "ok", "")
+
+    results = cluster.run_on_all_nodes(TWO_NODES, lambda node: "x", run_fn=run_fn)
+    # One node raising must not abort the whole sweep; it's a rank-labeled failure.
+    assert [r.returncode for r in results] == [0, 1]
+    assert "kaboom" in results[1].stderr
     assert results[1].instance_id == "i-1"
 
 
@@ -254,6 +262,7 @@ def test_run_canary_scps_and_runs_torchrun_on_all_nodes():
         run_fn=run_fn,
     )
     assert scped == ["i-0", "i-1"]
+    assert len(run_fn.commands) == len(results) == 2
     assert all("--rdzv-endpoint=10.0.0.5:29400" in c for c in run_fn.commands)
     assert all("cluster_canary.py" in c for c in run_fn.commands)
     assert all(r.returncode == 0 for r in results)
@@ -296,6 +305,7 @@ def _run_job(run_fn, script="train.py", script_args=None, **kwargs):
 def test_run_distributed_job_py_uses_torchrun():
     run_fn = _Recorder(lambda node, cmd: (0, "done", ""))
     results = _run_job(run_fn, script_args=["--epochs", "2"])
+    assert len(run_fn.commands) == len(results) == 2
     assert all(r.returncode == 0 for r in results)
     assert all("torchrun" in c and "/tmp/train.py --epochs 2" in c for c in run_fn.commands)
     assert all("--rdzv-endpoint=10.0.0.5:29400" in c for c in run_fn.commands)
@@ -305,6 +315,7 @@ def test_run_distributed_job_sh_uses_escape_hatch_env():
     run_fn = _Recorder()
     _run_job(run_fn, script="job.sh")
     ran = run_fn.commands
+    assert len(ran) == 2
     assert all("bash /tmp/job.sh" in c for c in ran)
     assert all("AWSB_MASTER_ADDR=10.0.0.5" in c for c in ran)
     assert any("AWSB_NODE_RANK=0" in c for c in ran) and any("AWSB_NODE_RANK=1" in c for c in ran)
@@ -324,7 +335,9 @@ def test_run_distributed_job_runs_data_prep_before_training():
 def test_run_distributed_job_aborts_if_data_prep_fails():
     run_fn = _Recorder(lambda node, cmd: (1, "", "prep failed") if "data_prep.sh" in cmd else (0, "", ""))
     results = _run_job(run_fn, data_script=Path("prep.sh"))
+    assert len(results) == 2
     assert all(r.returncode != 0 for r in results)
+    assert len(run_fn.commands) == 2  # the two data-prep runs, and no training
     assert all("torchrun" not in c for c in run_fn.commands)
 
 

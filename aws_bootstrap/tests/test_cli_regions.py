@@ -46,6 +46,7 @@ def _r(regions):
         ["list", "instance-types", "--help"],
         ["list", "amis", "--help"],
     ],
+    ids=lambda argv: " ".join(argv[:-1]),
 )
 def test_region_option_is_repeatable_in_help(runner, argv):
     result = runner.invoke(main, argv)

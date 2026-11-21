@@ -11,6 +11,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+import yaml
 
 from aws_bootstrap.cli import main
 from aws_bootstrap.cluster import NodeResult
@@ -66,20 +67,22 @@ def test_cluster_help(runner, argv, expected):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("fmt", ["json", "yaml", "table"])
-def test_cluster_status_renders_in_each_structured_format(runner, cluster_nodes, fmt):
+@pytest.mark.parametrize("fmt,load", [("json", json.loads), ("yaml", yaml.safe_load)], ids=["json", "yaml"])
+def test_cluster_status_structured_output_lists_nodes(runner, cluster_nodes, fmt, load):
     cluster_nodes.return_value = [_node(instance_id="i-aaa", rank=0)]
     result = runner.invoke(main, ["-o", fmt, "cluster", "status", "--cluster-id", "ml1"])
     assert result.exit_code == 0, result.output
-    # Each format surfaces the node's instance id (table mode via real columns,
-    # not a Python repr of the list).
+    node = load(result.output)["nodes"][0]
+    assert (node["rank"], node["instance_id"]) == (0, "i-aaa")
+
+
+def test_cluster_status_table_has_real_columns(runner, cluster_nodes):
+    cluster_nodes.return_value = [_node(instance_id="i-aaa", rank=0)]
+    result = runner.invoke(main, ["-o", "table", "cluster", "status", "--cluster-id", "ml1"])
+    assert result.exit_code == 0, result.output
     assert "i-aaa" in result.output
-    if fmt == "json":
-        node = json.loads(result.output)["nodes"][0]
-        assert (node["rank"], node["instance_id"]) == (0, "i-aaa")
-    if fmt == "table":
-        assert "Instance" in result.output  # column header, not a key-value dump
-        assert "'instance_id'" not in result.output  # not a dict repr
+    assert "Instance" in result.output  # column header, not a key-value dump
+    assert "'instance_id'" not in result.output  # not a Python repr of the node list
 
 
 def test_cluster_status_still_shows_non_running_nodes(runner, cluster_nodes):
@@ -161,6 +164,9 @@ def test_cluster_launch_two_nodes_tags_ranks(runner, cluster_launch):
     # a confirm_on_demand callback that always declines.
     confirm = launch.call_args.kwargs.get("confirm_on_demand")
     assert confirm is not None and confirm() is False
+    # --no-setup: no node waits for SSH or runs remote setup.
+    cluster_launch.mocks.ssh_ready.assert_not_called()
+    cluster_launch.mocks.setup.assert_not_called()
 
 
 def test_cluster_launch_runs_remote_setup_per_node(runner, cluster_launch):

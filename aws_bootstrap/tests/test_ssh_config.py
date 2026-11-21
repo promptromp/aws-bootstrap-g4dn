@@ -113,14 +113,14 @@ def test_add_idempotent_updates_ip_and_keeps_alias(cfg):
     assert "HostName 1.2.3.4" not in content
 
 
-@pytest.mark.parametrize("port,line", [(2222, "Port 2222"), (22, None)], ids=["non-default", "default"])
-def test_stanza_port_line_only_when_non_default(cfg, port, line):
-    _add(cfg, port=port)
-    content = cfg.read_text()
-    if line:
-        assert line in content
-    else:
-        assert "Port" not in content
+def test_stanza_includes_port_when_non_default(cfg):
+    _add(cfg, port=2222)
+    assert "Port 2222" in cfg.read_text()
+
+
+def test_stanza_omits_port_when_default(cfg):
+    _add(cfg)
+    assert "Port" not in cfg.read_text()
 
 
 # ---------------------------------------------------------------------------
