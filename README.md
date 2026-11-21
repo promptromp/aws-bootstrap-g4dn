@@ -74,6 +74,10 @@ uv sync
 
 All methods install the `aws-bootstrap` CLI.
 
+For development, `pre-commit run --all` runs lint, format, type checks and the tests your
+change can reach ([pytest-impacted](https://github.com/promptromp/pytest-impacted)); `uv run pytest`
+runs the whole suite, as CI does on every push to `main`.
+
 #### Optional: auto-activate the venv with direnv
 
 A sample [direnv](https://direnv.net/) config is provided at [`.envrc.example`](.envrc.example). It activates the project venv (and optionally sets `AWS_PROFILE`) automatically when you `cd` into the repo:

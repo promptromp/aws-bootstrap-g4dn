@@ -42,6 +42,31 @@ include = ["aws_bootstrap*"]
 [tool.mypy]
 ignore_missing_imports = true
 
+[tool.pytest.ini_options]
+testpaths = ["aws_bootstrap/tests"]
+markers = ["slow: long-running test, skipped by the pre-commit hook (-m 'not slow')"]
+# pytest-impacted: the pre-commit hook and pull-request CI run only the tests a change can
+# reach (`pytest --impacted`); a push to main runs them all. The plugin follows imports from
+# aws_bootstrap/ and the test files. Anything else a test depends on needs a rule below, and
+# a rule that is wrong must select more, never less. tests/test_impacted_rules.py checks that
+# every non-Python file in the package matches a rule. `*` matches one path segment and `**`
+# any depth (pytest_impacted.strategies.matches_any_glob).
+impacted_module = "aws_bootstrap"
+impacted_tests_dir = "aws_bootstrap/tests"
+# Dependencies, the toolchain and CI config can affect any test: a change to one runs them all.
+impacted_invalidate_all = [
+    "pyproject.toml",
+    "uv.lock",
+    ".pre-commit-config.yaml",
+    ".github/workflows/**",
+]
+# Files that tests *read* (rather than import) count as a change to the test that reads them.
+impacted_map = [
+    "aws_bootstrap/resources/cluster_canary.py=aws_bootstrap/tests/test_cluster.py",
+    # remote_setup.sh and every SETUP_PAYLOAD file are checked by the payload-wiring tests.
+    "aws_bootstrap/resources/*=aws_bootstrap/tests/test_torch_index.py",
+]
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
@@ -83,6 +108,7 @@ quote-style = "double"
 dev = [
     "mypy>=2.4.1",
     "pytest>=9.2.0",
+    "pytest-impacted[fast]>=0.38.1",
     "ruff>=0.17.4",
     "types-pyyaml>=6.0.12.20261111",
     "types-tabulate>=0.10.0.20261006",
