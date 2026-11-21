@@ -1107,6 +1107,11 @@ def plan_azs(
         zones = list(explicit)
     else:
         zones = sorted(usable)
+        if not zones:  # offered only in AZs without a default subnet
+            raise CLIError(
+                f"{instance_type} is offered in {region} only in AZs without a default subnet "
+                f"({', '.join(sorted(offered))}); the tool launches into the default VPC."
+            )
     try:
         prices = spot_prices_by_az(ec2_client, instance_type)
     except botocore.exceptions.ClientError:

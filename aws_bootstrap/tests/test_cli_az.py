@@ -140,9 +140,10 @@ def test_cheapest_only_region_that_cannot_host_the_type_is_skipped(launch_aws, k
     regions = ["--region", "us-east-1", "--region", "us-west-2"]
     result = _run("-o", "json", "launch", "--key-path", str(key), "--dry-run", "--cheapest-az", *regions)
     assert result.exit_code == 0, result.output
-    data = json.loads(result.output)
+    data = json.loads(result.stdout)
     assert data["regions"] == ["us-west-2"]
     assert list(data["availability_zones"]) == ["us-west-2"]
+    assert "[us-east-1]" in result.stderr and "Skipping us-east-1" in result.stderr  # visible in -o json too
 
 
 def test_no_region_can_host_the_launch(launch_aws, key):

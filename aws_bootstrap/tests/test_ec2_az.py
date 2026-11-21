@@ -153,16 +153,29 @@ def test_plan_azs(plan_kwargs, subnets, expected):
         ),
         ({"offered": []}, {"cheapest": True}, "not offered in any availability zone of us-west-2"),
         (
+            {"offered": ["us-west-2d"], "subnets_override": ["us-west-2a"]},
+            {"cheapest": True},
+            "only in AZs without a default subnet",
+        ),
+        (
             {"offered": USW2, "zones_error": botocore.exceptions.EndpointConnectionError(endpoint_url="x")},
             {"explicit": ("us-west-2b",)},
             "Can't reach EC2 in region us-west-2",
         ),
     ],
-    ids=["unusable-explicit", "unknown-az", "not-opted-in", "type-not-offered", "unreachable-region"],
+    ids=[
+        "unusable-explicit",
+        "unknown-az",
+        "not-opted-in",
+        "type-not-offered",
+        "no-default-subnet",
+        "unreachable-region",
+    ],
 )
 def test_plan_azs_errors(ec2_kwargs, plan_kwargs, match):
     with pytest.raises(CLIError, match=match):
-        plan_azs(_ec2(prices=USW2_PRICES, subnets=USW2, **ec2_kwargs), "us-west-2", "g6e.2xlarge", **plan_kwargs)
+        subnets = ec2_kwargs.pop("subnets_override", USW2)
+        plan_azs(_ec2(prices=USW2_PRICES, subnets=subnets, **ec2_kwargs), "us-west-2", "g6e.2xlarge", **plan_kwargs)
 
 
 def test_plan_azs_explicit_tolerates_a_denied_price_lookup():

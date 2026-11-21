@@ -573,7 +573,10 @@ def launch(
                 if az_map.get(r):
                     raise CLIError(f"[{r}] {e.format_message()}") from None
                 skipped.append(f"[{r}] {e.format_message()}")
-                warn(f"{skipped[-1]} Skipping {r}.")
+                # stderr, unconditionally: structured-output users must see the skip too.
+                click.echo(
+                    click.style("  WARNING: ", fg="yellow", bold=True) + f"{skipped[-1]} Skipping {r}.", err=True
+                )
                 continue
             usable.append(r)
         if not usable:
