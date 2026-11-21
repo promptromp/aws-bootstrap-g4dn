@@ -147,11 +147,13 @@ uv run pytest --impacted --impacted-git-mode=unstaged      # only what your unco
 ### Impacted-test selection (pytest-impacted)
 
 Configured in `pyproject.toml` `[tool.pytest.ini_options]`: `impacted_module = "aws_bootstrap"`, `impacted_tests_dir = "aws_bootstrap/tests"`.
-- **Hook:** `--impacted-git-mode=unstaged` sees what git has uncommitted (staged or not) plus untracked files, not pre-commit's file list. So `pre-commit run --all` selects the same tests as a commit, and a clean tree selects nothing and passes (the plugin turns pytest's exit 5 into 0).
+- **Hook:** `--impacted-git-mode=unstaged` selects from git's state, not pre-commit's file list. A commit sees staged changes plus untracked files (pre-commit stashes unstaged edits first); `pre-commit run --all` also sees unstaged edits. A clean tree selects nothing and passes (the plugin turns pytest's exit 5 into 0), so run `uv run pytest` when you want the whole suite.
 - **PR CI:** `--impacted-git-mode=branch --impacted-base-branch=origin/<base>`, diffed from the fork point (CI checks out with `fetch-depth: 0`).
 - **Import analysis is automatic.** The plugin follows imports from `aws_bootstrap/` and the test files, so most changes need no configuration.
 - **Files a test reads but doesn't import need a rule.** Examples: `test_cluster` reads `resources/cluster_canary.py`, and `test_torch_index` reads `remote_setup.sh` and checks the payload files. Add an `impacted_map` line (`GLOB=<test file>`), or an `impacted_invalidate_all` glob when any test may depend on it. A rule that is wrong must select more, never less.
-- **The guard test enforces this.** `tests/test_impacted_rules.py` fails when a tracked non-Python file under `aws_bootstrap/` matches no rule, or a map target is missing.
+- **The guard test catches a missing rule.** `tests/test_impacted_rules.py` fails when a tracked non-Python file under `aws_bootstrap/` (any depth) matches no rule, or a map target is missing. The map line `aws_bootstrap/**=…/test_impacted_rules.py` selects it for every package change. Without that line it would never run when it matters, since it imports no package code; it ignores that catch-all when checking coverage. Its limits:
+  - It checks only that *some* rule matches, not that the rule names the test that reads the file.
+  - It skips `.py` files, since import analysis covers them. A Python file a test reads as *data* (like `cluster_canary.py`) still needs its own map line.
 - **Changes to dependencies or CI config run every test:** `pyproject.toml`, `uv.lock`, `.pre-commit-config.yaml` and `.github/workflows/**` invalidate all.
 
 Use `uv add <package>` to add dependencies and `uv add --group dev <package>` for dev dependencies.

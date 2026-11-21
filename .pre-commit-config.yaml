@@ -35,10 +35,11 @@ repos:
 - repo: local
   hooks:
   # Only the tests the change can reach (pytest-impacted; rules in pyproject's
-  # [tool.pytest.ini_options]). The change is everything git has uncommitted, staged or
-  # not, plus new files: not pre-commit's file list, so `pre-commit run --all` selects
-  # the same tests as a commit, and a change that reaches no test passes. A push to
-  # main runs the whole suite in CI; run it locally with `uv run pytest`.
+  # [tool.pytest.ini_options]), selected from git's state rather than pre-commit's file
+  # list: a commit sees what is staged plus new files (pre-commit stashes unstaged edits
+  # first), and `pre-commit run --all` also sees unstaged edits. A change that reaches
+  # no test passes, so a clean tree runs none. A push to main runs the whole suite in CI;
+  # run it locally with `uv run pytest`.
   - id: pytest
     name: pytest [impacted, without slow]
     entry: uv run python -m pytest -q -m "not slow" --impacted --impacted-git-mode=unstaged

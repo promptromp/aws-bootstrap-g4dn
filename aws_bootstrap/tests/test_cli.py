@@ -1092,6 +1092,9 @@ def test_no_credentials_caught_on_list(mock_session, mock_list):
 # ---------------------------------------------------------------------------
 
 
+# query_cuda_version runs after a successful setup; unpatched it ssh'd to 1.2.3.4 and
+# waited out the 10s ConnectTimeout, nearly all of the suite's run time.
+@patch("aws_bootstrap.cli.query_cuda_version", return_value=None)
 @patch("aws_bootstrap.cli.add_ssh_host", return_value="aws-gpu1")
 @patch("aws_bootstrap.cli.run_remote_setup", return_value=True)
 @patch("aws_bootstrap.cli.wait_for_ssh", return_value=True)
@@ -1102,7 +1105,17 @@ def test_no_credentials_caught_on_list(mock_session, mock_list):
 @patch("aws_bootstrap.cli.get_latest_ami")
 @patch("aws_bootstrap.cli.boto3.Session")
 def test_launch_python_version_passed_to_setup(
-    mock_session, mock_ami, mock_import, mock_sg, mock_launch, mock_wait, mock_ssh, mock_setup, mock_add_ssh, tmp_path
+    mock_session,
+    mock_ami,
+    mock_import,
+    mock_sg,
+    mock_launch,
+    mock_wait,
+    mock_ssh,
+    mock_setup,
+    mock_add_ssh,
+    mock_cuda,
+    tmp_path,
 ):
     mock_ami.return_value = {"ImageId": "ami-123", "Name": "TestAMI"}
     mock_launch.return_value = _region_launch({"InstanceId": "i-test123"})
