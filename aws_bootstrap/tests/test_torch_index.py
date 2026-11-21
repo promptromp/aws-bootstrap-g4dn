@@ -197,9 +197,11 @@ def test_select_tag_none_when_nothing_fits():
 
 
 def test_select_tag_none_when_index_lists_no_cuda():
+    resolve, tried = _resolver({})
     log = _Log()
-    assert ti.select_tag((13, 5), lambda: "<a href='cpu/'>cpu</a>", _resolver({})[0], log) is None
-    assert log
+    assert ti.select_tag((13, 5), lambda: "<a href='cpu/'>cpu</a>", resolve, log) is None
+    assert tried == []
+    assert any("lists no CUDA wheel indexes" in m for m in log)
 
 
 # ---------------------------------------------------------------------------
@@ -240,8 +242,9 @@ def _completed(code: int, stderr: str = ""):
 def test_uv_resolve_no_solution_is_nobuild_with_the_error_line(monkeypatch):
     """uv exits 1 when the index has no matching build; report its error line, not the hint."""
     monkeypatch.setattr(ti.subprocess, "run", _completed(1, UV_NO_SOLUTION_STDERR))
-    with pytest.raises(ti.NoBuild, match="^error: No solution found"):
+    with pytest.raises(ti.NoBuild, match="^error: No solution found") as exc:
         ti.uv_resolve("u", "p")
+    assert "hint: You require CPython 3.12" in str(exc.value)  # the hint often names the cause
 
 
 def test_uv_resolve_request_failure_is_unavailable(monkeypatch):

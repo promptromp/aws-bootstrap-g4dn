@@ -108,10 +108,11 @@ def fetch_index_root(url: str = INDEX_ROOT, timeout: int = FETCH_TIMEOUT) -> str
 
 
 def _uv_error(stderr: str) -> str:
-    """The ``error:`` line of uv's stderr (its last line is often just a ``hint:``)."""
+    """uv's ``error:`` line, plus its first ``hint:`` (which often names the actual cause)."""
     lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
-    errors = [ln for ln in lines if ln.startswith("error:")]
-    return (errors or lines or ["no output"])[0]
+    error = next((ln for ln in lines if ln.startswith("error:")), lines[0] if lines else "no output")
+    hint = next((ln for ln in lines if ln.startswith("hint:")), None)
+    return f"{error}; {hint}" if hint else error
 
 
 def uv_resolve(index_url: str, python: str, extra_args: Iterable[str] = (), timeout: int = RESOLVE_TIMEOUT) -> str:
@@ -158,6 +159,9 @@ def select_tag(
         published = published_versions(fetch())
     except Exception as e:  # network, TLS, decode: fall back to PyPI, but say why
         log(f"could not read the PyTorch index ({e})")
+        return None
+    if not published:  # unparseable page (captive portal, format change): say so, not "none served"
+        log(f"the PyTorch index at {INDEX_ROOT} lists no CUDA wheel indexes")
         return None
     for version in candidates(published, toolkit):
         tag = tag_for(version)
