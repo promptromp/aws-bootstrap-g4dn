@@ -99,11 +99,11 @@ requires-dist = [
 
 [package.metadata.requires-dev]
 dev = [
-    { name = "mypy", specifier = ">=2.3.1" },
-    { name = "pytest", specifier = ">=9.1.1" },
-    { name = "ruff", specifier = ">=0.16.6" },
-    { name = "types-pyyaml", specifier = ">=6.0.12.20260815" },
-    { name = "types-tabulate", specifier = ">=0.10.0.20260508" },
+    { name = "mypy", specifier = ">=2.4.1" },
+    { name = "pytest", specifier = ">=9.2.0" },
+    { name = "ruff", specifier = ">=0.17.4" },
+    { name = "types-pyyaml", specifier = ">=6.0.12.20261111" },
+    { name = "types-tabulate", specifier = ">=0.10.0.20261006" },
 ]
 
 [[package]]
