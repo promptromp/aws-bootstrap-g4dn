@@ -77,6 +77,7 @@ aws_bootstrap/
         test_ssh_ebs.py
         test_quota.py
         test_torch_index.py    # resources/torch_index.py CUDA-index discovery + SETUP_PAYLOAD wiring invariants
+        test_impacted_rules.py # pytest-impacted rules cover every non-Python package file (see Coding Conventions)
 docs/
     nsight-remote-profiling.md # Nsight Compute, Nsight Systems, and Nsight VSCE remote profiling guide
     capacity-and-retry.md      # Multi-region & --wait retry model, backoff design, recommended region lists
@@ -124,8 +125,8 @@ Entry point: `aws-bootstrap = "aws_bootstrap.cli:main"` (installed via `uv sync`
 - **Linting**: `ruff check` — line length 120, rules: E, F, UP, B, SIM, I, PLC
 - **Formatting**: `ruff format` — double quotes, isort via ruff
 - **Type checking**: `mypy` with `ignore_missing_imports = true`
-- **Testing**: `pytest`
-- **All-in-one**: `pre-commit run --all` runs the full chain (ruff check, ruff format, mypy, pytest)
+- **Testing**: `pytest`. The pre-commit hook and pull-request CI run **only the tests a change can reach** ([pytest-impacted](https://github.com/promptromp/pytest-impacted), with the `[fast]` Rust parser). A push to main runs the whole suite.
+- **All-in-one**: `pre-commit run --all` runs the full chain (ruff check, ruff format, mypy, impacted pytest)
 
 After making changes, run:
 
@@ -139,8 +140,21 @@ Or run tools individually:
 uv run ruff check aws_bootstrap/
 uv run ruff format aws_bootstrap/
 uv run mypy aws_bootstrap/
-uv run pytest
+uv run pytest                                              # every test
+uv run pytest --impacted --impacted-git-mode=unstaged      # only what your uncommitted changes reach
 ```
+
+### Impacted-test selection (pytest-impacted)
+
+Configured in `pyproject.toml` `[tool.pytest.ini_options]`: `impacted_module = "aws_bootstrap"`, `impacted_tests_dir = "aws_bootstrap/tests"`.
+- **Hook:** `--impacted-git-mode=unstaged` selects from git's state, not pre-commit's file list. A commit sees staged changes plus untracked files (pre-commit stashes unstaged edits first); `pre-commit run --all` also sees unstaged edits. A clean tree selects nothing and passes (the plugin turns pytest's exit 5 into 0), so run `uv run pytest` when you want the whole suite.
+- **PR CI:** `--impacted-git-mode=branch --impacted-base-branch=origin/<base>`, diffed from the fork point (CI checks out with `fetch-depth: 0`).
+- **Import analysis is automatic.** The plugin follows imports from `aws_bootstrap/` and the test files, so most changes need no configuration.
+- **Files a test reads but doesn't import need a rule.** Examples: `test_cluster` reads `resources/cluster_canary.py`, and `test_torch_index` reads `remote_setup.sh` and checks the payload files. Add an `impacted_map` line (`GLOB=<test file>`), or an `impacted_invalidate_all` glob when any test may depend on it. A rule that is wrong must select more, never less.
+- **The guard test catches a missing rule.** `tests/test_impacted_rules.py` fails when a tracked non-Python file under `aws_bootstrap/` (any depth) matches no rule, or a map target is missing. The map line `aws_bootstrap/**=…/test_impacted_rules.py` selects it for every package change. Without that line it would never run when it matters, since it imports no package code; it ignores that catch-all when checking coverage. Its limits:
+  - It checks only that *some* rule matches, not that the rule names the test that reads the file.
+  - It skips `.py` files, since import analysis covers them. A Python file a test reads as *data* (like `cluster_canary.py`) still needs its own map line.
+- **Changes to dependencies or CI config run every test:** `pyproject.toml`, `uv.lock`, `.pre-commit-config.yaml` and `.github/workflows/**` invalidate all.
 
 Use `uv add <package>` to add dependencies and `uv add --group dev <package>` for dev dependencies.
 

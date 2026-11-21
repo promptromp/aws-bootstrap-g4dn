@@ -69,8 +69,11 @@ We welcome feature suggestions! Please use our **Feature Request** template when
 
 4. **Run checks**:
    ```bash
-   pre-commit run --all
+   pre-commit run --all   # lint, format, types, and the tests your change can reach
+   uv run pytest          # the whole suite (CI runs it on every push to main)
    ```
+   The pre-commit pytest hook runs only the tests your uncommitted changes can reach
+   ([pytest-impacted](https://github.com/promptromp/pytest-impacted)); on a clean tree it runs none.
 
 5. **Commit your changes**:
    ```bash

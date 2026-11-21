@@ -58,5 +58,14 @@ jobs:
         enable-cache: true
     - name: Install the project
       run: uv sync --all-extras --dev
-    - name: Run tests
+    # Pull requests run only the tests the branch can reach (pytest-impacted, rules in
+    # pyproject.toml), diffed from where it forked off the base branch (fetch-depth: 0
+    # above provides the history). A push to main runs the whole suite.
+    - name: Run tests (impacted by this pull request)
+      if: github.event_name == 'pull_request'
+      env:
+        BASE_REF: ${{ github.base_ref }}
+      run: uv run pytest --impacted --impacted-git-mode=branch --impacted-base-branch="origin/${BASE_REF}"
+    - name: Run tests (all)
+      if: github.event_name != 'pull_request'
       run: uv run pytest
