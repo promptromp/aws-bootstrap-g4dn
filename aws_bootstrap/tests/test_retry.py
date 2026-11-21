@@ -19,20 +19,18 @@ from aws_bootstrap.retry import (
 # --- resolve_regions ---------------------------------------------------------
 
 
-def test_resolve_regions_explicit_wins_and_preserves_order():
-    assert resolve_regions(("us-east-1", "us-west-2"), "eu-west-1") == ("us-east-1", "us-west-2")
-
-
-def test_resolve_regions_falls_back_to_session_region():
-    assert resolve_regions((), "eu-west-1") == ("eu-west-1",)
-
-
-def test_resolve_regions_falls_back_to_default():
-    assert resolve_regions((), None) == ("us-west-2",)
-
-
-def test_resolve_regions_explicit_single():
-    assert resolve_regions(("ap-south-1",), None) == ("ap-south-1",)
+@pytest.mark.parametrize(
+    "explicit,session_region,expected",
+    [
+        (("us-east-1", "us-west-2"), "eu-west-1", ("us-east-1", "us-west-2")),
+        (("ap-south-1",), None, ("ap-south-1",)),
+        ((), "eu-west-1", ("eu-west-1",)),
+        ((), None, ("us-west-2",)),
+    ],
+    ids=["explicit-wins-in-order", "explicit-single", "session-region", "default"],
+)
+def test_resolve_regions(explicit, session_region, expected):
+    assert resolve_regions(explicit, session_region) == expected
 
 
 # --- parse_duration ----------------------------------------------------------

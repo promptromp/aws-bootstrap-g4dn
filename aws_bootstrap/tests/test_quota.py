@@ -27,19 +27,35 @@ def _make_client_error(code: str, message: str = "error") -> botocore.exceptions
     )
 
 
+@pytest.fixture
+def sq():
+    """A bare mocked Service Quotas client."""
+    return MagicMock()
+
+
+def _requested(request_id, status, desired, created=None, case_id=""):
+    """A RequestedQuota record as the Service Quotas API returns it."""
+    record = {
+        "Id": request_id,
+        "Status": status,
+        "QuotaCode": QUOTA_CODE_SPOT,
+        "QuotaName": "All G and VT Spot Instance Requests",
+        "DesiredValue": desired,
+        "CaseId": case_id,
+    }
+    if created:
+        record["Created"] = created
+    return record
+
+
 # ---------------------------------------------------------------------------
 # get_quota
 # ---------------------------------------------------------------------------
 
 
-def test_get_quota_happy_path():
-    sq = MagicMock()
+def test_get_quota_happy_path(sq):
     sq.get_service_quota.return_value = {
-        "Quota": {
-            "QuotaCode": QUOTA_CODE_SPOT,
-            "QuotaName": "All G and VT Spot Instance Requests",
-            "Value": 4.0,
-        }
+        "Quota": {"QuotaCode": QUOTA_CODE_SPOT, "QuotaName": "All G and VT Spot Instance Requests", "Value": 4.0}
     }
     result = get_quota(sq, QUOTA_CODE_SPOT)
     assert result["quota_code"] == QUOTA_CODE_SPOT
@@ -48,87 +64,67 @@ def test_get_quota_happy_path():
     sq.get_service_quota.assert_called_once_with(ServiceCode="ec2", QuotaCode=QUOTA_CODE_SPOT)
 
 
-def test_get_quota_not_found_raises_cli_error():
-    sq = MagicMock()
-    sq.get_service_quota.side_effect = _make_client_error("NoSuchResourceException")
-    with pytest.raises(CLIError, match="not found"):
-        get_quota(sq, QUOTA_CODE_SPOT)
-
-
-def test_get_quota_unknown_error_propagates():
-    sq = MagicMock()
-    sq.get_service_quota.side_effect = _make_client_error("InternalServiceException")
-    with pytest.raises(botocore.exceptions.ClientError):
-        get_quota(sq, QUOTA_CODE_SPOT)
-
-
-# ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
 # request_quota_increase
 # ---------------------------------------------------------------------------
 
 
-def test_request_quota_increase_success():
-    sq = MagicMock()
-    sq.request_service_quota_increase.return_value = {
-        "RequestedQuota": {
-            "Id": "req-123",
-            "Status": "PENDING",
-            "QuotaCode": QUOTA_CODE_SPOT,
-            "QuotaName": "All G and VT Spot Instance Requests",
-            "DesiredValue": 8.0,
-            "CaseId": "",
-        }
-    }
+def test_request_quota_increase_success(sq):
+    sq.request_service_quota_increase.return_value = {"RequestedQuota": _requested("req-123", "PENDING", 8.0)}
     result = request_quota_increase(sq, QUOTA_CODE_SPOT, 8.0)
     assert result["request_id"] == "req-123"
     assert result["status"] == "PENDING"
     assert result["desired_value"] == 8.0
-    assert "case_id" not in result  # empty CaseId should be omitted
+    assert "case_id" not in result  # an empty CaseId is omitted
 
 
-def test_request_quota_increase_with_case_id():
-    sq = MagicMock()
+def test_request_quota_increase_with_case_id(sq):
     sq.request_service_quota_increase.return_value = {
-        "RequestedQuota": {
-            "Id": "req-456",
-            "Status": "CASE_OPENED",
-            "QuotaCode": QUOTA_CODE_SPOT,
-            "QuotaName": "All G and VT Spot Instance Requests",
-            "DesiredValue": 16.0,
-            "CaseId": "case-789",
-        }
+        "RequestedQuota": _requested("req-456", "CASE_OPENED", 16.0, case_id="case-789")
     }
-    result = request_quota_increase(sq, QUOTA_CODE_SPOT, 16.0)
-    assert result["case_id"] == "case-789"
+    assert request_quota_increase(sq, QUOTA_CODE_SPOT, 16.0)["case_id"] == "case-789"
 
 
-def test_request_quota_increase_not_found():
-    sq = MagicMock()
-    sq.request_service_quota_increase.side_effect = _make_client_error("NoSuchResourceException")
-    with pytest.raises(CLIError, match="not found"):
-        request_quota_increase(sq, QUOTA_CODE_SPOT, 8.0)
+# ---------------------------------------------------------------------------
+# API error mapping (every call maps the same codes)
+# ---------------------------------------------------------------------------
+
+_CALLS = {
+    "get_quota": ("get_service_quota", lambda sq: get_quota(sq, QUOTA_CODE_SPOT)),
+    "request": ("request_service_quota_increase", lambda sq: request_quota_increase(sq, QUOTA_CODE_SPOT, 8.0)),
+    "history": (
+        "list_requested_service_quota_change_history_by_quota",
+        lambda sq: get_quota_request_history(sq, QUOTA_CODE_SPOT),
+    ),
+}
 
 
-def test_request_quota_increase_duplicate():
-    sq = MagicMock()
-    sq.request_service_quota_increase.side_effect = _make_client_error("ResourceAlreadyExistsException")
-    with pytest.raises(CLIError, match="already pending"):
-        request_quota_increase(sq, QUOTA_CODE_SPOT, 8.0)
-
-
-def test_request_quota_increase_invalid_argument():
-    sq = MagicMock()
-    sq.request_service_quota_increase.side_effect = _make_client_error("IllegalArgumentException", "bad value")
-    with pytest.raises(CLIError, match="Invalid request"):
-        request_quota_increase(sq, QUOTA_CODE_SPOT, -1.0)
-
-
-def test_request_quota_increase_unknown_error_propagates():
-    sq = MagicMock()
-    sq.request_service_quota_increase.side_effect = _make_client_error("InternalServiceException")
-    with pytest.raises(botocore.exceptions.ClientError):
-        request_quota_increase(sq, QUOTA_CODE_SPOT, 8.0)
+@pytest.mark.parametrize(
+    "call,code,raises,match",
+    [
+        ("get_quota", "NoSuchResourceException", CLIError, "not found"),
+        ("get_quota", "InternalServiceException", botocore.exceptions.ClientError, None),
+        ("request", "NoSuchResourceException", CLIError, "not found"),
+        ("request", "ResourceAlreadyExistsException", CLIError, "already pending"),
+        ("request", "IllegalArgumentException", CLIError, "Invalid request"),
+        ("request", "InternalServiceException", botocore.exceptions.ClientError, None),
+        ("history", "NoSuchResourceException", CLIError, "not found"),
+    ],
+    ids=[
+        "get-quota-not-found",
+        "get-quota-unknown-propagates",
+        "request-not-found",
+        "request-already-pending",
+        "request-invalid-argument",
+        "request-unknown-propagates",
+        "history-not-found",
+    ],
+)
+def test_api_errors_are_mapped(sq, call, code, raises, match):
+    method, invoke = _CALLS[call]
+    getattr(sq, method).side_effect = _make_client_error(code)
+    with pytest.raises(raises, match=match):
+        invoke(sq)
 
 
 # ---------------------------------------------------------------------------
@@ -136,64 +132,27 @@ def test_request_quota_increase_unknown_error_propagates():
 # ---------------------------------------------------------------------------
 
 
-def test_get_quota_request_history_sorted():
-    sq = MagicMock()
+def test_get_quota_request_history_sorted(sq):
     sq.list_requested_service_quota_change_history_by_quota.return_value = {
         "RequestedQuotas": [
-            {
-                "Id": "req-old",
-                "Status": "APPROVED",
-                "QuotaCode": QUOTA_CODE_SPOT,
-                "QuotaName": "All G and VT Spot Instance Requests",
-                "DesiredValue": 4.0,
-                "Created": datetime(2025, 1, 1, tzinfo=UTC),
-                "CaseId": "",
-            },
-            {
-                "Id": "req-new",
-                "Status": "PENDING",
-                "QuotaCode": QUOTA_CODE_SPOT,
-                "QuotaName": "All G and VT Spot Instance Requests",
-                "DesiredValue": 8.0,
-                "Created": datetime(2025, 6, 1, tzinfo=UTC),
-                "CaseId": "",
-            },
+            _requested("req-old", "APPROVED", 4.0, created=datetime(2025, 1, 1, tzinfo=UTC)),
+            _requested("req-new", "PENDING", 8.0, created=datetime(2025, 6, 1, tzinfo=UTC)),
         ]
     }
     results = get_quota_request_history(sq, QUOTA_CODE_SPOT)
-    assert len(results) == 2
-    assert results[0]["request_id"] == "req-new"  # newest first
-    assert results[1]["request_id"] == "req-old"
+    assert [r["request_id"] for r in results] == ["req-new", "req-old"]  # newest first
 
 
-def test_get_quota_request_history_status_filter():
-    sq = MagicMock()
+def test_get_quota_request_history_status_filter(sq):
     sq.list_requested_service_quota_change_history_by_quota.return_value = {"RequestedQuotas": []}
     get_quota_request_history(sq, QUOTA_CODE_SPOT, status_filter="APPROVED")
-    call_kwargs = sq.list_requested_service_quota_change_history_by_quota.call_args[1]
-    assert call_kwargs["Status"] == "APPROVED"
+    assert sq.list_requested_service_quota_change_history_by_quota.call_args[1]["Status"] == "APPROVED"
 
 
-def test_get_quota_request_history_no_status_filter():
-    sq = MagicMock()
+def test_get_quota_request_history_no_status_filter_by_default(sq):
     sq.list_requested_service_quota_change_history_by_quota.return_value = {"RequestedQuotas": []}
-    get_quota_request_history(sq, QUOTA_CODE_SPOT)
-    call_kwargs = sq.list_requested_service_quota_change_history_by_quota.call_args[1]
-    assert "Status" not in call_kwargs
-
-
-def test_get_quota_request_history_empty():
-    sq = MagicMock()
-    sq.list_requested_service_quota_change_history_by_quota.return_value = {"RequestedQuotas": []}
-    results = get_quota_request_history(sq, QUOTA_CODE_SPOT)
-    assert results == []
-
-
-def test_get_quota_request_history_not_found():
-    sq = MagicMock()
-    sq.list_requested_service_quota_change_history_by_quota.side_effect = _make_client_error("NoSuchResourceException")
-    with pytest.raises(CLIError, match="not found"):
-        get_quota_request_history(sq, QUOTA_CODE_SPOT)
+    assert get_quota_request_history(sq, QUOTA_CODE_SPOT) == []
+    assert "Status" not in sq.list_requested_service_quota_change_history_by_quota.call_args[1]
 
 
 # ---------------------------------------------------------------------------
@@ -201,8 +160,7 @@ def test_get_quota_request_history_not_found():
 # ---------------------------------------------------------------------------
 
 
-def test_get_family_quotas_gvt():
-    sq = MagicMock()
+def test_get_family_quotas_gvt(sq):
 
     def fake_get(ServiceCode, QuotaCode):
         names = {

@@ -83,15 +83,16 @@ def test_import_key_pair_not_exists_imports_under_requested_name(tmp_path):
     assert ec2.import_key_pair.call_args[1]["KeyName"] == "aws-bootstrap-key"
 
 
-def test_import_key_pair_matching_reuses_name(tmp_path):
-    ec2 = _ec2([{"KeyPairs": [{"PublicKey": LOCAL_PUB}]}])
-    assert import_key_pair(ec2, "aws-bootstrap-key", _pub(tmp_path)) == "aws-bootstrap-key"
-    ec2.import_key_pair.assert_not_called()
-
-
-def test_import_key_pair_no_pubkey_on_record_reuses(tmp_path):
-    # Older imported pair: AWS returns no PublicKey -> reuse (assume it's ours).
-    ec2 = _ec2([{"KeyPairs": [{}]}])
+@pytest.mark.parametrize(
+    "record",
+    [
+        pytest.param({"PublicKey": LOCAL_PUB}, id="matching-key"),
+        # Older imported pair: AWS returns no PublicKey -> reuse (assume it's ours).
+        pytest.param({}, id="no-public-key-on-record"),
+    ],
+)
+def test_import_key_pair_existing_reuses_name(tmp_path, record):
+    ec2 = _ec2([{"KeyPairs": [record]}])
     assert import_key_pair(ec2, "aws-bootstrap-key", _pub(tmp_path)) == "aws-bootstrap-key"
     ec2.import_key_pair.assert_not_called()
 
@@ -201,26 +202,17 @@ def test_generate_ssh_keypair_propagates_failure(tmp_path):
 # --- query_cuda_version ------------------------------------------------------
 
 
-@patch("aws_bootstrap.ssh.subprocess.run")
-def test_query_cuda_version_valid(mock_run):
-    mock_run.return_value = MagicMock(returncode=0, stdout="13.2\n")
-    assert query_cuda_version("1.2.3.4", "ubuntu", Path("/tmp/k.pub")) == "13.2"
-
-
-@patch("aws_bootstrap.ssh.subprocess.run")
-def test_query_cuda_version_none_sentinel_is_ignored(mock_run):
-    # remote_setup writes "none" on a box with no CUDA (non-DL / smoke test).
-    mock_run.return_value = MagicMock(returncode=0, stdout="none\n")
-    assert query_cuda_version("1.2.3.4", "ubuntu", Path("/tmp/k.pub")) is None
-
-
-@patch("aws_bootstrap.ssh.subprocess.run")
-def test_query_cuda_version_missing_file(mock_run):
-    # `cat` of a missing sentinel: rc!=0 -> None (e.g. --no-setup, never written).
-    mock_run.return_value = MagicMock(returncode=1, stdout="")
-    assert query_cuda_version("1.2.3.4", "ubuntu", Path("/tmp/k.pub")) is None
-
-
-@patch("aws_bootstrap.ssh.subprocess.run", side_effect=subprocess.TimeoutExpired("ssh", 15))
-def test_query_cuda_version_timeout(_mock_run):
-    assert query_cuda_version("1.2.3.4", "ubuntu", Path("/tmp/k.pub")) is None
+@pytest.mark.parametrize(
+    "run,expected",
+    [
+        pytest.param({"return_value": MagicMock(returncode=0, stdout="13.2\n")}, "13.2", id="valid"),
+        # remote_setup writes "none" on a box with no CUDA (non-DL / smoke test).
+        pytest.param({"return_value": MagicMock(returncode=0, stdout="none\n")}, None, id="none-sentinel"),
+        # `cat` of a missing sentinel: rc!=0 -> None (e.g. --no-setup, never written).
+        pytest.param({"return_value": MagicMock(returncode=1, stdout="")}, None, id="missing-file"),
+        pytest.param({"side_effect": subprocess.TimeoutExpired("ssh", 15)}, None, id="timeout"),
+    ],
+)
+def test_query_cuda_version(run, expected):
+    with patch("aws_bootstrap.ssh.subprocess.run", **run):
+        assert query_cuda_version("1.2.3.4", "ubuntu", Path("/tmp/k.pub")) == expected

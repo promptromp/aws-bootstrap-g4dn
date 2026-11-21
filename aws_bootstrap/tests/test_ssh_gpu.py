@@ -3,6 +3,8 @@
 from __future__ import annotations
 from pathlib import Path
 
+import pytest
+
 from aws_bootstrap.ssh import (
     add_ssh_host,
     get_ssh_host_details,
@@ -29,16 +31,11 @@ def test_get_ssh_host_details_found(tmp_path):
     assert details.identity_file == Path("/home/user/.ssh/id_ed25519")
 
 
-def test_get_ssh_host_details_not_found(tmp_path):
-    """Returns None when no managed block exists for the instance."""
+@pytest.mark.parametrize("create", [True, False], ids=["no-managed-block", "no-config-file"])
+def test_get_ssh_host_details_not_found(tmp_path, create):
+    """Returns None when there is no managed block for the instance (or no config at all)."""
     cfg = tmp_path / ".ssh" / "config"
-    cfg.parent.mkdir(parents=True, exist_ok=True)
-    cfg.write_text("")
-
+    if create:
+        cfg.parent.mkdir(parents=True)
+        cfg.write_text("")
     assert get_ssh_host_details("i-missing", config_path=cfg) is None
-
-
-def test_get_ssh_host_details_nonexistent_file(tmp_path):
-    """Returns None when the SSH config file doesn't exist."""
-    cfg = tmp_path / "no_such_file"
-    assert get_ssh_host_details("i-abc123", config_path=cfg) is None

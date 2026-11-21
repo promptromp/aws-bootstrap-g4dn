@@ -62,15 +62,14 @@ def _fake_launch(rank_holder):
     return launch_fn
 
 
-def test_launch_cluster_nodes_assigns_sequential_ranks():
-    holder = {"n": 0}
+def test_launch_cluster_nodes_assigns_sequential_ranks_and_reports_each_node():
     seen = []
     results = cluster.launch_cluster_nodes(
         LaunchConfig(regions=("us-east-1",)),
         prepare_region=lambda r: None,
         count=3,
         start_rank=0,
-        launch_fn=_fake_launch(holder),
+        launch_fn=_fake_launch({"n": 0}),
         on_node=lambda rank, launch: seen.append((rank, launch.instance["InstanceId"])),
     )
     assert [r.rank for r in results] == [0, 1, 2]
@@ -78,16 +77,17 @@ def test_launch_cluster_nodes_assigns_sequential_ranks():
     assert seen == [(0, "i-0"), (1, "i-1"), (2, "i-2")]
 
 
-def test_launch_cluster_nodes_starts_at_offset():
-    holder = {"n": 0}
+def test_launch_cluster_nodes_starts_at_offset_without_a_callback():
+    """An incremental launch continues the existing ranks; on_node is optional."""
     results = cluster.launch_cluster_nodes(
         LaunchConfig(regions=("us-east-1",)),
         prepare_region=lambda r: None,
         count=2,
         start_rank=2,
-        launch_fn=_fake_launch(holder),
+        launch_fn=_fake_launch({"n": 0}),
     )
     assert [r.rank for r in results] == [2, 3]
+    assert [r.launch.instance["InstanceId"] for r in results] == ["i-0", "i-1"]
 
 
 # ---------------------------------------------------------------------------
@@ -95,20 +95,17 @@ def test_launch_cluster_nodes_starts_at_offset():
 # ---------------------------------------------------------------------------
 
 
-def test_master_addr_is_rank0_private_ip():
-    nodes = [
-        {"Rank": 1, "PrivateIp": "10.0.0.6"},
-        {"Rank": 0, "PrivateIp": "10.0.0.5"},
-    ]
-    assert cluster.master_addr(nodes) == "10.0.0.5"
-
-
-def test_master_addr_tolerates_unknown_rank():
-    # A node whose rank tag failed to write (Rank=None) must not crash master_addr.
-    nodes = [
-        {"Rank": None, "PrivateIp": "10.0.0.9"},
-        {"Rank": 0, "PrivateIp": "10.0.0.5"},
-    ]
+@pytest.mark.parametrize(
+    "nodes",
+    [
+        pytest.param([{"Rank": 1, "PrivateIp": "10.0.0.6"}, {"Rank": 0, "PrivateIp": "10.0.0.5"}], id="ranked"),
+        # A node whose rank tag failed to write (Rank=None) must not crash master_addr.
+        pytest.param(
+            [{"Rank": None, "PrivateIp": "10.0.0.9"}, {"Rank": 0, "PrivateIp": "10.0.0.5"}], id="unknown-rank"
+        ),
+    ],
+)
+def test_master_addr_is_rank0_private_ip(nodes):
     assert cluster.master_addr(nodes) == "10.0.0.5"
 
 
@@ -122,33 +119,31 @@ def test_build_torchrun_command_quotes_script_args():
     assert "/tmp/t.py --run-name 'my run' --flag" in cmd
 
 
-def test_build_torchrun_command_c10d():
-    cmd = cluster.build_torchrun_command(
-        script="train.py",
-        num_nodes=4,
-        nproc_per_node=1,
-        master_addr="10.0.0.5",
-        rdzv_id="ml1",
-        rdzv_port=29400,
-        script_args=["--epochs", "1"],
-    )
-    assert "torchrun" in cmd
-    assert "--nnodes=4" in cmd
-    assert "--nproc-per-node=1" in cmd
-    assert "--rdzv-backend=c10d" in cmd
-    assert "--rdzv-endpoint=10.0.0.5:29400" in cmd
-    assert "--rdzv-id=ml1" in cmd
-    assert cmd.strip().endswith("train.py --epochs 1")
-
-
-def test_build_torchrun_command_exact():
+@pytest.mark.parametrize(
+    "num_nodes,script,script_args,expected",
+    [
+        (
+            2,
+            "/tmp/t.py",
+            None,
+            "torchrun --nnodes=2 --nproc-per-node=1 "
+            "--rdzv-backend=c10d --rdzv-endpoint=10.0.0.5:29400 --rdzv-id=ml1 /tmp/t.py",
+        ),
+        (
+            4,
+            "train.py",
+            ["--epochs", "1"],
+            "torchrun --nnodes=4 --nproc-per-node=1 "
+            "--rdzv-backend=c10d --rdzv-endpoint=10.0.0.5:29400 --rdzv-id=ml1 train.py --epochs 1",
+        ),
+    ],
+    ids=["no-args", "with-args"],
+)
+def test_build_torchrun_command_exact(num_nodes, script, script_args, expected):
     # Exact match: this string is the load-bearing contract with torchrun, so
     # guard against silent flag-format drift (e.g. --nproc-per-node vs _).
-    cmd = cluster.build_torchrun_command("/tmp/t.py", 2, 1, "10.0.0.5", "ml1", 29400)
-    assert cmd == (
-        "torchrun --nnodes=2 --nproc-per-node=1 "
-        "--rdzv-backend=c10d --rdzv-endpoint=10.0.0.5:29400 --rdzv-id=ml1 /tmp/t.py"
-    )
+    cmd = cluster.build_torchrun_command(script, num_nodes, 1, "10.0.0.5", "ml1", 29400, script_args=script_args)
+    assert cmd == expected
 
 
 def test_render_node_config_is_sourceable():
@@ -187,6 +182,7 @@ def test_node_env_contract():
         ({"i-0": "12.4", "i-1": "12.1"}, False),
         ({"i-0": "12.4"}, True),
     ],
+    ids=["consistent", "skewed", "single-node"],
 )
 def test_detect_version_skew(versions, expected_ok):
     mismatches = cluster.detect_version_skew(versions)
@@ -205,88 +201,84 @@ def test_canary_resource_is_valid_python():
 # Parallel multi-node execution + canary orchestration
 # ---------------------------------------------------------------------------
 
+TWO_NODES = [
+    {"Rank": 0, "InstanceId": "i-0", "PrivateIp": "10.0.0.5", "PublicIp": "1.1.1.1"},
+    {"Rank": 1, "InstanceId": "i-1", "PrivateIp": "10.0.0.6", "PublicIp": "2.2.2.2"},
+]
+
+
+class _Recorder:
+    """A run_fn that records each command and answers ``outcome(node, command)``."""
+
+    def __init__(self, outcome=lambda node, command: (0, "", "")):
+        self.commands: list[str] = []
+        self._outcome = outcome
+
+    def __call__(self, node, command):
+        self.commands.append(command)
+        return self._outcome(node, command)
+
 
 def test_run_on_all_nodes_collects_results_in_order():
-    nodes = [{"Rank": 0, "InstanceId": "i-0"}, {"Rank": 1, "InstanceId": "i-1"}]
-
-    def run_fn(node, command):
-        return (0, f"out-{node['InstanceId']}", "")
-
-    results = cluster.run_on_all_nodes(nodes, lambda node: "echo hi", run_fn=run_fn)
+    results = cluster.run_on_all_nodes(
+        TWO_NODES, lambda node: "echo hi", run_fn=lambda node, cmd: (0, f"out-{node['InstanceId']}", "")
+    )
     assert [r.instance_id for r in results] == ["i-0", "i-1"]
     assert [r.returncode for r in results] == [0, 0]
     assert results[0].stdout == "out-i-0"
 
 
 def test_run_on_all_nodes_reports_failures():
-    nodes = [{"Rank": 0, "InstanceId": "i-0"}, {"Rank": 1, "InstanceId": "i-1"}]
-
     def run_fn(node, command):
-        return (0 if node["Rank"] == 0 else 1, "", "boom" if node["Rank"] == 1 else "")
+        return (node["Rank"], "", "boom" if node["Rank"] else "")
 
-    results = cluster.run_on_all_nodes(nodes, lambda node: "x", run_fn=run_fn)
-    assert results[0].returncode == 0
-    assert results[1].returncode == 1
-    assert results[1].stderr == "boom"
+    results = cluster.run_on_all_nodes(TWO_NODES, lambda node: "x", run_fn=run_fn)
+    assert [r.returncode for r in results] == [0, 1]
+    assert results[1].stderr == "boom"  # the node's own stderr, untouched
 
 
 def test_run_on_all_nodes_survives_raising_run_fn():
-    nodes = [{"Rank": 0, "InstanceId": "i-0"}, {"Rank": 1, "InstanceId": "i-1"}]
-
     def run_fn(node, command):
         if node["Rank"] == 1:
             raise RuntimeError("kaboom")
         return (0, "ok", "")
 
-    results = cluster.run_on_all_nodes(nodes, lambda node: "x", run_fn=run_fn)
+    results = cluster.run_on_all_nodes(TWO_NODES, lambda node: "x", run_fn=run_fn)
     # One node raising must not abort the whole sweep; it's a rank-labeled failure.
-    assert results[0].returncode == 0
-    assert results[1].returncode == 1
+    assert [r.returncode for r in results] == [0, 1]
     assert "kaboom" in results[1].stderr
     assert results[1].instance_id == "i-1"
 
 
 def test_run_canary_scps_and_runs_torchrun_on_all_nodes():
-    nodes = [
-        {"Rank": 0, "InstanceId": "i-0", "PrivateIp": "10.0.0.5", "PublicIp": "1.1.1.1"},
-        {"Rank": 1, "InstanceId": "i-1", "PrivateIp": "10.0.0.6", "PublicIp": "2.2.2.2"},
-    ]
     scped: list[str] = []
-    ran: list[str] = []
-
-    def scp_fn(node, local, remote):
-        scped.append(node["InstanceId"])
-        return True
-
-    def run_fn(node, command):
-        ran.append(command)
-        return (0, f"[canary] rank ok {node['Rank']}", "")
-
+    run_fn = _Recorder(lambda node, cmd: (0, f"[canary] rank ok {node['Rank']}", ""))
     results = cluster.run_canary(
-        nodes, cluster_id="ml1", nproc_per_node=1, rdzv_port=29400, scp_fn=scp_fn, run_fn=run_fn
+        TWO_NODES,
+        cluster_id="ml1",
+        nproc_per_node=1,
+        rdzv_port=29400,
+        scp_fn=lambda node, local, remote: scped.append(node["InstanceId"]) or True,
+        run_fn=run_fn,
     )
     assert scped == ["i-0", "i-1"]
-    assert all("--rdzv-endpoint=10.0.0.5:29400" in c for c in ran)
-    assert all("cluster_canary.py" in c for c in ran)
+    assert len(run_fn.commands) == len(results) == 2
+    assert all("--rdzv-endpoint=10.0.0.5:29400" in c for c in run_fn.commands)
+    assert all("cluster_canary.py" in c for c in run_fn.commands)
     assert all(r.returncode == 0 for r in results)
 
 
 def test_run_canary_scp_failure_aborts():
-    nodes = [{"Rank": 0, "InstanceId": "i-0", "PrivateIp": "10.0.0.5", "PublicIp": "1.1.1.1"}]
-
-    def scp_fn(node, local, remote):
-        return False
-
-    ran: list[str] = []
-
-    def run_fn(node, command):
-        ran.append(command)
-        return (0, "", "")
-
+    run_fn = _Recorder()
     results = cluster.run_canary(
-        nodes, cluster_id="ml1", nproc_per_node=1, rdzv_port=29400, scp_fn=scp_fn, run_fn=run_fn
+        TWO_NODES[:1],
+        cluster_id="ml1",
+        nproc_per_node=1,
+        rdzv_port=29400,
+        scp_fn=lambda node, local, remote: False,
+        run_fn=run_fn,
     )
-    assert ran == []
+    assert run_fn.commands == []
     assert results[0].returncode != 0
 
 
@@ -295,54 +287,35 @@ def test_run_canary_scp_failure_aborts():
 # ---------------------------------------------------------------------------
 
 
-def _twonode():
-    return [
-        {"Rank": 0, "InstanceId": "i-0", "PrivateIp": "10.0.0.5", "PublicIp": "1.1.1.1"},
-        {"Rank": 1, "InstanceId": "i-1", "PrivateIp": "10.0.0.6", "PublicIp": "2.2.2.2"},
-    ]
+def _run_job(run_fn, script="train.py", script_args=None, **kwargs):
+    return cluster.run_distributed_job(
+        TWO_NODES,
+        cluster_id="ml1",
+        nproc_per_node=1,
+        rdzv_port=29400,
+        local_script=Path(script),
+        remote_script=f"/tmp/{script}",
+        script_args=script_args,
+        scp_fn=lambda n, ll, r: True,
+        run_fn=run_fn,
+        **kwargs,
+    )
 
 
 def test_run_distributed_job_py_uses_torchrun():
-    ran: list[str] = []
-
-    def run_fn(node, command):
-        ran.append(command)
-        return (0, "done", "")
-
-    results = cluster.run_distributed_job(
-        _twonode(),
-        cluster_id="ml1",
-        nproc_per_node=1,
-        rdzv_port=29400,
-        local_script=Path("train.py"),
-        remote_script="/tmp/train.py",
-        script_args=["--epochs", "2"],
-        scp_fn=lambda n, ll, r: True,
-        run_fn=run_fn,
-    )
+    run_fn = _Recorder(lambda node, cmd: (0, "done", ""))
+    results = _run_job(run_fn, script_args=["--epochs", "2"])
+    assert len(run_fn.commands) == len(results) == 2
     assert all(r.returncode == 0 for r in results)
-    assert all("torchrun" in c and "/tmp/train.py --epochs 2" in c for c in ran)
-    assert all("--rdzv-endpoint=10.0.0.5:29400" in c for c in ran)
+    assert all("torchrun" in c and "/tmp/train.py --epochs 2" in c for c in run_fn.commands)
+    assert all("--rdzv-endpoint=10.0.0.5:29400" in c for c in run_fn.commands)
 
 
 def test_run_distributed_job_sh_uses_escape_hatch_env():
-    ran: list[str] = []
-
-    def run_fn(node, command):
-        ran.append(command)
-        return (0, "", "")
-
-    cluster.run_distributed_job(
-        _twonode(),
-        cluster_id="ml1",
-        nproc_per_node=1,
-        rdzv_port=29400,
-        local_script=Path("job.sh"),
-        remote_script="/tmp/job.sh",
-        script_args=None,
-        scp_fn=lambda n, ll, r: True,
-        run_fn=run_fn,
-    )
+    run_fn = _Recorder()
+    _run_job(run_fn, script="job.sh")
+    ran = run_fn.commands
+    assert len(ran) == 2
     assert all("bash /tmp/job.sh" in c for c in ran)
     assert all("AWSB_MASTER_ADDR=10.0.0.5" in c for c in ran)
     assert any("AWSB_NODE_RANK=0" in c for c in ran) and any("AWSB_NODE_RANK=1" in c for c in ran)
@@ -350,24 +323,9 @@ def test_run_distributed_job_sh_uses_escape_hatch_env():
 
 
 def test_run_distributed_job_runs_data_prep_before_training():
-    calls: list[str] = []
-
-    def run_fn(node, command):
-        calls.append(command)
-        return (0, "", "")
-
-    cluster.run_distributed_job(
-        _twonode(),
-        cluster_id="ml1",
-        nproc_per_node=1,
-        rdzv_port=29400,
-        local_script=Path("train.py"),
-        remote_script="/tmp/train.py",
-        script_args=None,
-        scp_fn=lambda n, ll, r: True,
-        run_fn=run_fn,
-        data_script=Path("prep.sh"),
-    )
+    run_fn = _Recorder()
+    _run_job(run_fn, data_script=Path("prep.sh"))
+    calls = run_fn.commands
     assert sum("data_prep.sh" in c for c in calls) == 2
     assert sum("torchrun" in c for c in calls) == 2
     # Training only after every node's data-prep finished.
@@ -375,42 +333,12 @@ def test_run_distributed_job_runs_data_prep_before_training():
 
 
 def test_run_distributed_job_aborts_if_data_prep_fails():
-    ran: list[str] = []
-
-    def run_fn(node, command):
-        ran.append(command)
-        if "data_prep.sh" in command:
-            return (1, "", "prep failed")
-        return (0, "", "")
-
-    results = cluster.run_distributed_job(
-        _twonode(),
-        cluster_id="ml1",
-        nproc_per_node=1,
-        rdzv_port=29400,
-        local_script=Path("train.py"),
-        remote_script="/tmp/train.py",
-        script_args=None,
-        scp_fn=lambda n, ll, r: True,
-        run_fn=run_fn,
-        data_script=Path("prep.sh"),
-    )
+    run_fn = _Recorder(lambda node, cmd: (1, "", "prep failed") if "data_prep.sh" in cmd else (0, "", ""))
+    results = _run_job(run_fn, data_script=Path("prep.sh"))
+    assert len(results) == 2
     assert all(r.returncode != 0 for r in results)
-    assert all("torchrun" not in c for c in ran)
-
-
-def test_run_canary_still_passes_after_refactor():
-    ran: list[str] = []
-    results = cluster.run_canary(
-        _twonode(),
-        cluster_id="ml1",
-        nproc_per_node=1,
-        rdzv_port=29400,
-        scp_fn=lambda n, ll, r: True,
-        run_fn=lambda n, c: ran.append(c) or (0, "ok", ""),
-    )
-    assert all(r.returncode == 0 for r in results)
-    assert all("cluster_canary.py" in c for c in ran)
+    assert len(run_fn.commands) == 2  # the two data-prep runs, and no training
+    assert all("torchrun" not in c for c in run_fn.commands)
 
 
 def test_master_addr_rejects_an_empty_node_list():

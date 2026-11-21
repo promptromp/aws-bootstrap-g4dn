@@ -1,9 +1,8 @@
 """Region-aware behaviour of the ``quota`` and ``list`` CLI commands.
 
 These exercise the repeatable ``--region`` support, region labelling, and the
-per-region structured output added alongside multi-region ``status``. They use
-the shared fixtures in ``conftest.py`` and ``pytest.mark.parametrize`` rather
-than the decorator-stacking style of the older ``test_cli.py`` cases.
+per-region structured output added alongside multi-region ``status``, using the
+shared fixtures in ``conftest.py``.
 """
 
 from __future__ import annotations
@@ -47,6 +46,7 @@ def _r(regions):
         ["list", "instance-types", "--help"],
         ["list", "amis", "--help"],
     ],
+    ids=lambda argv: " ".join(argv[:-1]),
 )
 def test_region_option_is_repeatable_in_help(runner, argv):
     result = runner.invoke(main, argv)
@@ -176,14 +176,13 @@ def test_quota_request_confirm_lists_all_regions(runner, cli_session):
 # list instance-types / amis
 # ---------------------------------------------------------------------------
 
+_LIST_COMMANDS = [
+    ("instance-types", "aws_bootstrap.cli.list_instance_types", "instance_type_rows"),
+    ("amis", "aws_bootstrap.cli.list_amis", "ami_rows"),
+]
 
-@pytest.mark.parametrize(
-    "command,helper,rows_fixture",
-    [
-        ("instance-types", "aws_bootstrap.cli.list_instance_types", "instance_type_rows"),
-        ("amis", "aws_bootstrap.cli.list_amis", "ami_rows"),
-    ],
-)
+
+@pytest.mark.parametrize("command,helper,rows_fixture", _LIST_COMMANDS, ids=["instance-types", "amis"])
 def test_list_multi_region_queries_and_tags_each(runner, cli_session, request, command, helper, rows_fixture):
     rows = request.getfixturevalue(rows_fixture)
     with patch(helper, return_value=rows) as mock_helper:
@@ -194,13 +193,7 @@ def test_list_multi_region_queries_and_tags_each(runner, cli_session, request, c
     assert {row["region"] for row in data} == {"us-east-1", "us-west-2"}
 
 
-@pytest.mark.parametrize(
-    "command,helper,rows_fixture",
-    [
-        ("instance-types", "aws_bootstrap.cli.list_instance_types", "instance_type_rows"),
-        ("amis", "aws_bootstrap.cli.list_amis", "ami_rows"),
-    ],
-)
+@pytest.mark.parametrize("command,helper,rows_fixture", _LIST_COMMANDS, ids=["instance-types", "amis"])
 def test_list_single_region_labels_region(runner, cli_session, request, command, helper, rows_fixture):
     rows = request.getfixturevalue(rows_fixture)
     with patch(helper, return_value=rows):
