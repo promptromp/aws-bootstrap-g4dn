@@ -3,6 +3,8 @@
 from __future__ import annotations
 from pathlib import Path
 
+import pytest
+
 from aws_bootstrap.config import DEFAULT_REGION, LaunchConfig
 
 
@@ -18,12 +20,10 @@ def test_defaults():
     assert config.tag_value == "aws-bootstrap-g4dn"
     assert config.run_setup is True
     assert config.dry_run is False
-
-
-def test_ebs_fields_default_none():
-    config = LaunchConfig()
     assert config.ebs_storage is None
     assert config.ebs_volume_id is None
+    assert config.wait is False
+    assert config.wait_timeout == 1800
 
 
 def test_overrides():
@@ -41,6 +41,17 @@ def test_overrides():
     assert config.key_path == Path("/tmp/test.pub")
 
 
+@pytest.mark.parametrize(
+    "kwargs,storage,volume_id",
+    [({"ebs_storage": 96}, 96, None), ({"ebs_volume_id": "vol-abc123"}, None, "vol-abc123")],
+    ids=["ebs-storage", "ebs-volume-id"],
+)
+def test_ebs_overrides_leave_the_other_unset(kwargs, storage, volume_id):
+    config = LaunchConfig(**kwargs)
+    assert config.ebs_storage == storage
+    assert config.ebs_volume_id == volume_id
+
+
 def test_region_property_returns_first_of_regions():
     config = LaunchConfig(regions=("us-east-1", "us-west-2", "eu-west-1"))
     assert config.region == "us-east-1"
@@ -49,23 +60,4 @@ def test_region_property_returns_first_of_regions():
 
 def test_region_property_falls_back_when_regions_empty():
     # Latent-invariant guard: never raise an opaque IndexError.
-    config = LaunchConfig(regions=())
-    assert config.region == DEFAULT_REGION
-
-
-def test_wait_defaults():
-    config = LaunchConfig()
-    assert config.wait is False
-    assert config.wait_timeout == 1800
-
-
-def test_ebs_storage_override():
-    config = LaunchConfig(ebs_storage=96)
-    assert config.ebs_storage == 96
-    assert config.ebs_volume_id is None
-
-
-def test_ebs_volume_id_override():
-    config = LaunchConfig(ebs_volume_id="vol-abc123")
-    assert config.ebs_volume_id == "vol-abc123"
-    assert config.ebs_storage is None
+    assert LaunchConfig(regions=()).region == DEFAULT_REGION

@@ -3,6 +3,7 @@
 from __future__ import annotations
 import fnmatch
 import io
+import random
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -18,7 +19,6 @@ from aws_bootstrap.ec2 import (
     RegionContext,
     RegionFatalError,
     RegionLaunch,
-    _build_launch_params,
     _gpu_summary,
     _quota_error_message,
     _quota_hint,
@@ -44,6 +44,16 @@ from aws_bootstrap.ec2 import (
 )
 
 
+@pytest.fixture
+def ec2():
+    """A bare mocked EC2 client."""
+    return MagicMock()
+
+
+def _make_client_error(code: str, message: str = "test") -> botocore.exceptions.ClientError:
+    return botocore.exceptions.ClientError({"Error": {"Code": code, "Message": message}}, "RunInstances")
+
+
 def test_cli_error_is_click_exception():
     err = CLIError("something went wrong")
     assert isinstance(err, click.ClickException)
@@ -51,15 +61,17 @@ def test_cli_error_is_click_exception():
 
 
 def test_cli_error_show_outputs_red():
-    err = CLIError("bad input")
     buf = io.StringIO()
-    err.show(file=buf)
-    output = buf.getvalue()
-    assert "Error: bad input" in output
+    CLIError("bad input").show(file=buf)
+    assert "Error: bad input" in buf.getvalue()
 
 
-def test_get_latest_ami_picks_newest():
-    ec2 = MagicMock()
+# ---------------------------------------------------------------------------
+# AMI lookup
+# ---------------------------------------------------------------------------
+
+
+def test_get_latest_ami_picks_newest(ec2):
     ec2.describe_images.return_value = {
         "Images": [
             {"ImageId": "ami-old", "Name": "DL AMI old", "CreationDate": "2024-01-01T00:00:00Z"},
@@ -67,12 +79,10 @@ def test_get_latest_ami_picks_newest():
             {"ImageId": "ami-mid", "Name": "DL AMI mid", "CreationDate": "2025-01-01T00:00:00Z"},
         ]
     }
-    ami = get_latest_ami(ec2, "DL AMI*")
-    assert ami["ImageId"] == "ami-new"
+    assert get_latest_ami(ec2, "DL AMI*")["ImageId"] == "ami-new"
 
 
-def test_get_latest_ami_no_results():
-    ec2 = MagicMock()
+def test_get_latest_ami_no_results(ec2):
     ec2.describe_images.return_value = {"Images": []}
     with pytest.raises(click.ClickException, match="No x86_64 AMI found"):
         get_latest_ami(ec2, "nonexistent*")
@@ -92,37 +102,28 @@ def _instance_type_response(arches: list[str]) -> dict:
 
 
 @pytest.mark.parametrize(
-    "arches,expected",
+    "response,expected",
     [
-        (["x86_64"], "x86_64"),
-        (["arm64"], "arm64"),
+        pytest.param(_instance_type_response(["x86_64"]), "x86_64", id="x86_64"),
+        pytest.param(_instance_type_response(["arm64"]), "arm64", id="arm64"),
         # Mixed-arch types keep x86_64: far more AMIs are published for it.
-        (["arm64", "x86_64"], "x86_64"),
-        ([], "x86_64"),
+        pytest.param(_instance_type_response(["arm64", "x86_64"]), "x86_64", id="mixed"),
+        pytest.param(_instance_type_response([]), "x86_64", id="no-architectures"),
+        pytest.param({"InstanceTypes": []}, "x86_64", id="empty-response"),
+        # An unknown type in this region must not abort the launch sweep.
+        pytest.param(_make_client_error("InvalidInstanceType"), "x86_64", id="unknown-type"),
     ],
 )
-def test_instance_type_architecture(arches, expected):
-    ec2 = MagicMock()
-    ec2.describe_instance_types.return_value = _instance_type_response(arches)
+def test_instance_type_architecture(ec2, response, expected):
+    if isinstance(response, Exception):
+        ec2.describe_instance_types.side_effect = response
+    else:
+        ec2.describe_instance_types.return_value = response
     assert instance_type_architecture(ec2, "g5g.xlarge") == expected
 
 
-def test_instance_type_architecture_falls_back_when_type_unknown():
-    """An unknown type in this region must not abort the launch sweep."""
-    ec2 = MagicMock()
-    ec2.describe_instance_types.side_effect = _make_client_error("InvalidInstanceType")
-    assert instance_type_architecture(ec2, "made-up.xlarge") == "x86_64"
-
-
-def test_instance_type_architecture_falls_back_on_empty_response():
-    ec2 = MagicMock()
-    ec2.describe_instance_types.return_value = {"InstanceTypes": []}
-    assert instance_type_architecture(ec2, "made-up.xlarge") == "x86_64"
-
-
 @pytest.mark.parametrize("arch", ["x86_64", "arm64"])
-def test_get_latest_ami_filters_on_requested_architecture(arch):
-    ec2 = MagicMock()
+def test_get_latest_ami_filters_on_requested_architecture(ec2, arch):
     ec2.describe_images.return_value = {
         "Images": [{"ImageId": "ami-1", "Name": "n", "CreationDate": "2025-06-01T00:00:00Z"}]
     }
@@ -131,9 +132,8 @@ def test_get_latest_ami_filters_on_requested_architecture(arch):
     assert {"Name": "architecture", "Values": [arch]} in filters
 
 
-def test_get_latest_ami_arch_miss_explains_the_mismatch():
+def test_get_latest_ami_arch_miss_explains_the_mismatch(ec2):
     """A custom filter written for x86_64 finds nothing for arm64 — the error must say why."""
-    ec2 = MagicMock()
     ec2.meta.region_name = "us-west-2"
     ec2.describe_images.return_value = {"Images": []}
     with pytest.raises(click.ClickException) as exc:
@@ -147,9 +147,8 @@ def test_get_latest_ami_arch_miss_explains_the_mismatch():
     assert "PyTorch" not in msg
 
 
-def test_get_latest_ami_miss_with_default_filter_blames_the_region():
+def test_get_latest_ami_miss_with_default_filter_blames_the_region(ec2):
     """The default spans every architecture, so if it finds nothing the region lacks the image."""
-    ec2 = MagicMock()
     ec2.meta.region_name = "eu-south-2"
     ec2.describe_images.return_value = {"Images": []}
     with pytest.raises(click.ClickException) as exc:
@@ -160,8 +159,8 @@ def test_get_latest_ami_miss_with_default_filter_blames_the_region():
     assert "aws-bootstrap list amis --arch x86_64 --region eu-south-2" in msg
 
 
-def test_no_ami_message_without_a_known_region():
-    ec2 = MagicMock()  # meta.region_name is a MagicMock, not a str: no --region flag
+def test_no_ami_message_without_a_known_region(ec2):
+    # meta.region_name is a MagicMock, not a str: no --region flag
     ec2.describe_images.return_value = {"Images": []}
     with pytest.raises(click.ClickException) as exc:
         get_latest_ami(ec2, "X*", architecture="arm64")
@@ -186,13 +185,6 @@ def test_default_ami_filter_spans_architectures_but_not_other_images(name, match
     assert fnmatch.fnmatchcase(name, DEFAULT_AMI_FILTER) is matches
 
 
-def _make_client_error(code: str, message: str = "test") -> botocore.exceptions.ClientError:
-    return botocore.exceptions.ClientError(
-        {"Error": {"Code": code, "Message": message}},
-        "RunInstances",
-    )
-
-
 # ---------------------------------------------------------------------------
 # Quota error messages
 #
@@ -202,32 +194,34 @@ def _make_client_error(code: str, message: str = "test") -> botocore.exceptions.
 # ---------------------------------------------------------------------------
 
 
-def test_quota_message_spot_label_and_type():
-    msg = _quota_error_message("MaxSpotInstanceCountExceeded", LaunchConfig(spot=True), "us-west-2")
-    assert "Spot instance quota exceeded" in msg
-    assert "--type spot" in msg
+@pytest.mark.parametrize(
+    "code,spot,label,quota_type",
+    [
+        ("MaxSpotInstanceCountExceeded", True, "Spot instance quota exceeded", "spot"),
+        ("VcpuLimitExceeded", False, "On-demand vCPU quota exceeded", "on-demand"),
+    ],
+)
+def test_quota_message_label_and_type(code, spot, label, quota_type):
+    msg = _quota_error_message(code, LaunchConfig(spot=spot), "us-west-2")
+    assert label in msg
+    assert f"--type {quota_type}" in msg
     assert "aws-bootstrap quota show" in msg
-
-
-def test_quota_message_on_demand_label_and_type():
-    msg = _quota_error_message("VcpuLimitExceeded", LaunchConfig(spot=False), "us-west-2")
-    assert "On-demand vCPU quota exceeded" in msg
-    assert "--type on-demand" in msg
 
 
 @pytest.mark.parametrize(
     ("instance_type", "family"),
-    [("g4dn.xlarge", "gvt"), ("g5.2xlarge", "gvt"), ("p5.48xlarge", "p"), ("dl1.24xlarge", "dl")],
+    [
+        ("g4dn.xlarge", "gvt"),
+        ("g5.2xlarge", "gvt"),
+        ("p5.48xlarge", "p"),
+        ("dl1.24xlarge", "dl"),
+        # A non-GPU type has no quota family; the hint still has to name one.
+        ("t3.medium", "gvt"),
+    ],
 )
 def test_quota_message_family_matches_instance_type(instance_type, family):
-    msg = _quota_error_message("MaxSpotInstanceCountExceeded", LaunchConfig(instance_type=instance_type), "us-west-2")
+    msg = _quota_error_message("VcpuLimitExceeded", LaunchConfig(instance_type=instance_type), "us-west-2")
     assert f"--family {family}" in msg
-
-
-def test_quota_message_non_gpu_instance_type_falls_back_to_gvt():
-    """A non-GPU type has no quota family; the hint still has to name one."""
-    msg = _quota_error_message("VcpuLimitExceeded", LaunchConfig(instance_type="t3.medium"), "us-west-2")
-    assert "--family gvt" in msg
 
 
 def test_quota_message_pins_the_failed_region():
@@ -236,9 +230,26 @@ def test_quota_message_pins_the_failed_region():
     assert "--region eu-west-1" in msg
 
 
-def test_run_instances_maps_capacity_error():
+def test_quota_error_message_falls_back_to_config_region():
+    """`region=None` still pins the hint, via config.regions[0]."""
+    config = LaunchConfig(spot=True, instance_type="g4dn.xlarge", regions=("us-west-2",))
+    assert "--region us-west-2" in _quota_error_message("MaxSpotInstanceCountExceeded", config, None)
+
+
+def test_quota_hint_without_region_omits_flag():
+    """With no region to pin, the suggested commands carry no --region flag."""
+    hint = _quota_hint("spot", "gvt", None)
+    assert "--region" not in hint
+    assert "aws-bootstrap quota show --family gvt" in hint
+
+
+# ---------------------------------------------------------------------------
+# _run_instances: error mapping and placement
+# ---------------------------------------------------------------------------
+
+
+def test_run_instances_maps_capacity_error(ec2):
     """InsufficientInstanceCapacity is retryable (CapacityError), not fatal."""
-    ec2 = MagicMock()
     ec2.run_instances.side_effect = _make_client_error("InsufficientInstanceCapacity")
     with pytest.raises(CapacityError) as exc:
         _run_instances(ec2, LaunchConfig(spot=True), "ami-1", "sg-1", "us-west-2", True, "k")
@@ -250,29 +261,75 @@ def test_run_instances_maps_capacity_error():
     ("code", "kind"),
     [("MaxSpotInstanceCountExceeded", "quota"), ("VcpuLimitExceeded", "quota"), ("SpotMaxPriceTooLow", "price")],
 )
-def test_run_instances_maps_region_fatal_error(code, kind):
+def test_run_instances_maps_region_fatal_error(ec2, code, kind):
     """Quota / price are never worth waiting on -> RegionFatalError with a kind."""
-    ec2 = MagicMock()
     ec2.run_instances.side_effect = _make_client_error(code)
     with pytest.raises(RegionFatalError) as exc:
         _run_instances(ec2, LaunchConfig(spot=True), "ami-1", "sg-1", "us-west-2", True, "k")
     assert exc.value.kind == kind
 
 
-def test_run_instances_reraises_unknown_client_error():
+def test_run_instances_reraises_unknown_client_error(ec2):
     """An unmapped API error must not be silently reclassified as capacity."""
-    ec2 = MagicMock()
     ec2.run_instances.side_effect = _make_client_error("UnauthorizedOperation")
     with pytest.raises(botocore.exceptions.ClientError):
         _run_instances(ec2, LaunchConfig(spot=True), "ami-1", "sg-1", "us-west-2", True, "k")
 
 
-def _region_ctx(region: str, run_side_effect):
+@pytest.mark.parametrize(
+    "placement_az,placement_group,expected",
+    [
+        pytest.param("us-east-1c", None, {"AvailabilityZone": "us-east-1c"}, id="az"),
+        pytest.param(
+            "us-east-1c",
+            "aws-bootstrap-cluster-ml1",
+            {"AvailabilityZone": "us-east-1c", "GroupName": "aws-bootstrap-cluster-ml1"},
+            id="az-and-group",
+        ),
+        pytest.param(None, "aws-bootstrap-cluster-ml1", {"GroupName": "aws-bootstrap-cluster-ml1"}, id="group-only"),
+        pytest.param(None, None, None, id="none"),
+    ],
+)
+def test_run_instances_placement(ec2, placement_az, placement_group, expected):
+    """EBS AZ pinning and cluster placement groups reach run_instances via Placement."""
+    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-test"}]}
+    config = LaunchConfig(ebs_volume_id="vol-abc", spot=True)
+    _run_instances(
+        ec2,
+        config,
+        "ami-test",
+        "sg-test",
+        "us-east-1",
+        True,
+        "key-test",
+        placement_az=placement_az,
+        placement_group=placement_group,
+    )
+    # _run_instances no longer resolves the AZ itself — it is passed in.
+    ec2.describe_volumes.assert_not_called()
+    params = ec2.run_instances.call_args[1]
+    if expected is None:
+        assert "Placement" not in params
+    else:
+        assert params["Placement"] == expected
+
+
+# ---------------------------------------------------------------------------
+# launch_with_retry
+# ---------------------------------------------------------------------------
+
+
+def _region_ctx(region: str, run_side_effect, **ctx_fields):
     """RegionContext whose ec2 client's run_instances has the given side effect."""
     client = MagicMock()
     client.run_instances.side_effect = run_side_effect
     return RegionContext(
-        region=region, ec2_client=client, ami={"ImageId": f"ami-{region}"}, sg_id="sg-1", key_name="aws-bootstrap-key"
+        region=region,
+        ec2_client=client,
+        ami={"ImageId": f"ami-{region}"},
+        sg_id="sg-1",
+        key_name="aws-bootstrap-key",
+        **ctx_fields,
     )
 
 
@@ -300,22 +357,30 @@ def test_launch_with_retry_falls_through_to_second_region_on_capacity():
     assert calls == ["us-west-2:spot", "us-east-1:spot"]
 
 
-def test_launch_with_retry_quota_skips_to_next_region():
-    """A per-region quota error moves on to the next region (no longer fail-fast)."""
+@pytest.mark.parametrize(
+    "code,spot,kind",
+    [
+        # A per-region quota error moves on to the next region (no longer fail-fast).
+        pytest.param("VcpuLimitExceeded", False, "quota", id="quota"),
+        # SpotMaxPriceTooLow is region-fatal but the next region is still tried.
+        pytest.param("SpotMaxPriceTooLow", True, "price", id="spot-price"),
+    ],
+)
+def test_launch_with_retry_region_fatal_skips_to_next_region(code, spot, kind):
     contexts = {
-        "us-west-2": _region_ctx("us-west-2", _make_client_error("VcpuLimitExceeded")),
+        "us-west-2": _region_ctx("us-west-2", _make_client_error(code)),
         "us-east-1": _region_ctx("us-east-1", [_ok_instance("i-east")]),
     }
     fatal: list[tuple[str, str]] = []
-    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False)
     result = launch_with_retry(
-        config,
+        LaunchConfig(regions=("us-west-2", "us-east-1"), spot=spot),
         lambda r: contexts[r],
         on_region_fatal=lambda region, kind, msg: fatal.append((region, kind)),
     )
     assert result.region == "us-east-1"
+    assert result.pricing == ("spot" if spot else "on-demand")
     contexts["us-east-1"].ec2_client.run_instances.assert_called_once()
-    assert fatal == [("us-west-2", "quota")]
+    assert fatal == [("us-west-2", kind)]
 
 
 def test_launch_with_retry_all_regions_quota_aggregated_hard_fail():
@@ -334,52 +399,45 @@ def test_launch_with_retry_all_regions_quota_aggregated_hard_fail():
     assert "aws-bootstrap quota show --family gvt --region us-east-1" in msg
 
 
-def test_launch_with_retry_spot_price_skips_to_next_region():
-    """SpotMaxPriceTooLow is region-fatal but the next region is still tried."""
+def test_launch_with_retry_quota_hint_pins_failed_region():
+    """Aggregated failure pins the quota hint to the region that failed."""
     contexts = {
-        "us-west-2": _region_ctx("us-west-2", _make_client_error("SpotMaxPriceTooLow")),
-        "us-east-1": _region_ctx("us-east-1", [_ok_instance("i-east")]),
+        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
+        "us-east-1": _region_ctx("us-east-1", _make_client_error("VcpuLimitExceeded")),
     }
-    fatal: list[tuple[str, str]] = []
-    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True)
-    result = launch_with_retry(
-        config,
-        lambda r: contexts[r],
-        on_region_fatal=lambda region, kind, msg: fatal.append((region, kind)),
-    )
-    assert result.region == "us-east-1"
-    assert result.pricing == "spot"
-    assert fatal == [("us-west-2", "price")]
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False, instance_type="g4dn.xlarge")
+    with pytest.raises(click.ClickException) as exc:
+        launch_with_retry(config, lambda r: contexts[r])
+    msg = exc.value.format_message()
+    assert "us-east-1: on-demand quota exceeded" in msg
+    assert "aws-bootstrap quota show --family gvt --region us-east-1" in msg
+    assert "--type on-demand --desired-value <N> --region us-east-1" in msg
 
 
 def test_launch_with_retry_single_region_price_emits_hint_then_fails():
     """Price-fatal single region: hint surfaced via callback, then hard fail."""
     ctx = _region_ctx("us-west-2", _make_client_error("SpotMaxPriceTooLow"))
-    config = LaunchConfig(regions=("us-west-2",), spot=True)
     fatal: list[tuple[str, str, str]] = []
     with pytest.raises(click.ClickException, match="Launch cancelled"):
         launch_with_retry(
-            config,
+            LaunchConfig(regions=("us-west-2",), spot=True),
             lambda r: ctx,
             on_region_fatal=lambda region, kind, msg: fatal.append((region, kind, msg)),
             confirm_on_demand=lambda: False,
         )
-    assert fatal[0][0] == "us-west-2"
-    assert fatal[0][1] == "price"
-    assert "exceeds the default maximum" in fatal[0][2]
+    region, kind, msg = fatal[0]
+    assert (region, kind) == ("us-west-2", "price")
+    assert "exceeds the default maximum" in msg
 
 
 def test_launch_with_retry_on_demand_quota_aggregated_after_spot_capacity():
     """Spot capacity miss -> on-demand fallback hits quota -> aggregated hint."""
-    contexts = {
-        "us-west-2": _region_ctx(
-            "us-west-2",
-            [_make_client_error("InsufficientInstanceCapacity"), _make_client_error("VcpuLimitExceeded")],
-        ),
-    }
+    ctx = _region_ctx(
+        "us-west-2", [_make_client_error("InsufficientInstanceCapacity"), _make_client_error("VcpuLimitExceeded")]
+    )
     config = LaunchConfig(regions=("us-west-2",), spot=True, instance_type="g4dn.xlarge")
     with pytest.raises(click.ClickException) as exc:
-        launch_with_retry(config, lambda r: contexts[r], confirm_on_demand=lambda: True)
+        launch_with_retry(config, lambda r: ctx, confirm_on_demand=lambda: True)
     msg = exc.value.format_message()
     assert "on-demand quota exceeded" in msg
     assert "aws-bootstrap quota show --family gvt --region us-west-2" in msg
@@ -404,7 +462,7 @@ def test_launch_with_retry_wait_only_retries_capacity_regions():
             on_wait=lambda c, s, e, retrying, skipped: waits.append((tuple(retrying), tuple(skipped))),
             sleeper=lambda _s: None,
             clock=lambda: next(ticks),
-            rng=__import__("random").Random(0),
+            rng=random.Random(0),
         )
     assert waits == [(("us-west-2",), ("us-east-1", "us-west-1"))]
     # Quota-fatal regions attempted once only (not re-swept each cycle).
@@ -427,7 +485,7 @@ def test_launch_with_retry_wait_times_out_hard_fail():
             on_wait=lambda cycle, s, e, retrying, skipped: waits.append((cycle, tuple(retrying), tuple(skipped))),
             sleeper=slept.append,
             clock=lambda: next(ticks),
-            rng=__import__("random").Random(0),
+            rng=random.Random(0),
         )
     assert slept, "expected at least one backoff sleep before timeout"
     # One wait cycle; only the capacity-limited region is retried, none skipped.
@@ -435,27 +493,14 @@ def test_launch_with_retry_wait_times_out_hard_fail():
 
 
 def test_launch_with_retry_no_wait_on_demand_fallback_across_regions():
+    capacity = _make_client_error("InsufficientInstanceCapacity")
     contexts = {
         # [spot attempt, on-demand attempt]
-        "us-west-2": _region_ctx(
-            "us-west-2",
-            [
-                _make_client_error("InsufficientInstanceCapacity"),
-                _make_client_error("InsufficientInstanceCapacity"),
-            ],
-        ),
-        "us-east-1": _region_ctx(
-            "us-east-1",
-            [_make_client_error("InsufficientInstanceCapacity"), _ok_instance("i-od")],
-        ),
+        "us-west-2": _region_ctx("us-west-2", [capacity, capacity]),
+        "us-east-1": _region_ctx("us-east-1", [capacity, _ok_instance("i-od")]),
     }
     config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True)
-
-    result = launch_with_retry(
-        config,
-        lambda r: contexts[r],
-        confirm_on_demand=lambda: True,
-    )
+    result = launch_with_retry(config, lambda r: contexts[r], confirm_on_demand=lambda: True)
     assert result.region == "us-east-1"
     assert result.pricing == "on-demand"
 
@@ -481,135 +526,111 @@ def test_launch_with_retry_prepares_each_region_once():
     config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True, wait=True, wait_timeout=600)
     result = launch_with_retry(config, prepare, clock=lambda: 0.0)
     assert result.region == "us-east-1"
-    assert sorted(prep_calls) == ["us-east-1", "us-west-2"]
-    assert len(prep_calls) == 2  # each region prepared exactly once
+    assert sorted(prep_calls) == ["us-east-1", "us-west-2"]  # each region prepared exactly once
 
 
-def test_launch_with_retry_quota_hint_pins_failed_region():
-    """Aggregated failure pins the quota hint to the region that failed."""
-    contexts = {
-        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
-        "us-east-1": _region_ctx("us-east-1", _make_client_error("VcpuLimitExceeded")),
+@pytest.mark.parametrize(
+    "ctx_fields,expected",
+    [
+        pytest.param({"placement_azs": ("us-east-1c",)}, {"AvailabilityZone": "us-east-1c"}, id="hard-pinned-az"),
+        pytest.param(
+            {"placement_azs": ("us-east-1c",), "placement_group": "aws-bootstrap-cluster-ml1"},
+            {"AvailabilityZone": "us-east-1c", "GroupName": "aws-bootstrap-cluster-ml1"},
+            id="hard-pinned-az-and-placement-group",
+        ),
+    ],
+)
+def test_launch_with_retry_sends_the_pinned_az_to_run_instances(ctx_fields, expected):
+    """A hard-pinned AZ (an EBS volume's, or a cluster's first node's) and the cluster
+    placement group in RegionContext reach run_instances as Placement."""
+    ctx = _region_ctx("us-east-1", [_ok_instance("i-east")], **ctx_fields)
+    result = launch_with_retry(LaunchConfig(regions=("us-east-1",), spot=True, ebs_volume_id="vol-abc"), lambda r: ctx)
+    assert result.region == "us-east-1"
+    assert ctx.ec2_client.run_instances.call_args[1]["Placement"] == expected
+
+
+# ---------------------------------------------------------------------------
+# Instance discovery / pricing / termination
+# ---------------------------------------------------------------------------
+
+
+def _raw_instance(instance_id="i-abc123", *, tags=(("Name", "aws-bootstrap-g4dn.xlarge"),), **overrides):
+    """An instance as describe_instances returns it."""
+    inst = {
+        "InstanceId": instance_id,
+        "State": {"Name": "running"},
+        "InstanceType": "g4dn.xlarge",
+        "PublicIpAddress": "1.2.3.4",
+        "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
+        "InstanceLifecycle": "spot",
+        "Placement": {"AvailabilityZone": "us-west-2a"},
+        "Tags": [{"Key": k, "Value": v} for k, v in tags],
+        **overrides,
     }
-    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False, instance_type="g4dn.xlarge")
-    with pytest.raises(click.ClickException) as exc:
-        launch_with_retry(config, lambda r: contexts[r])
-    msg = exc.value.format_message()
-    assert "us-east-1: on-demand quota exceeded" in msg
-    assert "aws-bootstrap quota show --family gvt --region us-east-1" in msg
-    assert "--type on-demand --desired-value <N> --region us-east-1" in msg
+    return {k: v for k, v in inst.items() if v is not None}
 
 
-def test_quota_hint_without_region_omits_flag():
-    """With no region to pin, the suggested commands carry no --region flag."""
-    hint = _quota_hint("spot", "gvt", None)
-    assert "--region" not in hint
-    assert "aws-bootstrap quota show --family gvt" in hint
+def _reservations(*instances):
+    return {"Reservations": [{"Instances": [inst]} for inst in instances]}
 
 
-def test_quota_error_message_falls_back_to_config_region():
-    """`region=None` still pins the hint, via config.regions[0]."""
-    config = LaunchConfig(spot=True, instance_type="g4dn.xlarge", regions=("us-west-2",))
-    assert "--region us-west-2" in _quota_error_message("MaxSpotInstanceCountExceeded", config, None)
-
-
-def test_launch_with_retry_capacity_error_carries_region_and_market():
-    err = CapacityError("eu-west-1", "spot", "no capacity")
-    assert err.region == "eu-west-1"
-    assert err.market == "spot"
-
-
-def test_find_tagged_instances():
-    ec2 = MagicMock()
-    ec2.describe_instances.return_value = {
-        "Reservations": [
-            {
-                "Instances": [
-                    {
-                        "InstanceId": "i-abc123",
-                        "State": {"Name": "running"},
-                        "InstanceType": "g4dn.xlarge",
-                        "PublicIpAddress": "1.2.3.4",
-                        "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-                        "InstanceLifecycle": "spot",
-                        "Placement": {"AvailabilityZone": "us-west-2a"},
-                        "Tags": [
-                            {"Key": "Name", "Value": "aws-bootstrap-g4dn.xlarge"},
-                            {"Key": "created-by", "Value": "aws-bootstrap-g4dn"},
-                        ],
-                    }
-                ]
-            }
-        ]
-    }
+def test_find_tagged_instances(ec2):
+    ec2.describe_instances.return_value = _reservations(
+        _raw_instance(tags=(("Name", "aws-bootstrap-g4dn.xlarge"), ("created-by", "aws-bootstrap-g4dn")))
+    )
     instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
     assert len(instances) == 1
-    assert instances[0]["InstanceId"] == "i-abc123"
-    assert instances[0]["State"] == "running"
-    assert instances[0]["PublicIp"] == "1.2.3.4"
-    assert instances[0]["Name"] == "aws-bootstrap-g4dn.xlarge"
-    assert instances[0]["Lifecycle"] == "spot"
-    assert instances[0]["AvailabilityZone"] == "us-west-2a"
+    inst = instances[0]
+    assert inst["InstanceId"] == "i-abc123"
+    assert inst["State"] == "running"
+    assert inst["PublicIp"] == "1.2.3.4"
+    assert inst["Name"] == "aws-bootstrap-g4dn.xlarge"
+    assert inst["Lifecycle"] == "spot"
+    assert inst["AvailabilityZone"] == "us-west-2a"
 
 
-def test_find_tagged_instances_on_demand_lifecycle():
+def test_find_tagged_instances_on_demand_lifecycle(ec2):
     """On-demand instances have no InstanceLifecycle key; should default to 'on-demand'."""
-    ec2 = MagicMock()
-    ec2.describe_instances.return_value = {
-        "Reservations": [
-            {
-                "Instances": [
-                    {
-                        "InstanceId": "i-ondemand",
-                        "State": {"Name": "running"},
-                        "InstanceType": "g4dn.xlarge",
-                        "PublicIpAddress": "5.6.7.8",
-                        "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-                        "Placement": {"AvailabilityZone": "us-west-2b"},
-                        "Tags": [
-                            {"Key": "Name", "Value": "aws-bootstrap-g4dn.xlarge"},
-                        ],
-                    }
-                ]
-            }
-        ]
-    }
-    instances = find_tagged_instances(ec2, "aws-bootstrap-g4dn")
-    assert len(instances) == 1
-    assert instances[0]["Lifecycle"] == "on-demand"
-    assert instances[0]["AvailabilityZone"] == "us-west-2b"
+    ec2.describe_instances.return_value = _reservations(
+        _raw_instance("i-ondemand", InstanceLifecycle=None, Placement={"AvailabilityZone": "us-west-2b"})
+    )
+    inst = find_tagged_instances(ec2, "aws-bootstrap-g4dn")[0]
+    assert inst["Lifecycle"] == "on-demand"
+    assert inst["AvailabilityZone"] == "us-west-2b"
 
 
-def test_find_tagged_instances_empty():
-    ec2 = MagicMock()
+def test_find_tagged_instances_empty(ec2):
     ec2.describe_instances.return_value = {"Reservations": []}
     assert find_tagged_instances(ec2, "aws-bootstrap-g4dn") == []
 
 
-def test_get_spot_price_returns_price():
-    ec2 = MagicMock()
-    ec2.describe_spot_price_history.return_value = {"SpotPriceHistory": [{"SpotPrice": "0.1578"}]}
-    price = get_spot_price(ec2, "g4dn.xlarge", "us-west-2a")
-    assert price == 0.1578
+@pytest.mark.parametrize(
+    "tags,cluster_id,rank",
+    [
+        ((("Name", "n"), ("aws-bootstrap-cluster", "ml1"), ("aws-bootstrap-cluster-rank", "2")), "ml1", 2),
+        ((("Name", "n"),), "", None),
+    ],
+    ids=["cluster-node", "standalone"],
+)
+def test_find_tagged_instances_exposes_cluster_tags(ec2, tags, cluster_id, rank):
+    """`cleanup --sync` needs a node's cluster id/rank to rebuild its deterministic alias."""
+    ec2.describe_instances.return_value = _reservations(_raw_instance("i-1", tags=tags, PublicIpAddress=None))
+    inst = find_tagged_instances(ec2, "aws-bootstrap-g4dn")[0]
+    assert inst["ClusterId"] == cluster_id
+    assert inst["Rank"] == rank
+
+
+@pytest.mark.parametrize("history,expected", [([{"SpotPrice": "0.1578"}], 0.1578), ([], None)])
+def test_get_spot_price(ec2, history, expected):
+    ec2.describe_spot_price_history.return_value = {"SpotPriceHistory": history}
+    assert get_spot_price(ec2, "g4dn.xlarge", "us-west-2a") == expected
     ec2.describe_spot_price_history.assert_called_once()
 
 
-def test_get_spot_price_returns_none_when_empty():
-    ec2 = MagicMock()
-    ec2.describe_spot_price_history.return_value = {"SpotPriceHistory": []}
-    price = get_spot_price(ec2, "g4dn.xlarge", "us-west-2a")
-    assert price is None
-
-
-def test_terminate_tagged_instances():
-    ec2 = MagicMock()
+def test_terminate_tagged_instances(ec2):
     ec2.terminate_instances.return_value = {
         "TerminatingInstances": [
-            {
-                "InstanceId": "i-abc123",
-                "PreviousState": {"Name": "running"},
-                "CurrentState": {"Name": "shutting-down"},
-            }
+            {"InstanceId": "i-abc123", "PreviousState": {"Name": "running"}, "CurrentState": {"Name": "shutting-down"}}
         ]
     }
     changes = terminate_tagged_instances(ec2, ["i-abc123"])
@@ -623,56 +644,62 @@ def test_terminate_tagged_instances():
 # ---------------------------------------------------------------------------
 
 
-def test_list_instance_types_returns_sorted():
-    ec2 = MagicMock()
-    paginator = MagicMock()
-    ec2.get_paginator.return_value = paginator
-    paginator.paginate.return_value = [
+def test_list_instance_types_returns_sorted(ec2):
+    t4 = {"Gpus": [{"Count": 1, "Name": "T4", "MemoryInfo": {"SizeInMiB": 16384}}]}
+    ec2.get_paginator.return_value.paginate.return_value = [
         {
             "InstanceTypes": [
                 {
                     "InstanceType": "g4dn.xlarge",
                     "VCpuInfo": {"DefaultVCpus": 4},
                     "MemoryInfo": {"SizeInMiB": 16384},
-                    "GpuInfo": {"Gpus": [{"Count": 1, "Name": "T4", "MemoryInfo": {"SizeInMiB": 16384}}]},
+                    "GpuInfo": t4,
                 },
                 {
                     "InstanceType": "g4dn.2xlarge",
                     "VCpuInfo": {"DefaultVCpus": 8},
                     "MemoryInfo": {"SizeInMiB": 32768},
-                    "GpuInfo": {"Gpus": [{"Count": 1, "Name": "T4", "MemoryInfo": {"SizeInMiB": 16384}}]},
+                    "GpuInfo": t4,
                 },
             ]
         }
     ]
     results = list_instance_types(ec2, "g4dn")
-    assert len(results) == 2
     # sorted by name — 2xlarge < xlarge lexicographically
-    assert results[0]["InstanceType"] == "g4dn.2xlarge"
-    assert results[1]["InstanceType"] == "g4dn.xlarge"
+    assert [r["InstanceType"] for r in results] == ["g4dn.2xlarge", "g4dn.xlarge"]
     assert results[1]["VCpuCount"] == 4
     assert results[1]["MemoryMiB"] == 16384
     assert "T4" in results[1]["GpuSummary"]
 
 
-def test_list_instance_types_no_gpu():
-    ec2 = MagicMock()
-    paginator = MagicMock()
-    ec2.get_paginator.return_value = paginator
-    paginator.paginate.return_value = [
+def test_list_instance_types_no_gpu(ec2):
+    ec2.get_paginator.return_value.paginate.return_value = [
         {
             "InstanceTypes": [
-                {
-                    "InstanceType": "t3.medium",
-                    "VCpuInfo": {"DefaultVCpus": 2},
-                    "MemoryInfo": {"SizeInMiB": 4096},
-                },
+                {"InstanceType": "t3.medium", "VCpuInfo": {"DefaultVCpus": 2}, "MemoryInfo": {"SizeInMiB": 4096}}
             ]
         }
     ]
     results = list_instance_types(ec2, "t3")
     assert len(results) == 1
     assert results[0]["GpuSummary"] == ""
+
+
+@pytest.mark.parametrize(
+    "prefix,expected",
+    [
+        # A hyphenated family (p6-b200) is only reachable via a true prefix match;
+        # the old "{prefix}.*" filter returned nothing for --prefix p6.
+        ("p6", "p6*.*"),
+        ("g4dn", "g4dn*.*"),
+        ("g", "g*.*"),
+    ],
+)
+def test_list_instance_types_uses_prefix_match(ec2, prefix, expected):
+    ec2.get_paginator.return_value.paginate.return_value = [{"InstanceTypes": []}]
+    assert list_instance_types(ec2, prefix) == []
+    filters = ec2.get_paginator.return_value.paginate.call_args.kwargs["Filters"]
+    assert filters == [{"Name": "instance-type", "Values": [expected]}]
 
 
 @pytest.mark.parametrize(
@@ -702,184 +729,93 @@ def test_gpu_summary_without_gpus():
     assert _gpu_summary({}) == ""
 
 
-@pytest.mark.parametrize(
-    "prefix,expected",
-    [
-        # A hyphenated family (p6-b200) is only reachable via a true prefix match;
-        # the old "{prefix}.*" filter returned nothing for --prefix p6.
-        ("p6", "p6*.*"),
-        ("g4dn", "g4dn*.*"),
-        ("g", "g*.*"),
-    ],
-)
-def test_list_instance_types_uses_prefix_match(prefix, expected):
-    ec2 = MagicMock()
-    ec2.get_paginator.return_value.paginate.return_value = [{"InstanceTypes": []}]
-    list_instance_types(ec2, prefix)
-    filters = ec2.get_paginator.return_value.paginate.call_args.kwargs["Filters"]
-    assert filters == [{"Name": "instance-type", "Values": [expected]}]
-
-
-def test_list_instance_types_empty():
-    ec2 = MagicMock()
-    paginator = MagicMock()
-    ec2.get_paginator.return_value = paginator
-    paginator.paginate.return_value = [{"InstanceTypes": []}]
-    results = list_instance_types(ec2, "nonexistent")
-    assert results == []
-
-
 # ---------------------------------------------------------------------------
 # list_amis
 # ---------------------------------------------------------------------------
 
 
-def test_list_amis_sorted_newest_first():
-    ec2 = MagicMock()
+def _ami(image_id, created, name=None):
+    return {"ImageId": image_id, "Name": name or image_id, "CreationDate": created, "Architecture": "x86_64"}
+
+
+def test_list_amis_sorted_newest_first(ec2):
     ec2.describe_images.return_value = {
-        "Images": [
-            {
-                "ImageId": "ami-old",
-                "Name": "DL AMI old",
-                "CreationDate": "2024-01-01T00:00:00Z",
-                "Architecture": "x86_64",
-            },
-            {
-                "ImageId": "ami-new",
-                "Name": "DL AMI new",
-                "CreationDate": "2025-06-01T00:00:00Z",
-                "Architecture": "x86_64",
-            },
-        ]
+        "Images": [_ami("ami-old", "2024-01-01T00:00:00Z"), _ami("ami-new", "2025-06-01T00:00:00Z")]
     }
     results = list_amis(ec2, "DL AMI*")
-    assert len(results) == 2
-    assert results[0]["ImageId"] == "ami-new"
-    assert results[1]["ImageId"] == "ami-old"
+    assert [r["ImageId"] for r in results] == ["ami-new", "ami-old"]
 
 
-def test_list_amis_searches_all_architectures_by_default():
-    """No architecture filter by default — otherwise ARM64 DLAMIs are invisible."""
-    ec2 = MagicMock()
+@pytest.mark.parametrize(
+    "architecture,arch_filter",
+    [
+        # No architecture filter by default — otherwise ARM64 DLAMIs are invisible.
+        pytest.param(None, None, id="all-architectures-by-default"),
+        pytest.param("arm64", {"Name": "architecture", "Values": ["arm64"]}, id="narrowed"),
+    ],
+)
+def test_list_amis_architecture_filter(ec2, architecture, arch_filter):
     ec2.describe_images.return_value = {"Images": []}
-    list_amis(ec2, "Deep Learning*")
+    kwargs = {"architecture": architecture} if architecture else {}
+    assert list_amis(ec2, "Deep Learning*", **kwargs) == []
     filters = ec2.describe_images.call_args.kwargs["Filters"]
-    assert not any(f["Name"] == "architecture" for f in filters)
+    assert [f for f in filters if f["Name"] == "architecture"] == ([arch_filter] if arch_filter else [])
 
 
-def test_list_amis_architecture_narrows_the_search():
-    ec2 = MagicMock()
-    ec2.describe_images.return_value = {"Images": []}
-    list_amis(ec2, "Deep Learning*", architecture="arm64")
-    filters = ec2.describe_images.call_args.kwargs["Filters"]
-    assert {"Name": "architecture", "Values": ["arm64"]} in filters
-
-
-def test_list_amis_empty():
-    ec2 = MagicMock()
-    ec2.describe_images.return_value = {"Images": []}
-    results = list_amis(ec2, "nonexistent*")
-    assert results == []
-
-
-def test_list_amis_limited_to_20():
-    ec2 = MagicMock()
+def test_list_amis_limited_to_20(ec2):
     ec2.describe_images.return_value = {
-        "Images": [
-            {
-                "ImageId": f"ami-{i:03d}",
-                "Name": f"AMI {i}",
-                "CreationDate": f"2025-01-{i + 1:02d}T00:00:00Z",
-                "Architecture": "x86_64",
-            }
-            for i in range(25)
-        ]
+        "Images": [_ami(f"ami-{i:03d}", f"2025-01-{i + 1:02d}T00:00:00Z") for i in range(25)]
     }
-    results = list_amis(ec2, "AMI*")
-    assert len(results) == 20
+    assert len(list_amis(ec2, "AMI*")) == 20
 
 
-def test_list_amis_uses_owner_hint_for_deep_learning():
-    ec2 = MagicMock()
+def test_list_amis_uses_owner_hint_for_deep_learning(ec2):
     ec2.describe_images.return_value = {"Images": []}
     list_amis(ec2, "Deep Learning Base*")
-    call_kwargs = ec2.describe_images.call_args[1]
-    assert call_kwargs["Owners"] == ["amazon"]
+    assert ec2.describe_images.call_args[1]["Owners"] == ["amazon"]
 
 
 # ---------------------------------------------------------------------------
-# list_enabled_regions
+# list_enabled_regions / find_tagged_instances_in_regions
 # ---------------------------------------------------------------------------
 
 
-def test_list_enabled_regions_sorted():
-    ec2 = MagicMock()
-    ec2.describe_regions.return_value = {
-        "Regions": [
-            {"RegionName": "us-west-2"},
-            {"RegionName": "eu-west-1"},
-            {"RegionName": "us-east-1"},
-        ]
-    }
-    regions = list_enabled_regions(ec2)
-    assert regions == ["eu-west-1", "us-east-1", "us-west-2"]
+@pytest.mark.parametrize(
+    "names,expected",
+    [(["us-west-2", "eu-west-1", "us-east-1"], ["eu-west-1", "us-east-1", "us-west-2"]), ([], [])],
+    ids=["sorted", "empty"],
+)
+def test_list_enabled_regions(ec2, names, expected):
+    ec2.describe_regions.return_value = {"Regions": [{"RegionName": n} for n in names]}
+    assert list_enabled_regions(ec2) == expected
     ec2.describe_regions.assert_called_once_with(AllRegions=False)
 
 
-def test_list_enabled_regions_empty():
-    ec2 = MagicMock()
-    ec2.describe_regions.return_value = {"Regions": []}
-    assert list_enabled_regions(ec2) == []
-
-
-# ---------------------------------------------------------------------------
-# find_tagged_instances_in_regions
-# ---------------------------------------------------------------------------
-
-
-def _instance_response(instance_id: str, az: str):
-    return {
-        "Reservations": [
-            {
-                "Instances": [
-                    {
-                        "InstanceId": instance_id,
-                        "State": {"Name": "running"},
-                        "InstanceType": "g4dn.xlarge",
-                        "PublicIpAddress": "1.2.3.4",
-                        "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
-                        "InstanceLifecycle": "spot",
-                        "Placement": {"AvailabilityZone": az},
-                        "Tags": [{"Key": "created-by", "Value": "aws-bootstrap-g4dn"}],
-                    }
-                ]
-            }
-        ]
-    }
+def _region_client(instance_id: str | None = None, az: str = "", error: Exception | None = None) -> MagicMock:
+    client = MagicMock()
+    if error:
+        client.describe_instances.side_effect = error
+    else:
+        client.describe_instances.return_value = _reservations(
+            _raw_instance(instance_id, Placement={"AvailabilityZone": az}, tags=(("created-by", "aws-bootstrap-g4dn"),))
+        )
+    return client
 
 
 def _session_with_region_clients(clients_by_region: dict[str, MagicMock]) -> MagicMock:
     session = MagicMock()
-
-    def client_factory(_service, region_name=None, **_kwargs):
-        return clients_by_region[region_name]
-
-    session.client.side_effect = client_factory
+    session.client.side_effect = lambda _service, region_name=None, **_kw: clients_by_region[region_name]
     return session
 
 
 def test_find_tagged_instances_in_regions_aggregates_and_labels():
-    east = MagicMock()
-    east.describe_instances.return_value = _instance_response("i-east", "us-east-1a")
-    west = MagicMock()
-    west.describe_instances.return_value = _instance_response("i-west", "us-west-2a")
-    session = _session_with_region_clients({"us-east-1": east, "us-west-2": west})
-
+    session = _session_with_region_clients(
+        {"us-east-1": _region_client("i-east", "us-east-1a"), "us-west-2": _region_client("i-west", "us-west-2a")}
+    )
     instances, failures = find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", ["us-east-1", "us-west-2"])
-
     assert failures == []
-    assert {i["InstanceId"] for i in instances} == {"i-east", "i-west"}
     by_id = {i["InstanceId"]: i for i in instances}
+    assert set(by_id) == {"i-east", "i-west"}
     assert by_id["i-east"]["Region"] == "us-east-1"
     assert by_id["i-west"]["Region"] == "us-west-2"
     # Sorted by region then launch time
@@ -887,17 +823,9 @@ def test_find_tagged_instances_in_regions_aggregates_and_labels():
 
 
 def test_find_tagged_instances_in_regions_captures_failure():
-    ok = MagicMock()
-    ok.describe_instances.return_value = _instance_response("i-ok", "us-east-1a")
-    bad = MagicMock()
-    bad.describe_instances.side_effect = botocore.exceptions.ClientError(
-        {"Error": {"Code": "AuthFailure", "Message": "not authorized"}},
-        "DescribeInstances",
-    )
-    session = _session_with_region_clients({"us-east-1": ok, "ap-south-1": bad})
-
+    bad = _region_client(error=botocore.exceptions.ClientError({"Error": {"Code": "AuthFailure"}}, "DescribeInstances"))
+    session = _session_with_region_clients({"us-east-1": _region_client("i-ok", "us-east-1a"), "ap-south-1": bad})
     instances, failures = find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", ["us-east-1", "ap-south-1"])
-
     assert [i["InstanceId"] for i in instances] == ["i-ok"]
     assert len(failures) == 1
     assert failures[0]["region"] == "ap-south-1"
@@ -906,18 +834,15 @@ def test_find_tagged_instances_in_regions_captures_failure():
 
 def test_find_tagged_instances_in_regions_empty_region_list():
     session = MagicMock()
-    instances, failures = find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", [])
-    assert instances == []
-    assert failures == []
+    assert find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", []) == ([], [])
     session.client.assert_not_called()
 
 
 def test_find_tagged_instances_in_regions_propagates_credential_error():
     """Non-ClientError exceptions (e.g. missing credentials) are not swallowed."""
-    bad = MagicMock()
-    bad.describe_instances.side_effect = botocore.exceptions.NoCredentialsError()
-    session = _session_with_region_clients({"us-east-1": bad})
-
+    session = _session_with_region_clients(
+        {"us-east-1": _region_client(error=botocore.exceptions.NoCredentialsError())}
+    )
     with pytest.raises(botocore.exceptions.NoCredentialsError):
         find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", ["us-east-1"])
 
@@ -929,130 +854,68 @@ def test_find_tagged_instances_in_regions_propagates_credential_error():
 # ---------------------------------------------------------------------------
 
 
-def test_resolve_ebs_placement_az_returns_volume_az():
-    ec2 = MagicMock()
+def test_resolve_ebs_placement_az_returns_volume_az(ec2):
     ec2.describe_volumes.return_value = {"Volumes": [{"VolumeId": "vol-abc", "AvailabilityZone": "us-east-1c"}]}
     assert resolve_ebs_placement_az(ec2, "vol-abc", "us-east-1") == "us-east-1c"
     ec2.describe_volumes.assert_called_once_with(VolumeIds=["vol-abc"])
 
 
-def test_resolve_ebs_placement_az_not_found_names_region():
-    ec2 = MagicMock()
-    ec2.describe_volumes.side_effect = botocore.exceptions.ClientError(
-        {"Error": {"Code": "InvalidVolume.NotFound", "Message": "not found"}},
-        "DescribeVolumes",
-    )
+@pytest.mark.parametrize(
+    "describe",
+    [
+        pytest.param({"side_effect": _make_client_error("InvalidVolume.NotFound", "not found")}, id="not-found-error"),
+        pytest.param({"return_value": {"Volumes": []}}, id="empty-response"),
+    ],
+)
+def test_resolve_ebs_placement_az_not_found_names_region(ec2, describe):
+    ec2.describe_volumes.configure_mock(**describe)
     with pytest.raises(CLIError, match="EBS volume not found: vol-x in us-west-2"):
         resolve_ebs_placement_az(ec2, "vol-x", "us-west-2")
 
 
-def test_resolve_ebs_placement_az_empty_response():
-    ec2 = MagicMock()
-    ec2.describe_volumes.return_value = {"Volumes": []}
-    with pytest.raises(CLIError, match="EBS volume not found"):
-        resolve_ebs_placement_az(ec2, "vol-x", "us-west-2")
-
-
-def test_run_instances_pins_placement_az_when_provided():
-    ec2 = MagicMock()
-    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-test"}]}
-    config = LaunchConfig(ebs_volume_id="vol-abc", spot=True)
-
-    _run_instances(ec2, config, "ami-test", "sg-test", "us-east-1", True, "key-test", "us-east-1c")
-
-    # _run_instances no longer resolves the AZ itself — it is passed in.
-    ec2.describe_volumes.assert_not_called()
-    assert ec2.run_instances.call_args[1]["Placement"] == {"AvailabilityZone": "us-east-1c"}
-
-
-def test_run_instances_omits_placement_without_az():
-    ec2 = MagicMock()
-    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-test"}]}
-    config = LaunchConfig(spot=True)
-
-    _run_instances(ec2, config, "ami-test", "sg-test", "us-east-1", True, "key-test")
-
-    assert "Placement" not in ec2.run_instances.call_args[1]
-
-
-def test_launch_with_retry_passes_placement_az_to_run_instances():
-    """The AZ resolved into RegionContext is threaded through to run_instances."""
-    client = MagicMock()
-    client.run_instances.return_value = _ok_instance("i-east")
-    ctx = RegionContext(
-        region="us-east-1",
-        ec2_client=client,
-        ami={"ImageId": "ami-east"},
-        sg_id="sg-1",
-        key_name="aws-bootstrap-key",
-        placement_azs=("us-east-1c",),
-    )
-    config = LaunchConfig(regions=("us-east-1",), spot=True, ebs_volume_id="vol-abc")
-
-    result = launch_with_retry(config, lambda r: ctx)
-
-    assert result.region == "us-east-1"
-    assert client.run_instances.call_args[1]["Placement"] == {"AvailabilityZone": "us-east-1c"}
-
-
 # ---------------------------------------------------------------------------
-# Cluster placement-group lifecycle
+# Cluster placement-group lifecycle / intra-cluster SG rule / discovery
 # ---------------------------------------------------------------------------
 
 
-def test_ensure_cluster_placement_group_creates_when_absent():
-    ec2 = MagicMock()
+def test_ensure_cluster_placement_group_creates_when_absent(ec2):
     ec2.describe_placement_groups.return_value = {"PlacementGroups": []}
-    name = ensure_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1", "aws-bootstrap-g4dn")
-    assert name == "aws-bootstrap-cluster-ml1"
+    assert ensure_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1", "aws-bootstrap-g4dn") == (
+        "aws-bootstrap-cluster-ml1"
+    )
     create_kwargs = ec2.create_placement_group.call_args[1]
     assert create_kwargs["GroupName"] == "aws-bootstrap-cluster-ml1"
     assert create_kwargs["Strategy"] == "cluster"
 
 
-def test_ensure_cluster_placement_group_reuses_existing():
-    ec2 = MagicMock()
+def test_ensure_cluster_placement_group_reuses_existing(ec2):
     ec2.describe_placement_groups.return_value = {
         "PlacementGroups": [{"GroupName": "aws-bootstrap-cluster-ml1", "State": "available"}]
     }
-    name = ensure_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1", "aws-bootstrap-g4dn")
-    assert name == "aws-bootstrap-cluster-ml1"
+    assert ensure_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1", "aws-bootstrap-g4dn") == (
+        "aws-bootstrap-cluster-ml1"
+    )
     ec2.create_placement_group.assert_not_called()
 
 
-def test_delete_cluster_placement_group_ignores_unknown():
-    ec2 = MagicMock()
-    ec2.delete_placement_group.side_effect = botocore.exceptions.ClientError(
-        {"Error": {"Code": "InvalidPlacementGroup.Unknown", "Message": "nope"}},
-        "DeletePlacementGroup",
-    )
-    # Must not raise; already-gone counts as deleted.
-    assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is True
+@pytest.mark.parametrize(
+    "error,deleted",
+    [
+        pytest.param(None, True, id="deleted"),
+        # Already gone counts as deleted.
+        pytest.param("InvalidPlacementGroup.Unknown", True, id="already-gone"),
+        # Instances still terminating -> not deletable yet, but no raise.
+        pytest.param("InvalidPlacementGroup.InUse", False, id="in-use"),
+    ],
+)
+def test_delete_cluster_placement_group(ec2, error, deleted):
+    if error:
+        ec2.delete_placement_group.side_effect = _make_client_error(error)
+    assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is deleted
     ec2.delete_placement_group.assert_called_once_with(GroupName="aws-bootstrap-cluster-ml1")
 
 
-def test_delete_cluster_placement_group_success_returns_true():
-    ec2 = MagicMock()
-    assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is True
-
-
-def test_delete_cluster_placement_group_in_use_returns_false():
-    ec2 = MagicMock()
-    ec2.delete_placement_group.side_effect = botocore.exceptions.ClientError(
-        {"Error": {"Code": "InvalidPlacementGroup.InUse", "Message": "in use"}},
-        "DeletePlacementGroup",
-    )
-    # Instances still terminating -> not deletable yet, but no raise.
-    assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is False
-
-
-# ---------------------------------------------------------------------------
-# Intra-cluster security-group rule
-# ---------------------------------------------------------------------------
-
-
-def test_ensure_cluster_sg_rule_authorizes_self_reference():
-    ec2 = MagicMock()
+def test_ensure_cluster_sg_rule_authorizes_self_reference(ec2):
     ensure_cluster_security_group_rule(ec2, "sg-123")
     kwargs = ec2.authorize_security_group_ingress.call_args[1]
     assert kwargs["GroupId"] == "sg-123"
@@ -1061,44 +924,25 @@ def test_ensure_cluster_sg_rule_authorizes_self_reference():
     assert perm["UserIdGroupPairs"][0]["GroupId"] == "sg-123"
 
 
-def test_ensure_cluster_sg_rule_idempotent_on_duplicate():
-    ec2 = MagicMock()
-    ec2.authorize_security_group_ingress.side_effect = botocore.exceptions.ClientError(
-        {"Error": {"Code": "InvalidPermission.Duplicate", "Message": "exists"}},
-        "AuthorizeSecurityGroupIngress",
-    )
-    # Must not raise.
-    ensure_cluster_security_group_rule(ec2, "sg-123")
+def test_ensure_cluster_sg_rule_idempotent_on_duplicate(ec2):
+    ec2.authorize_security_group_ingress.side_effect = _make_client_error("InvalidPermission.Duplicate")
+    ensure_cluster_security_group_rule(ec2, "sg-123")  # must not raise
 
 
-# ---------------------------------------------------------------------------
-# Cluster instance discovery
-# ---------------------------------------------------------------------------
+def _cluster_reservation(instance_id, cluster_id, rank, private="10.0.0.5"):
+    return _reservations(
+        _raw_instance(
+            instance_id,
+            InstanceType="g5.xlarge",
+            PrivateIpAddress=private,
+            LaunchTime=datetime(2026, 5, 21, tzinfo=UTC),
+            Placement={"AvailabilityZone": "us-east-1c"},
+            tags=(("aws-bootstrap-cluster", cluster_id), ("aws-bootstrap-cluster-rank", str(rank))),
+        )
+    )["Reservations"][0]
 
 
-def _cluster_reservation(instance_id, cluster_id, rank, az="us-east-1c", private="10.0.0.5"):
-    return {
-        "Instances": [
-            {
-                "InstanceId": instance_id,
-                "State": {"Name": "running"},
-                "InstanceType": "g5.xlarge",
-                "PublicIpAddress": "1.2.3.4",
-                "PrivateIpAddress": private,
-                "LaunchTime": datetime(2026, 5, 21, tzinfo=UTC),
-                "Placement": {"AvailabilityZone": az},
-                "InstanceLifecycle": "spot",
-                "Tags": [
-                    {"Key": "aws-bootstrap-cluster", "Value": cluster_id},
-                    {"Key": "aws-bootstrap-cluster-rank", "Value": str(rank)},
-                ],
-            }
-        ]
-    }
-
-
-def test_find_cluster_instances_sorted_by_rank():
-    ec2 = MagicMock()
+def test_find_cluster_instances_sorted_by_rank(ec2):
     ec2.describe_instances.return_value = {
         "Reservations": [
             _cluster_reservation("i-2", "ml1", 1, private="10.0.0.6"),
@@ -1114,8 +958,7 @@ def test_find_cluster_instances_sorted_by_rank():
     assert {"Name": "tag:aws-bootstrap-cluster", "Values": ["ml1"]} in filters
 
 
-def test_list_clusters_groups_by_cluster_id():
-    ec2 = MagicMock()
+def test_list_clusters_groups_by_cluster_id(ec2):
     ec2.describe_instances.return_value = {
         "Reservations": [
             _cluster_reservation("i-1", "ml1", 0),
@@ -1127,121 +970,6 @@ def test_list_clusters_groups_by_cluster_id():
     assert set(clusters) == {"ml1", "exp2"}
     assert len(clusters["ml1"]) == 2
     assert len(clusters["exp2"]) == 1
-
-
-# ---------------------------------------------------------------------------
-# Placement-group threading through the launch path
-# ---------------------------------------------------------------------------
-
-
-def test_build_launch_params_includes_placement_group():
-    p = _build_launch_params(
-        LaunchConfig(),
-        "ami-x",
-        "sg-x",
-        True,
-        "k",
-        placement_az="us-east-1c",
-        placement_group="aws-bootstrap-cluster-ml1",
-    )
-    assert p["Placement"] == {
-        "AvailabilityZone": "us-east-1c",
-        "GroupName": "aws-bootstrap-cluster-ml1",
-    }
-
-
-def test_build_launch_params_group_only():
-    p = _build_launch_params(LaunchConfig(), "ami-x", "sg-x", True, "k", placement_group="aws-bootstrap-cluster-ml1")
-    assert p["Placement"] == {"GroupName": "aws-bootstrap-cluster-ml1"}
-
-
-def test_run_instances_passes_placement_group():
-    ec2 = MagicMock()
-    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-1"}]}
-    _run_instances(
-        ec2,
-        LaunchConfig(),
-        "ami",
-        "sg",
-        "us-east-1",
-        True,
-        "k",
-        placement_az="us-east-1c",
-        placement_group="aws-bootstrap-cluster-ml1",
-    )
-    assert ec2.run_instances.call_args[1]["Placement"]["GroupName"] == "aws-bootstrap-cluster-ml1"
-
-
-def test_launch_with_retry_threads_placement_group():
-    client = MagicMock()
-    client.run_instances.return_value = _ok_instance("i-east")
-    ctx = RegionContext(
-        region="us-east-1",
-        ec2_client=client,
-        ami={"ImageId": "ami-east"},
-        sg_id="sg-1",
-        key_name="aws-bootstrap-key",
-        placement_azs=("us-east-1c",),
-        placement_group="aws-bootstrap-cluster-ml1",
-    )
-    launch_with_retry(LaunchConfig(regions=("us-east-1",), spot=True), lambda r: ctx)
-    assert client.run_instances.call_args[1]["Placement"]["GroupName"] == "aws-bootstrap-cluster-ml1"
-
-
-# ---------------------------------------------------------------------------
-# find_tagged_instances exposes cluster id/rank (used by `cleanup --sync`)
-# ---------------------------------------------------------------------------
-
-
-def test_find_tagged_instances_includes_cluster_tags():
-    ec2 = MagicMock()
-    ec2.describe_instances.return_value = {
-        "Reservations": [
-            {
-                "Instances": [
-                    {
-                        "InstanceId": "i-1",
-                        "State": {"Name": "running"},
-                        "InstanceType": "g5.xlarge",
-                        "PublicIpAddress": "1.2.3.4",
-                        "LaunchTime": datetime(2026, 5, 21, tzinfo=UTC),
-                        "Placement": {"AvailabilityZone": "us-east-1c"},
-                        "Tags": [
-                            {"Key": "Name", "Value": "n"},
-                            {"Key": "aws-bootstrap-cluster", "Value": "ml1"},
-                            {"Key": "aws-bootstrap-cluster-rank", "Value": "2"},
-                        ],
-                    }
-                ]
-            }
-        ]
-    }
-    inst = find_tagged_instances(ec2, "aws-bootstrap-g4dn")[0]
-    assert inst["ClusterId"] == "ml1"
-    assert inst["Rank"] == 2
-
-
-def test_find_tagged_instances_no_cluster_tags():
-    ec2 = MagicMock()
-    ec2.describe_instances.return_value = {
-        "Reservations": [
-            {
-                "Instances": [
-                    {
-                        "InstanceId": "i-2",
-                        "State": {"Name": "running"},
-                        "InstanceType": "g4dn.xlarge",
-                        "LaunchTime": datetime(2026, 5, 21, tzinfo=UTC),
-                        "Placement": {"AvailabilityZone": "us-west-2a"},
-                        "Tags": [{"Key": "Name", "Value": "n"}],
-                    }
-                ]
-            }
-        ]
-    }
-    inst = find_tagged_instances(ec2, "aws-bootstrap-g4dn")[0]
-    assert inst["ClusterId"] == ""
-    assert inst["Rank"] is None
 
 
 # ---------------------------------------------------------------------------
@@ -1261,36 +989,39 @@ def _sg_client(permissions, *, owned=True):
     return ec2
 
 
-_SSH_22 = [{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}]
+def _tcp_rule(from_port, to_port, cidr="0.0.0.0/0"):
+    return [{"IpProtocol": "tcp", "FromPort": from_port, "ToPort": to_port, "IpRanges": [{"CidrIp": cidr}]}]
 
 
-def test_reused_sg_opens_a_port_it_is_missing():
-    """Regression: --ssh-port against an existing SG left it with no ingress,
-    surfacing only much later as an opaque 'SSH never became available'."""
-    ec2 = _sg_client(_SSH_22)
-    assert ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=2222) == "sg-1"
-    ec2.authorize_security_group_ingress.assert_called_once()
-    perm = ec2.authorize_security_group_ingress.call_args.kwargs["IpPermissions"][0]
-    assert perm["FromPort"] == perm["ToPort"] == 2222
+_SSH_22 = _tcp_rule(22, 22)
 
 
-def test_reused_sg_does_not_re_add_an_existing_rule():
-    ec2 = _sg_client(_SSH_22)
-    assert ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22) == "sg-1"
-    ec2.authorize_security_group_ingress.assert_not_called()
-
-
-def test_reused_sg_accepts_a_port_range_that_covers_the_port():
-    ec2 = _sg_client([{"IpProtocol": "tcp", "FromPort": 20, "ToPort": 30, "IpRanges": [{"CidrIp": "0.0.0.0/0"}]}])
-    ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22)
-    ec2.authorize_security_group_ingress.assert_not_called()
-
-
-def test_reused_sg_ignores_a_rule_for_a_different_cidr():
-    """A rule open only to some other CIDR does not make our port reachable."""
-    ec2 = _sg_client([{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}])
-    ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22)
-    ec2.authorize_security_group_ingress.assert_called_once()
+@pytest.mark.parametrize(
+    "permissions,port,owned,authorizes",
+    [
+        # Regression: --ssh-port against an existing SG left it with no ingress,
+        # surfacing only much later as an opaque 'SSH never became available'.
+        pytest.param(_SSH_22, 2222, True, True, id="opens-a-missing-port"),
+        pytest.param(_SSH_22, 22, True, False, id="existing-rule-not-re-added"),
+        pytest.param(_tcp_rule(20, 30), 22, True, False, id="port-range-covers-it"),
+        # A rule open only to some other CIDR does not make our port reachable.
+        pytest.param(_tcp_rule(22, 22, "10.0.0.0/8"), 22, True, True, id="other-cidr-ignored"),
+        # `--security-group` is user-supplied and the lookup matches on name + VPC
+        # alone, so a pre-existing restricted group can share the name. Punching
+        # 0.0.0.0/0 into it would be a security change nobody asked for.
+        pytest.param(_tcp_rule(22, 22, "10.0.0.0/8"), 2222, False, False, id="never-widens-an-unowned-group"),
+        # Nothing to do and nothing to warn about — the port is already reachable.
+        pytest.param(_SSH_22, 22, False, False, id="unowned-with-ingress-is-silent"),
+    ],
+)
+def test_reused_sg_ingress(permissions, port, owned, authorizes):
+    ec2 = _sg_client(permissions, owned=owned)
+    assert ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=port) == "sg-1"
+    assert ec2.authorize_security_group_ingress.called is authorizes
+    if authorizes:
+        ec2.authorize_security_group_ingress.assert_called_once()
+        perm = ec2.authorize_security_group_ingress.call_args.kwargs["IpPermissions"][0]
+        assert perm["FromPort"] == perm["ToPort"] == port
 
 
 def test_reused_sg_tolerates_a_concurrent_duplicate_add():
@@ -1306,86 +1037,56 @@ def test_reused_sg_propagates_an_unexpected_authorize_error():
         ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22)
 
 
-# ---------------------------------------------------------------------------
-# Terminate ownership guard
-# ---------------------------------------------------------------------------
-
-
-def _describe_owned(*instance_ids):
-    ec2 = MagicMock()
-    ec2.get_paginator.return_value.paginate.return_value = [
-        {"Reservations": [{"Instances": [{"InstanceId": i} for i in instance_ids]}]}
-    ]
-    return ec2
-
-
-def test_find_unowned_instances_flags_untagged_ids():
-    ec2 = _describe_owned("i-mine")
-    assert find_unowned_instances(ec2, ["i-mine", "i-theirs"], TAG_VALUE) == ["i-theirs"]
-
-
-def test_find_unowned_instances_empty_when_all_owned():
-    ec2 = _describe_owned("i-a", "i-b")
-    assert find_unowned_instances(ec2, ["i-a", "i-b"], TAG_VALUE) == []
-
-
-def test_find_unowned_instances_flags_ids_absent_from_the_region():
-    """Nothing tagged in this region -> every id is unowned (likely wrong --region)."""
-    ec2 = _describe_owned()
-    assert find_unowned_instances(ec2, ["i-a"], TAG_VALUE) == ["i-a"]
-
-
-def test_find_unowned_instances_short_circuits_on_empty_input():
-    ec2 = MagicMock()
-    assert find_unowned_instances(ec2, [], TAG_VALUE) == []
-    ec2.get_paginator.assert_not_called()
-
-
-def test_find_unowned_instances_filters_by_the_created_by_tag():
-    ec2 = _describe_owned("i-a")
-    find_unowned_instances(ec2, ["i-a"], TAG_VALUE)
-    kwargs = ec2.get_paginator.return_value.paginate.call_args.kwargs
-    assert kwargs["Filters"] == [{"Name": f"tag:{TAG_CREATED_BY}", "Values": [TAG_VALUE]}]
-    # Passing InstanceIds would make AWS raise for any id it has never seen,
-    # which is precisely the case this check exists to answer.
-    assert "InstanceIds" not in kwargs
-
-
-def test_reused_sg_never_widens_a_group_this_tool_did_not_create():
-    """`--security-group` is user-supplied and the lookup matches on name + VPC
-    alone, so a pre-existing restricted group can share the name. Punching
-    0.0.0.0/0 into it would be a security change nobody asked for."""
-    ec2 = _sg_client(
-        [{"IpProtocol": "tcp", "FromPort": 22, "ToPort": 22, "IpRanges": [{"CidrIp": "10.0.0.0/8"}]}],
-        owned=False,
-    )
-    assert ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=2222) == "sg-1"
-    ec2.authorize_security_group_ingress.assert_not_called()
-
-
 def test_unowned_sg_without_ingress_warns_with_the_exact_command(capsys):
-    ec2 = _sg_client([], owned=False)
-    ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=2222)
+    ensure_security_group(_sg_client([], owned=False), "someone-elses-sg", "tv", ssh_port=2222)
     err = capsys.readouterr().err
     assert "not tagged" in err
     assert "authorize-security-group-ingress --group-id sg-1" in err
     assert "--port 2222" in err
 
 
-def test_unowned_sg_that_already_has_ingress_is_silent():
-    """Nothing to do and nothing to warn about — the port is already reachable."""
-    ec2 = _sg_client(_SSH_22, owned=False)
-    ensure_security_group(ec2, "someone-elses-sg", "tv", ssh_port=22)
-    ec2.authorize_security_group_ingress.assert_not_called()
+# ---------------------------------------------------------------------------
+# Terminate ownership guard
+# ---------------------------------------------------------------------------
 
 
-def test_find_unowned_instances_paginates():
-    """A truncated page would misclassify an owned instance as unowned and
-    refuse a legitimate terminate."""
+def _describe_owned(*pages):
+    """A client whose tag-filtered describe_instances pages hold the given owned ids."""
     ec2 = MagicMock()
     ec2.get_paginator.return_value.paginate.return_value = [
-        {"Reservations": [{"Instances": [{"InstanceId": "i-page1"}]}]},
-        {"Reservations": [{"Instances": [{"InstanceId": "i-page2"}]}]},
+        {"Reservations": [{"Instances": [{"InstanceId": i} for i in page]}]} for page in pages
     ]
-    assert find_unowned_instances(ec2, ["i-page1", "i-page2"], TAG_VALUE) == []
+    return ec2
+
+
+@pytest.mark.parametrize(
+    "pages,query,unowned",
+    [
+        pytest.param([["i-mine"]], ["i-mine", "i-theirs"], ["i-theirs"], id="flags-untagged"),
+        pytest.param([["i-a", "i-b"]], ["i-a", "i-b"], [], id="all-owned"),
+        # Nothing tagged in this region -> every id is unowned (likely wrong --region).
+        pytest.param([[]], ["i-a"], ["i-a"], id="absent-from-region"),
+        # A truncated page would misclassify an owned instance as unowned and
+        # refuse a legitimate terminate.
+        pytest.param([["i-page1"], ["i-page2"]], ["i-page1", "i-page2"], [], id="paginates"),
+    ],
+)
+def test_find_unowned_instances(pages, query, unowned):
+    ec2 = _describe_owned(*pages)
+    assert find_unowned_instances(ec2, query, TAG_VALUE) == unowned
     ec2.get_paginator.assert_called_once_with("describe_instances")
+
+
+def test_find_unowned_instances_short_circuits_on_empty_input(ec2):
+    assert find_unowned_instances(ec2, [], TAG_VALUE) == []
+    ec2.get_paginator.assert_not_called()
+
+
+def test_find_unowned_instances_filters_by_the_created_by_tag():
+    ec2 = _describe_owned(["i-a"])
+    find_unowned_instances(ec2, ["i-a"], TAG_VALUE)
+    kwargs = ec2.get_paginator.return_value.paginate.call_args.kwargs
+    assert kwargs["Filters"] == [{"Name": f"tag:{TAG_CREATED_BY}", "Values": [TAG_VALUE]}]
+    # Passing InstanceIds would make AWS raise for any id it has never seen,
+    # which is precisely the case this check exists to answer.
+    assert "InstanceIds" not in kwargs
