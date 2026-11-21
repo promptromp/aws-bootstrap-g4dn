@@ -148,11 +148,14 @@ for each backoff cycle (--wait):        # outer
   every AZ failed on price or support, the region is dropped. The final error
   names the AZs actually tried. When every failure was `Unsupported`, there is
   no on-demand fallback, because on-demand would hit the same AZs.
-- **A single AZ is a hard pin** (an `--ebs-volume-id`, a cluster's AZ, one
-  `--availability-zone`), and its errors keep their usual meaning: AWS's
-  `Unsupported` error is shown as-is, and a price error drops the region.
-- **Every region's plan is computed before anything launches**, so a bad AZ in
-  a later region fails up front.
+- **An `--ebs-volume-id`'s AZ and a cluster's AZ are hard pins.** No other AZ
+  will do there, so an `Unsupported` is reported as an error with AWS's reason
+  rather than skipped. A plan that happens to hold one AZ (a single
+  `--availability-zone`) is not a pin: its region is dropped and the next
+  `--region` is tried.
+- **Every region's plan is computed before anything launches.** A bad explicit
+  AZ in a later region fails up front. A region with only `--cheapest-az`
+  that can't host the type is skipped with a warning.
 - **Plans are computed once per region** and reused across `--wait` cycles.
   Prices move slowly, and re-ranking mid-wait would reshuffle the order.
 

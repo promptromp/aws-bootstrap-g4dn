@@ -17,7 +17,9 @@ def key_check_stub(request):
     ``@pytest.mark.real_key_check``, or call ``ssh.check_key_usable`` directly.
     """
     if request.node.get_closest_marker("real_key_check"):
-        yield None
+        # The real check, but never against the user's ssh-agent: no agent unless a test fakes one.
+        with patch("aws_bootstrap.ssh._agent_sockets", return_value=[]):
+            yield None
         return
     with patch("aws_bootstrap.cli.check_key_usable") as stub:
         yield stub

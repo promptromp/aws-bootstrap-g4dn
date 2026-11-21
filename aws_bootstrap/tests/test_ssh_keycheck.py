@@ -7,6 +7,7 @@ user's: agent lookups are faked, and $SSH_AUTH_SOCK is cleared for every test.
 from __future__ import annotations
 import shutil
 import subprocess
+from contextlib import nullcontext
 from pathlib import Path
 
 import pytest
@@ -102,39 +103,64 @@ def test_passphrase_key_outside_any_agent_fails_with_the_fix(locked_key, ssh_con
         assert absent not in msg
 
 
-@pytest.mark.parametrize("holds_it", [True, False], ids=["agent-holds-key", "agent-holds-other-keys"])
-def test_passphrase_key_and_the_agent(locked_key, ssh_config, fake_agent, holds_it):
+PASSES = nullcontext()
+
+
+def fails(match: str | None = None):
+    return pytest.raises(CLIError, match=match)
+
+
+@pytest.mark.parametrize(
+    "holds_it,expectation",
+    [(True, PASSES), (False, fails())],
+    ids=["agent-holds-key", "agent-holds-other-keys"],
+)
+def test_passphrase_key_and_the_agent(locked_key, ssh_config, fake_agent, holds_it, expectation):
     fake_agent(ssh.key_fingerprint(locked_key) if holds_it else "SHA256:someoneelse")
-    if holds_it:
+    with expectation:
         ssh.check_key_usable(locked_key, ssh_config=ssh_config())
-    else:
-        with pytest.raises(CLIError):
-            ssh.check_key_usable(locked_key, ssh_config=ssh_config())
 
 
-@pytest.mark.parametrize("system,warns", [("Darwin", True), ("Linux", False)])
-def test_usekeychain_only_warns_on_macos(locked_key, ssh_config, monkeypatch, capsys, system, warns):
+@pytest.mark.parametrize("system,expectation", [("Darwin", PASSES), ("Linux", fails("has a passphrase"))])
+def test_usekeychain_only_warns_on_macos(locked_key, ssh_config, monkeypatch, capsys, system, expectation):
     """The Keychain may supply the passphrase on macOS (undecidable: warn); elsewhere nothing will."""
     monkeypatch.setattr(ssh.platform, "system", lambda: system)
-    cfg = ssh_config("IgnoreUnknown UseKeychain", "UseKeychain yes")
-    if warns:
-        ssh.check_key_usable(locked_key, ssh_config=cfg)
-        assert "Relying on the macOS Keychain" in capsys.readouterr().err
-    else:
-        with pytest.raises(CLIError):
-            ssh.check_key_usable(locked_key, ssh_config=cfg)
+    with expectation:
+        ssh.check_key_usable(locked_key, ssh_config=ssh_config("IgnoreUnknown UseKeychain", "UseKeychain yes"))
+    assert ("Relying on the macOS Keychain" in capsys.readouterr().err) is (system == "Darwin")
 
 
-@pytest.mark.parametrize("in_agent", [False, True], ids=["no-agent", "agent-holds-key"])
-def test_missing_private_key(plain_key, ssh_config, fake_agent, in_agent):
+@pytest.mark.parametrize(
+    "in_agent,expectation",
+    [(False, fails("SSH private key not found")), (True, PASSES)],
+    ids=["no-agent", "agent-holds-key"],
+)
+def test_missing_private_key(plain_key, ssh_config, fake_agent, in_agent, expectation):
     """Only the agent's copy can work without the file (e.g. 1Password): pass then, fail otherwise."""
     plain_key.with_suffix("").unlink()
     fake_agent(*([ssh.key_fingerprint(plain_key)] if in_agent else []))
-    if in_agent:
+    with expectation:
         ssh.check_key_usable(plain_key, ssh_config=ssh_config())
-    else:
-        with pytest.raises(CLIError, match="SSH private key not found"):
-            ssh.check_key_usable(plain_key, ssh_config=ssh_config())
+
+
+@pytest.mark.parametrize(
+    "delete_private,expectation",
+    [(False, PASSES), (True, fails("SSH private key not found"))],
+    ids=["plain-key-passes", "missing-key-still-fails"],
+)
+def test_unreachable_agent_falls_through_to_the_key_file(
+    plain_key, ssh_config, monkeypatch, delete_private, expectation
+):
+    """A stalled `ssh -G` / locked agent must not wave a missing or locked key through."""
+
+    def stalled(fingerprint):
+        raise subprocess.TimeoutExpired("ssh", 15)
+
+    monkeypatch.setattr(ssh, "_agent_has_key", stalled)
+    if delete_private:
+        plain_key.with_suffix("").unlink()
+    with expectation:
+        ssh.check_key_usable(plain_key, ssh_config=ssh_config())
 
 
 def test_world_readable_private_key_fails_with_chmod_hint(plain_key, ssh_config):

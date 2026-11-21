@@ -180,12 +180,16 @@ def check_key_usable(key_path: Path, ssh_config: Path | None = None) -> None:
     priv = private_key_path(key_path)
     load = f"ssh-add --apple-use-keychain {priv}" if platform.system() == "Darwin" else f"ssh-add {priv}"
     try:
-        try:
-            in_agent = key_path.exists() and _agent_has_key(key_fingerprint(key_path))
-        except ValueError:
-            raise CLIError(f"{key_path} is not an OpenSSH public key (pass --key-path to a .pub file).") from None
-        if in_agent:
-            return  # ssh uses the agent's copy; the file's passphrase doesn't matter
+        fingerprint = key_fingerprint(key_path) if key_path.exists() else None
+    except ValueError:
+        raise CLIError(f"{key_path} is not an OpenSSH public key (pass --key-path to a .pub file).") from None
+    try:
+        in_agent = fingerprint is not None and _agent_has_key(fingerprint)
+    except (OSError, subprocess.TimeoutExpired):
+        in_agent = False  # agent unreachable (or `ssh -G` stalled): judge the key file on its own
+    if in_agent:
+        return  # ssh uses the agent's copy; the file's passphrase doesn't matter
+    try:
         if not priv.exists():
             raise CLIError(
                 f"SSH private key not found: {priv}, and no ssh-agent holds {key_path}.\n"

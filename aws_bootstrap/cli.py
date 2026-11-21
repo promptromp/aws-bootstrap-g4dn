@@ -557,16 +557,31 @@ def launch(
             key_name=effective_key,
             placement_azs=placement_azs,
             az_prices={o.zone: o.spot_price for o in plan if o.spot_price is not None},
+            hard_pin=bool(config.ebs_volume_id),  # the volume's AZ is required
         )
 
     # Plan every region's AZs up front (read-only), so a bad --availability-zone in a
-    # later region fails before anything is created or launched in an earlier one.
+    # later region fails before anything is created or launched in an earlier one. A
+    # region with only --cheapest-az that can't host the type is skipped instead (the
+    # sweep would have moved past it anyway); none left is an error.
     if az_map or config.cheapest_az:
+        usable, skipped = [], []
         for r in config.regions:
             try:
                 az_plan(r, region_client(r))
             except CLIError as e:
-                raise CLIError(f"[{r}] {e.format_message()}") from None
+                if az_map.get(r):
+                    raise CLIError(f"[{r}] {e.format_message()}") from None
+                skipped.append(f"[{r}] {e.format_message()}")
+                warn(f"{skipped[-1]} Skipping {r}.")
+                continue
+            usable.append(r)
+        if not usable:
+            raise CLIError("No --region can host this launch:\n  " + "\n  ".join(skipped))
+        if skipped:
+            config.regions = tuple(usable)
+            multi_region = len(config.regions) > 1
+            regions_label = " → ".join(config.regions) if multi_region else config.regions[0]
 
     if config.dry_run:
         ctx0 = prepare_region(config.regions[0])
@@ -2216,6 +2231,7 @@ def cluster_launch(
             sg_id=sg_id,
             key_name=shared["key"],
             placement_azs=(shared["az"],) if shared["az"] else tuple(o.zone for o in first_plan),
+            hard_pin=bool(shared["az"]),  # later nodes must join the first node's AZ
             placement_group=pg_name,
             az_prices={o.zone: o.spot_price for o in first_plan if o.spot_price is not None},
         )

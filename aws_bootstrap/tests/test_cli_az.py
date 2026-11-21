@@ -106,6 +106,7 @@ def test_dry_run_az_plan_renders_in_every_output_format(launch_aws, key, fmt):
 
 def test_dry_run_without_az_flags_reports_null(launch_aws, key):
     result = _run("-o", "json", "launch", "--key-path", str(key), "--dry-run")
+    assert result.exit_code == 0, result.output
     assert json.loads(result.output)["availability_zones"] is None
     launch_aws["plan"].assert_not_called()
 
@@ -127,6 +128,30 @@ def test_bad_az_in_a_later_region_fails_before_anything_is_created(launch_aws, k
     launch_aws["import_key"].assert_not_called()
 
 
+def test_cheapest_only_region_that_cannot_host_the_type_is_skipped(launch_aws, key):
+    """Without an explicit AZ there, a region with no usable AZ is skipped (warned), not fatal."""
+
+    def no_east(ec2, region, *a, **kw):
+        if region == "us-east-1":
+            raise CLIError("g6e.2xlarge is not offered in any availability zone of us-east-1.")
+        return PLAN_USW2
+
+    launch_aws["plan"].side_effect = no_east
+    regions = ["--region", "us-east-1", "--region", "us-west-2"]
+    result = _run("-o", "json", "launch", "--key-path", str(key), "--dry-run", "--cheapest-az", *regions)
+    assert result.exit_code == 0, result.output
+    data = json.loads(result.output)
+    assert data["regions"] == ["us-west-2"]
+    assert list(data["availability_zones"]) == ["us-west-2"]
+
+
+def test_no_region_can_host_the_launch(launch_aws, key):
+    launch_aws["plan"].side_effect = CLIError("not offered in any availability zone")
+    result = _run("launch", "--key-path", str(key), "--dry-run", "--cheapest-az", "--region", "us-west-2")
+    assert result.exit_code != 0
+    assert "No --region can host this launch" in result.output
+
+
 def test_prepare_region_threads_the_plan_into_the_context(launch_aws, key):
     captured: dict = {}
 
@@ -138,6 +163,23 @@ def test_prepare_region_threads_the_plan_into_the_context(launch_aws, key):
         _run("launch", "--key-path", str(key), "--cheapest-az", "--region", "us-west-2")
     assert captured["ctx"].placement_azs == ("us-west-2b", "us-west-2a")
     assert captured["ctx"].az_prices == {"us-west-2b": 0.9911, "us-west-2a": 2.2122}
+    assert captured["ctx"].hard_pin is False  # a plan, not a required AZ
+
+
+def test_ebs_volume_az_is_a_hard_pin(launch_aws, key):
+    captured: dict = {}
+
+    def fake_launch(config, prepare_region, **kw):
+        captured["ctx"] = prepare_region("us-west-2")
+        raise CLIError("stop here")
+
+    with (
+        patch("aws_bootstrap.cli.resolve_ebs_placement_az", return_value="us-west-2c"),
+        patch("aws_bootstrap.cli.launch_with_retry", side_effect=fake_launch),
+    ):
+        _run("launch", "--key-path", str(key), "--ebs-volume-id", "vol-1", "--region", "us-west-2")
+    assert captured["ctx"].placement_azs == ("us-west-2c",)
+    assert captured["ctx"].hard_pin is True
 
 
 # ---------------------------------------------------------------------------
@@ -177,7 +219,7 @@ THROTTLED = botocore.exceptions.ClientError({"Error": {"Code": "RequestLimitExce
     ],
     ids=["fresh", "plan-fallback", "unknown", "ssh-unavailable"],
 )
-def test_launch_reports_the_az_and_its_spot_price(key, az_prices, describe_spot, ssh_ok, expected_price):
+def test_launch_reports_the_az_and_its_spot_price(cli_session, key, az_prices, describe_spot, ssh_ok, expected_price):
     with (
         patch("aws_bootstrap.cli.launch_with_retry", return_value=_launched(az_prices, describe_spot)),
         patch(

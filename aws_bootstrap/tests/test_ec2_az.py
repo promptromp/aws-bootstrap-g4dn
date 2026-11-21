@@ -152,8 +152,13 @@ def test_plan_azs(plan_kwargs, subnets, expected):
             "not opted in",
         ),
         ({"offered": []}, {"cheapest": True}, "not offered in any availability zone of us-west-2"),
+        (
+            {"offered": USW2, "zones_error": botocore.exceptions.EndpointConnectionError(endpoint_url="x")},
+            {"explicit": ("us-west-2b",)},
+            "Can't reach EC2 in region us-west-2",
+        ),
     ],
-    ids=["unusable-explicit", "unknown-az", "not-opted-in", "type-not-offered"],
+    ids=["unusable-explicit", "unknown-az", "not-opted-in", "type-not-offered", "unreachable-region"],
 )
 def test_plan_azs_errors(ec2_kwargs, plan_kwargs, match):
     with pytest.raises(CLIError, match=match):
@@ -189,7 +194,9 @@ def test_run_instances_unsupported(placement_az, raised):
 # ---------------------------------------------------------------------------
 
 
-def _ctx(region: str, azs: tuple[str, ...], outcomes: dict[str | None, object]) -> RegionContext:
+def _ctx(
+    region: str, azs: tuple[str, ...], outcomes: dict[str | None, object], hard_pin: bool = False
+) -> RegionContext:
     """Region context whose run_instances outcome depends on the requested AZ (default: no capacity)."""
     client = MagicMock()
 
@@ -202,7 +209,13 @@ def _ctx(region: str, azs: tuple[str, ...], outcomes: dict[str | None, object]) 
 
     client.run_instances.side_effect = run
     return RegionContext(
-        region=region, ec2_client=client, ami={"ImageId": "ami-1"}, sg_id="sg-1", key_name="k", placement_azs=azs
+        region=region,
+        ec2_client=client,
+        ami={"ImageId": "ami-1"},
+        sg_id="sg-1",
+        key_name="k",
+        placement_azs=azs,
+        hard_pin=hard_pin,
     )
 
 
@@ -255,24 +268,28 @@ def test_az_sweep(w2_outcomes, expected_region, expected_attempts, expected_fata
     assert fatal == expected_fatal
 
 
-def test_hard_pinned_az_keeps_the_pre_az_selection_behaviour():
-    """One AZ (an EBS volume's, a cluster's, a single --az): Unsupported surfaces AWS's own error."""
-    contexts = {"us-west-2": _ctx("us-west-2", ("us-west-2d",), {"us-west-2d": UNSUPPORTED})}
-    with pytest.raises(botocore.exceptions.ClientError) as exc:
+def test_hard_pin_unsupported_is_a_clean_region_named_error():
+    """An EBS volume's / cluster's AZ is required: report AWS's reason as a CLIError (no traceback, no skip)."""
+    contexts = {"us-west-2": _ctx("us-west-2", ("us-west-2d",), {"us-west-2d": UNSUPPORTED}, hard_pin=True)}
+    with pytest.raises(CLIError, match=r"\[us-west-2\] g4dn.xlarge can't launch in us-west-2d: .*not supported"):
         launch_with_retry(LaunchConfig(regions=("us-west-2",)), lambda r: contexts[r])
-    assert exc.value.response["Error"]["Code"] == "Unsupported"
 
 
-def test_hard_pinned_az_price_failure_drops_the_region():
-    contexts = {"us-west-2": _ctx("us-west-2", ("us-west-2d",), {"us-west-2d": PRICE})}
-    fatal: list[str] = []
-    with pytest.raises(CLIError):
-        launch_with_retry(
-            LaunchConfig(regions=("us-west-2",), spot=False),
-            lambda r: contexts[r],
-            on_region_fatal=lambda region, kind, msg: fatal.append(kind),
-        )
-    assert fatal == ["price"]
+@pytest.mark.parametrize("outcome,kind", [(UNSUPPORTED, "unsupported"), (PRICE, "price")])
+def test_one_az_plan_failure_drops_the_region_and_tries_the_next(outcome, kind):
+    """A plan that happens to hold one AZ (a single --az, or one usable AZ) is not a hard pin."""
+    contexts = {
+        "us-west-2": _ctx("us-west-2", ("us-west-2b",), {"us-west-2b": outcome}),
+        "us-east-1": _ctx("us-east-1", (), {None: "i-east"}),
+    }
+    fatal: list[tuple[str, str]] = []
+    result = launch_with_retry(
+        LaunchConfig(regions=("us-west-2", "us-east-1")),
+        lambda r: contexts[r],
+        on_region_fatal=lambda region, k, msg: fatal.append((region, k)),
+    )
+    assert result.region == "us-east-1"
+    assert fatal == [("us-west-2", kind)]
 
 
 def test_all_unsupported_skips_the_on_demand_fallback():
@@ -285,15 +302,14 @@ def test_all_unsupported_skips_the_on_demand_fallback():
     msg = exc.value.format_message()
     assert "Could not launch g4dn.xlarge (spot)" in msg
     assert "not supported in your requested AZ" in msg
-    assert "list instance-types --prefix g4dn" in msg
+    assert "aws-bootstrap launch --dry-run --cheapest-az --instance-type g4dn.xlarge --region us-west-2" in msg
 
 
 def test_failure_names_only_the_azs_actually_tried():
     contexts = {"us-west-2": _ctx("us-west-2", ("us-west-2b", "us-west-2a", "us-west-2c"), {"us-west-2b": QUOTA})}
     with pytest.raises(CLIError) as exc:
-        launch_with_retry(
-            LaunchConfig(regions=("us-west-2",), spot=False), lambda r: contexts[r], confirm_on_demand=lambda: False
-        )
+        # The on-demand fallback hits the same (region-wide) quota error in us-west-2b.
+        launch_with_retry(LaunchConfig(regions=("us-west-2",)), lambda r: contexts[r], confirm_on_demand=lambda: True)
     assert "(tried us-west-2b)" in exc.value.format_message()
 
 

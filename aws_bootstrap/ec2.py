@@ -385,6 +385,10 @@ class RegionContext:
     placement_group: str | None = None
     # Current spot price per AZ in placement_azs (for display), where known.
     az_prices: dict[str, float] = field(default_factory=dict)
+    # The single AZ in placement_azs is required, not a preference: an existing
+    # --ebs-volume-id's AZ, or a cluster's. An AZ-level failure there can't be
+    # routed around by trying another AZ (a plan that happens to hold one AZ can).
+    hard_pin: bool = False
 
 
 @dataclass
@@ -499,7 +503,7 @@ def _run_instances(
             # Often the type isn't offered in this AZ, so another AZ of the region may
             # work; the sweep decides (a hard pin re-raises the original error).
             aws_msg = e.response["Error"].get("Message", "")
-            raise AzUnsupportedError(f"{placement_az}: {aws_msg or 'request unsupported'}", e) from None
+            raise AzUnsupportedError(f"{placement_az}: {aws_msg or 'request unsupported'}") from None
         raise
     return response["Instances"][0]
 
@@ -507,16 +511,12 @@ def _run_instances(
 class AzUnsupportedError(Exception):
     """EC2 returned ``Unsupported`` for a launch pinned to an AZ (message keeps AWS's text).
 
-    With other AZs to try, the sweep moves on to the next one; if every AZ of a
-    region raises it, the region is dropped like a quota/price failure. For a hard
-    pin (one AZ: an ``--ebs-volume-id``, a cluster's AZ, a single ``--az``) the
-    sweep re-raises :attr:`client_error`, AWS's own error, as before AZ selection.
+    The sweep moves on to the region's next AZ; if every AZ of the plan raises it,
+    the region is dropped like a quota/price failure. For a hard pin
+    (``RegionContext.hard_pin``: an ``--ebs-volume-id`` or cluster AZ, where no
+    other AZ will do) it becomes a region-named ``CLIError`` carrying AWS's text.
     Never justifies a ``--wait`` sleep.
     """
-
-    def __init__(self, message: str, client_error: botocore.exceptions.ClientError) -> None:
-        super().__init__(message)
-        self.client_error = client_error
 
 
 def _describe_failures(
@@ -563,11 +563,13 @@ def _aggregated_error(
     if hints:
         tail = "\n\n" + "\n\n".join(f"  {h}" for h in hints)
         if all(kind == "unsupported" for kind, _ in failures.values()):
-            family = config.instance_type.split(".")[0]
-            tail += (
-                "\n\n  The AZs tried don't support this launch: pick other AZs (or drop --availability-zone);"
-                f"\n  `aws-bootstrap list instance-types --prefix {family}` shows where it runs."
-            )
+            tail += "\n\n  The AZs tried don't support this launch. List the AZs that do, per region, with:"
+            for region in regions:
+                if failures.get(region, ("",))[0] == "unsupported":
+                    tail += (
+                        f"\n    aws-bootstrap launch --dry-run --cheapest-az --instance-type {config.instance_type}"
+                        f" --region {region}"
+                    )
     else:
         tail = "\n\n  Try --wait, more --region values, --on-demand, or a different instance type."
     return CLIError(header + body + tail)
@@ -605,9 +607,9 @@ def launch_with_retry(
     the next AZ before the next region (all three can differ by AZ); quota is
     region-wide and drops the region at once. The region counts as
     capacity-limited once every AZ has missed and at least one missed on
-    capacity; if every AZ failed on price/unsupported it is dropped. A single AZ
-    is a hard pin and keeps the pre-AZ-selection behaviour (``Unsupported``
-    re-raises AWS's error; a price failure drops the region).
+    capacity; if every AZ failed on price/unsupported it is dropped. For a hard
+    pin (``ctx.hard_pin``: an EBS volume's or cluster's AZ) ``Unsupported`` is a
+    region-named ``CLIError`` with AWS's text, since no other AZ will do.
     ``on_attempt(region, market, attempt, az)``'s ``attempt`` is the 0-based
     ``--wait`` backoff-cycle index; it stays ``0`` outside the wait loop (no-wait
     pass and on-demand fallback). ``az`` is the AZ requested, or None.
@@ -642,8 +644,6 @@ def launch_with_retry(
         for region in candidates:
             ctx = ctx_for(region)
             azs: tuple[str | None, ...] = ctx.placement_azs or (None,)
-            # One AZ is a hard pin (or EC2's choice): its errors keep their old meaning.
-            pinned = len(azs) == 1
             capacity_miss: CapacityError | None = None
             az_failures: list[tuple[str, str]] = []  # AZ-level (kind, message): price / unsupported
             for az in azs:
@@ -669,13 +669,15 @@ def launch_with_retry(
                     capacity_miss = e
                     continue
                 except AzUnsupportedError as e:
-                    if pinned:
-                        raise e.client_error from None
+                    if ctx.hard_pin:
+                        # The volume's / cluster's AZ is required: report AWS's reason, don't skip.
+                        raise CLIError(f"[{region}] {config.instance_type} can't launch in {e}") from None
                     az_failures.append(("unsupported", f"{config.instance_type}: {e}"))
                     continue
                 except RegionFatalError as e:
-                    if e.kind == "price" and not pinned:
-                        # Spot prices differ by AZ: another AZ may be under the maximum.
+                    if e.kind == "price":
+                        # Spot prices differ by AZ: another AZ (if any) may be under the maximum;
+                        # with every AZ over it, the region is dropped below.
                         az_failures.append(("price", e.message))
                         continue
                     # Quota is region-wide: the region's other AZs would only repeat it.
@@ -1051,6 +1053,10 @@ def _confirm_zones(ec2_client, region: str, zones: tuple[str, ...]) -> None:
     """Fail (naming the region) unless every zone exists there and is usable (opted in)."""
     try:
         resp = ec2_client.describe_availability_zones(ZoneNames=list(zones), AllAvailabilityZones=True)
+    except botocore.exceptions.EndpointConnectionError:
+        raise CLIError(
+            f"Can't reach EC2 in region {region} (from availability zone {', '.join(zones)}): is the AZ name right?"
+        ) from None
     except botocore.exceptions.ClientError as e:
         raise CLIError(
             f"Unknown availability zone in {region}: {', '.join(zones)} ({e.response['Error'].get('Message', e)}).\n"
