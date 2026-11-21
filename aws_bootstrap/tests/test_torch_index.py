@@ -91,13 +91,15 @@ def test_published_versions_empty_page():
     assert ti.published_versions("<html></html>") == []
 
 
-def test_candidates_are_capped_at_the_toolkit_and_compare_numerically():
+def test_candidates_are_capped_at_the_toolkit_within_its_cuda_major():
     published = ti.published_versions(INDEX_HTML)
-    # 13.1: no cu131 exists, so the newest usable index is cu130 — never cu132.
-    assert ti.candidates(published, (13, 1))[:2] == [(13, 0), (12, 9)]
-    # Numeric, not string, ordering: cu92 (9.2) sorts below cu118 (11.8).
-    assert ti.candidates(published, (11, 8)) == [(11, 8), (10, 0), (9, 2)]
-    assert ti.candidates(published, (8, 0)) == []
+    assert ti.candidates(published, (13, 5)) == [(13, 4), (13, 2), (13, 0)]
+    # 13.1: no cu131 exists, so cu130 — never cu132, and never a 12.x index.
+    assert ti.candidates(published, (13, 1)) == [(13, 0)]
+    # Numeric, not string, comparison: (12, 9) is below (13, 0) and excluded as another major.
+    assert ti.candidates(published, (12, 9)) == [(12, 9)]
+    # A toolkit newer than any published index of its major: nothing (-> PyPI), not cu134.
+    assert ti.candidates(published, (14, 0)) == []
 
 
 def test_parse_pins_normalizes_names_and_skips_comments():
@@ -123,7 +125,7 @@ def _resolver(results: dict[str, str | Exception]):
     def resolve(url: str) -> str:
         tag = url.rstrip("/").rsplit("/", 1)[-1]
         tried.append(tag)
-        outcome = results.get(tag, RuntimeError("no solution"))
+        outcome = results.get(tag, ti.NoBuild("error: No solution found when resolving dependencies"))
         if isinstance(outcome, Exception):
             raise outcome
         return outcome
@@ -154,11 +156,26 @@ def test_select_tag_skips_an_index_missing_a_cuda_build_and_says_why():
     assert any("cu134" in m and "torchvision" in m for m in log)
 
 
-def test_select_tag_skips_an_index_that_fails_to_resolve():
-    resolve, _ = _resolver({"cu134": RuntimeError("No solution found"), "cu132": _pins("cu132")})
+def test_select_tag_skips_an_index_with_no_matching_build():
+    resolve, _ = _resolver({"cu134": ti.NoBuild("error: No solution found"), "cu132": _pins("cu132")})
     log = _Log()
     assert ti.select_tag((13, 5), lambda: INDEX_HTML, resolve, log) == "cu132"
     assert any("cu134" in m and "No solution found" in m for m in log)
+
+
+def test_select_tag_stops_when_resolution_is_unavailable():
+    """A network error or timeout must not walk older indexes (slow, and a silent downgrade)."""
+    resolve, tried = _resolver({"cu134": ti.ResolverUnavailable("error: Request failed after 3 retries")})
+    log = _Log()
+    assert ti.select_tag((13, 5), lambda: INDEX_HTML, resolve, log) is None
+    assert tried == ["cu134"]
+    assert any("Request failed" in m for m in log)
+
+
+def test_select_tag_attempts_are_bounded_to_the_toolkit_major():
+    resolve, tried = _resolver({})  # every index: no matching build
+    assert ti.select_tag((13, 5), lambda: INDEX_HTML, resolve, _Log()) is None
+    assert tried == ["cu134", "cu132", "cu130"]
 
 
 def test_select_tag_falls_back_when_the_index_cannot_be_read():
@@ -176,7 +193,7 @@ def test_select_tag_none_when_nothing_fits():
     resolve, _ = _resolver({})
     log = _Log()
     assert ti.select_tag((13, 5), lambda: INDEX_HTML, resolve, log) is None
-    assert any("no PyTorch CUDA index" in m for m in log)
+    assert any("no PyTorch CUDA 13.x index" in m for m in log)
 
 
 def test_select_tag_none_when_index_lists_no_cuda():
@@ -209,13 +226,41 @@ def test_uv_resolve_builds_the_compile_command(monkeypatch):
     assert seen["kwargs"]["timeout"] == ti.RESOLVE_TIMEOUT  # never unbounded: remote_setup.sh is
 
 
-def test_uv_resolve_raises_with_uvs_last_error_line(monkeypatch):
-    monkeypatch.setattr(
-        ti.subprocess,
-        "run",
-        lambda cmd, **kw: subprocess.CompletedProcess(cmd, 1, stdout="", stderr="error\n  No solution found\n"),
-    )
-    with pytest.raises(RuntimeError, match="No solution found"):
+UV_NO_SOLUTION_STDERR = (
+    "error: No solution found when resolving dependencies\n"
+    "  cause: Because all versions of torch have no wheels with a matching Python ABI tag\n"
+    "hint: You require CPython 3.12 (`cp312`), but we only found wheels for `torch` (v2.0.1)\n"
+)
+
+
+def _completed(code: int, stderr: str = ""):
+    return lambda cmd, **kw: subprocess.CompletedProcess(cmd, code, stdout="", stderr=stderr)
+
+
+def test_uv_resolve_no_solution_is_nobuild_with_the_error_line(monkeypatch):
+    """uv exits 1 when the index has no matching build; report its error line, not the hint."""
+    monkeypatch.setattr(ti.subprocess, "run", _completed(1, UV_NO_SOLUTION_STDERR))
+    with pytest.raises(ti.NoBuild, match="^error: No solution found"):
+        ti.uv_resolve("u", "p")
+
+
+def test_uv_resolve_request_failure_is_unavailable(monkeypatch):
+    """uv exits 2 on errors such as a failed request."""
+    monkeypatch.setattr(ti.subprocess, "run", _completed(2, "error: Request failed after 3 retries in 5.7s\n"))
+    with pytest.raises(ti.ResolverUnavailable, match="Request failed"):
+        ti.uv_resolve("u", "p")
+
+
+@pytest.mark.parametrize(
+    "exc",
+    [subprocess.TimeoutExpired(cmd="uv", timeout=120), FileNotFoundError("uv")],
+)
+def test_uv_resolve_timeout_or_missing_uv_is_unavailable(monkeypatch, exc):
+    def boom(cmd, **kw):
+        raise exc
+
+    monkeypatch.setattr(ti.subprocess, "run", boom)
+    with pytest.raises(ti.ResolverUnavailable):
         ti.uv_resolve("u", "p")
 
 

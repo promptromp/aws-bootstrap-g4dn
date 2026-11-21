@@ -1,17 +1,24 @@
 """Pick the PyTorch CUDA wheel index that matches this machine's CUDA toolkit.
 
 Uploaded to the instance and run by ``remote_setup.sh`` with the venv's Python, so
-it is stdlib-only and avoids syntax newer than the instance's interpreter.
+it is stdlib-only and evaluates no syntax newer than Python 3.8 at runtime.
 
 Rather than a hand-maintained list of CUDA wheel tags, which silently pinned every
 launch to an old index as PyTorch published new ones, it reads the tags PyTorch
-actually publishes (the ``cuNNN/`` directories of the index root), keeps those no
-newer than the installed toolkit, and asks ``uv`` to resolve the packages against
-each, newest first. The first index on which every package resolves to a
-``+cuNNN`` build wins. Checking the resolution, not just the directory, matters:
-an index can exist before it carries every package for this Python and CPU, and
-the PyTorch indexes also mirror stray CPU-only wheels that would otherwise
-"resolve" to the wrong build.
+actually publishes (the ``cuNNN/`` directories of the index root), keeps those of
+the toolkit's CUDA *major* version that are no newer than the toolkit, and asks
+``uv`` to resolve the packages against each, newest first. The first index on
+which every package resolves to a ``+cuNNN`` build wins.
+
+Checking the resolution, not just the directory, matters: an index can exist
+before it carries every package for this Python and CPU, and the PyTorch indexes
+also mirror stray CPU-only wheels that would otherwise "resolve" to the wrong build.
+
+Only a definite "no such build here" moves on to the next index. A network error,
+timeout or missing ``uv`` stops the search: walking older indexes would just
+repeat the failure, and could quietly install a torch built for an older CUDA.
+Staying within the toolkit's major version keeps ``torch.version.cuda`` compatible
+with ``nvcc`` for building extensions, and bounds the search to a few attempts.
 
 Usage::
 
@@ -19,7 +26,7 @@ Usage::
 
 Prints the winning tag (e.g. ``cu134``) on stdout, or nothing when none fits or a
 lookup fails; the caller then falls back to PyPI. Each rejected tag is reported
-on stderr so a downgrade is never silent.
+on stderr so a fallback is never silent.
 """
 
 from __future__ import annotations
@@ -29,12 +36,20 @@ import subprocess
 import sys
 import urllib.request
 from collections.abc import Callable, Iterable
+from typing import TYPE_CHECKING
 
+
+if TYPE_CHECKING:  # annotation-only alias: nothing here is evaluated at runtime
+    Version = tuple[int, int]
 
 INDEX_ROOT = "https://download.pytorch.org/whl/"
 PACKAGES = ("torch", "torchvision")
 FETCH_TIMEOUT = 30  # seconds, for the index root
-RESOLVE_TIMEOUT = 300  # seconds, per `uv pip compile`
+RESOLVE_TIMEOUT = 120  # seconds, per `uv pip compile` (a healthy resolve takes ~1s)
+
+# uv's exit statuses: 1 = the resolution failed (no matching build), 2 = an error
+# (network, bad arguments, ...).
+_UV_NO_SOLUTION = 1
 
 # "cu134/" -> major 13, minor 4. CUDA minors have always been one digit, so the
 # last digit is the minor and the rest the major (cu100 = 10.0, cu118 = 11.8).
@@ -42,7 +57,13 @@ _TAG_LINK = re.compile(r'href="cu(\d+)(\d)/"')
 _VERSION = re.compile(r"^\s*(\d+)\.(\d+)")
 _PINNED = re.compile(r"^([A-Za-z0-9_.-]+)==(\S+)")
 
-Version = tuple[int, int]
+
+class NoBuild(Exception):
+    """This index has no suitable build: try the next (older) one."""
+
+
+class ResolverUnavailable(Exception):
+    """Resolution could not run (network, timeout, no uv): stop, fall back to PyPI."""
 
 
 def parse_version(text: str) -> Version | None:
@@ -62,8 +83,8 @@ def published_versions(index_html: str) -> list[Version]:
 
 
 def candidates(published: Iterable[Version], toolkit: Version) -> list[Version]:
-    """Published versions no newer than *toolkit*, newest first."""
-    return sorted((v for v in published if v <= toolkit), reverse=True)
+    """Published versions of the toolkit's CUDA major, no newer than *toolkit*, newest first."""
+    return sorted((v for v in published if v[0] == toolkit[0] and v <= toolkit), reverse=True)
 
 
 def parse_pins(requirements: str) -> dict[str, str]:
@@ -86,8 +107,19 @@ def fetch_index_root(url: str = INDEX_ROOT, timeout: int = FETCH_TIMEOUT) -> str
         return resp.read().decode("utf-8", "replace")
 
 
+def _uv_error(stderr: str) -> str:
+    """The ``error:`` line of uv's stderr (its last line is often just a ``hint:``)."""
+    lines = [ln.strip() for ln in (stderr or "").splitlines() if ln.strip()]
+    errors = [ln for ln in lines if ln.startswith("error:")]
+    return (errors or lines or ["no output"])[0]
+
+
 def uv_resolve(index_url: str, python: str, extra_args: Iterable[str] = (), timeout: int = RESOLVE_TIMEOUT) -> str:
-    """Resolve PACKAGES against *index_url* for *python*; returns pinned requirements text."""
+    """Resolve PACKAGES against *index_url* for *python*; returns pinned requirements text.
+
+    Raises :class:`NoBuild` when uv finds no solution on this index, and
+    :class:`ResolverUnavailable` when resolution could not run at all.
+    """
     cmd = [
         "uv",
         "pip",
@@ -102,10 +134,16 @@ def uv_resolve(index_url: str, python: str, extra_args: Iterable[str] = (), time
         index_url,
         *extra_args,
     ]
-    result = subprocess.run(cmd, input="\n".join(PACKAGES), capture_output=True, text=True, timeout=timeout)
+    try:
+        result = subprocess.run(cmd, input="\n".join(PACKAGES), capture_output=True, text=True, timeout=timeout)
+    except subprocess.TimeoutExpired:
+        raise ResolverUnavailable(f"uv pip compile timed out after {timeout}s") from None
+    except OSError as e:  # uv not installed / not on PATH
+        raise ResolverUnavailable(f"could not run uv ({e})") from None
+    if result.returncode == _UV_NO_SOLUTION:
+        raise NoBuild(_uv_error(result.stderr))
     if result.returncode != 0:
-        detail = (result.stderr or "").strip().splitlines()
-        raise RuntimeError(detail[-1] if detail else f"uv exited {result.returncode}")
+        raise ResolverUnavailable(_uv_error(result.stderr))
     return result.stdout
 
 
@@ -115,26 +153,26 @@ def select_tag(
     resolve: Callable[[str], str],
     log: Callable[[str], None],
 ) -> str | None:
-    """Newest published tag <= *toolkit* on which every package resolves to a CUDA build."""
+    """Newest published tag of the toolkit's major, <= *toolkit*, serving CUDA builds of every package."""
     try:
         published = published_versions(fetch())
     except Exception as e:  # network, TLS, decode: fall back to PyPI, but say why
         log(f"could not read the PyTorch index ({e})")
         return None
-    if not published:
-        log("the PyTorch index lists no CUDA wheel indexes")
-        return None
     for version in candidates(published, toolkit):
         tag = tag_for(version)
         try:
             missing = cuda_builds_missing(parse_pins(resolve(f"{INDEX_ROOT}{tag}")), tag)
-        except Exception as e:  # resolution failure or timeout: try the next tag
-            log(f"{tag}: not usable ({e})")
+        except NoBuild as e:
+            log(f"{tag}: no matching build ({e})")
             continue
+        except ResolverUnavailable as e:
+            log(f"{tag}: resolution unavailable, not trying older indexes ({e})")
+            return None
         if not missing:
             return tag
         log(f"{tag}: no {tag} build of {', '.join(missing)}")
-    log(f"no PyTorch CUDA index at or below CUDA {toolkit[0]}.{toolkit[1]} serves {', '.join(PACKAGES)}")
+    log(f"no PyTorch CUDA {toolkit[0]}.x index at or below {toolkit[0]}.{toolkit[1]} serves {', '.join(PACKAGES)}")
     return None
 
 

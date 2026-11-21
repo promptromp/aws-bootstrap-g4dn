@@ -308,10 +308,11 @@ needs no extra flag:
 aws-bootstrap launch --instance-type g5g.xlarge
 ```
 
-Only a **custom** `--ami-filter` written for the other architecture fails: the
-command exits non-zero with an error naming the architecture. On that error,
-drop the custom `--ami-filter` (or fix it) rather than changing region, and
-discover what exists with `aws-bootstrap -o json list amis --arch arm64`.
+If no image matches, the command exits non-zero with an error naming the
+architecture and a region-pinned `list amis --arch <arch> --region <r>` command.
+With a **custom** `--ami-filter` the usual cause is a filter written for the other
+architecture — drop or fix it (changing region won't help). With the **default**
+filter it means the region doesn't publish the image — try another `--region`.
 
 Every other current GPU family (g4dn, g5, g6/g6e/g6f, gr6/gr6f, g7/g7e, p4d,
 p5/p5e/p5en, p6-b200/p6-b300) is x86_64.

@@ -132,28 +132,40 @@ def test_get_latest_ami_filters_on_requested_architecture(arch):
 
 
 def test_get_latest_ami_arch_miss_explains_the_mismatch():
-    """A filter written for x86_64 finds nothing for arm64 — the error must say why."""
+    """A custom filter written for x86_64 finds nothing for arm64 — the error must say why."""
     ec2 = MagicMock()
+    ec2.meta.region_name = "us-west-2"
     ec2.describe_images.return_value = {"Images": []}
     with pytest.raises(click.ClickException) as exc:
         get_latest_ami(ec2, "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04)*", architecture="arm64")
     msg = exc.value.format_message()
     assert "No arm64 AMI found" in msg
     assert "ARM64" in msg
-    assert "Omit --ami-filter" in msg
-    assert "aws-bootstrap list amis --arch arm64" in msg
+    assert "--ami-filter to use the default" in msg
+    assert "aws-bootstrap list amis --arch arm64 --region us-west-2" in msg
     # The old hint pointed at the PyTorch 2.10-2.12 DLAMIs, which AWS no longer patches.
     assert "PyTorch" not in msg
 
 
-def test_get_latest_ami_miss_with_default_filter_does_not_suggest_omitting_it():
+def test_get_latest_ami_miss_with_default_filter_blames_the_region():
+    """The default spans every architecture, so if it finds nothing the region lacks the image."""
     ec2 = MagicMock()
+    ec2.meta.region_name = "eu-south-2"
     ec2.describe_images.return_value = {"Images": []}
     with pytest.raises(click.ClickException) as exc:
         get_latest_ami(ec2, DEFAULT_AMI_FILTER, architecture="x86_64")
     msg = exc.value.format_message()
-    assert "Omit --ami-filter" not in msg
-    assert "aws-bootstrap list amis --arch x86_64" in msg
+    assert "try another --region" in msg
+    assert "--ami-filter" not in msg
+    assert "aws-bootstrap list amis --arch x86_64 --region eu-south-2" in msg
+
+
+def test_no_ami_message_without_a_known_region():
+    ec2 = MagicMock()  # meta.region_name is a MagicMock, not a str: no --region flag
+    ec2.describe_images.return_value = {"Images": []}
+    with pytest.raises(click.ClickException) as exc:
+        get_latest_ami(ec2, "X*", architecture="arm64")
+    assert exc.value.format_message().endswith("aws-bootstrap list amis --arch arm64")
 
 
 @pytest.mark.parametrize(

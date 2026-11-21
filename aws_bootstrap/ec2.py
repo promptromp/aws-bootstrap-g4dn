@@ -109,30 +109,37 @@ def get_latest_ami(ec2_client, ami_filter: str, architecture: str = "x86_64") ->
     response = ec2_client.describe_images(**params)
     images = response["Images"]
     if not images:
-        raise CLIError(_no_ami_message(ami_filter, architecture))
+        region = getattr(getattr(ec2_client, "meta", None), "region_name", None)
+        raise CLIError(_no_ami_message(ami_filter, architecture, region if isinstance(region, str) else None))
 
     images.sort(key=lambda x: x["CreationDate"], reverse=True)
     return images[0]
 
 
-def _no_ami_message(ami_filter: str, architecture: str) -> str:
+def _no_ami_message(ami_filter: str, architecture: str, region: str | None = None) -> str:
     """Actionable 'no AMI' error, naming the architecture that was required.
 
-    The usual cause is a filter written for the other architecture: AWS names its
-    Deep Learning AMIs per architecture ("Deep Learning ARM64 Base …" vs "Deep
-    Learning Base …"), so a filter copied from an x86_64 AMI matches nothing for an
-    arm64 instance type such as g5g, and vice versa. The default filter spans both.
+    Two distinct causes. A custom filter is most often written for the other
+    architecture: AWS names its Deep Learning AMIs per architecture ("Deep Learning
+    ARM64 Base …" vs "Deep Learning Base …"), so a filter copied from an x86_64 AMI
+    matches nothing for an arm64 type such as g5g. The default filter spans both,
+    so when *it* finds nothing the region simply doesn't publish that image.
     """
-    lines = [
-        f"No {architecture} AMI found matching filter: {ami_filter}",
-        "",
-        f"  This instance type needs an {architecture} image. AWS publishes Deep Learning AMIs",
-        "  per architecture (ARM64 builds carry an 'ARM64' infix in their name), so a filter",
-        "  written for one architecture matches nothing on the other.",
-    ]
-    if ami_filter != DEFAULT_AMI_FILTER:
-        lines.append("  Omit --ami-filter to use the default, which resolves for either architecture.")
-    lines += ["  List what this region offers with:", f"    aws-bootstrap list amis --arch {architecture}"]
+    lines = [f"No {architecture} AMI found matching filter: {ami_filter}", ""]
+    if ami_filter == DEFAULT_AMI_FILTER:
+        lines += [
+            f"  This region does not appear to publish the Deep Learning Base AMI for {architecture};",
+            "  try another --region.",
+        ]
+    else:
+        lines += [
+            f"  This instance type needs an {architecture} image. AWS publishes Deep Learning AMIs per",
+            "  architecture (ARM64 builds carry an 'ARM64' infix in their name), so a filter written",
+            "  for one architecture matches nothing on the other. Check the filter and region, or omit",
+            "  --ami-filter to use the default, which resolves for either architecture.",
+        ]
+    region_flag = f" --region {region}" if region else ""
+    lines += ["  List what is available with:", f"    aws-bootstrap list amis --arch {architecture}{region_flag}"]
     return "\n".join(lines)
 
 
