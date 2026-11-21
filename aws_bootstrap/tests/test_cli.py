@@ -457,6 +457,21 @@ def test_list_amis_output(mock_list, mock_session):
 
 
 @patch("aws_bootstrap.cli.boto3.Session")
+@patch("aws_bootstrap.cli.list_amis", return_value=[])
+def test_list_amis_default_filter_spans_architectures(mock_list, mock_session):
+    """`list amis --arch arm64` must find the ARM64 builds without a hand-written filter.
+
+    The old default ("Deep Learning Base OSS…*") could never match an ARM64 name
+    ("Deep Learning ARM64 Base OSS…"), so --arch arm64 alone always came back empty.
+    """
+    result = CliRunner().invoke(main, ["list", "amis", "--arch", "arm64", "--region", "us-west-2"])
+    assert result.exit_code == 0
+    pattern = mock_list.call_args.args[1]
+    assert pattern == "Deep Learning*Base OSS Nvidia Driver GPU AMI*"
+    assert mock_list.call_args.kwargs["architecture"] == "arm64"
+
+
+@patch("aws_bootstrap.cli.boto3.Session")
 @patch("aws_bootstrap.cli.list_amis")
 def test_list_amis_empty(mock_list, mock_session):
     mock_list.return_value = []

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import botocore.exceptions
 
-from .ec2 import CLIError
+from .ec2 import _FAMILY_PREFIXES, CLIError
 
 
 SERVICE_CODE = "ec2"
@@ -45,15 +45,15 @@ QUOTA_FAMILIES: dict[str, dict[str, str]] = {
     },
 }
 
-# Human-readable family lists. Kept in sync with the EC2 instance-type catalog
-# (`describe-instance-types`); retired families (g3, p2, p3, dl1) are dropped and
-# current ones added. These are display hints only — the authoritative mapping is
-# `ec2.instance_type_to_family`, which is prefix-based and needs no updating when
-# AWS ships a new family.
+_QUOTA_FAMILY_NAMES: dict[str, str] = {"gvt": "G and VT", "p": "P", "dl": "DL"}
+
+# Display labels, e.g. "G and VT (g*, vt*)". The instance-type patterns come from
+# the same prefix map instance_type_to_family uses, so the label can never drift
+# from the classification — unlike a hand-kept list of families, which went stale
+# with every new AWS GPU family. `list instance-types` shows the per-type mapping.
 QUOTA_FAMILY_LABELS: dict[str, str] = {
-    "gvt": "G and VT (g4dn, g5, g5g, g6, g6e, g6f, gr6, gr6f, g7, g7e, vt1)",
-    "p": "P (p3dn, p4d, p4de, p5, p5e, p5en, p6-b200, p6-b300, p6e-gb200)",
-    "dl": "DL (dl2q)",
+    family: f"{_QUOTA_FAMILY_NAMES[family]} ({', '.join(p + '*' for p in prefixes)})"
+    for prefixes, family in _FAMILY_PREFIXES
 }
 
 DEFAULT_FAMILY = "gvt"

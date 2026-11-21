@@ -234,22 +234,14 @@ def test_quota_families_has_expected_keys():
         assert "on-demand" in family
 
 
-def test_quota_family_labels_cover_current_ec2_families():
-    """Labels are display hints, but they must not omit currently-offered families.
+def test_quota_family_labels_derive_from_the_classifier():
+    """Labels come from the same prefix map as instance_type_to_family, so they can't drift.
 
-    Guards against the drift that had them still advertising retired families
-    (g3, p2, p3, dl1) while missing g6f/gr6/gr6f/g7/g7e and p6-b200/p6-b300.
+    The hand-kept family lists they replace went stale with each new AWS GPU family
+    (still listing retired g3/p2/p3/dl1, then missing p6e-gb300).
     """
+    assert QUOTA_FAMILY_LABELS == {"gvt": "G and VT (g*, vt*)", "p": "P (p*)", "dl": "DL (dl*)"}
     assert set(QUOTA_FAMILY_LABELS) == set(QUOTA_FAMILIES)
-    gvt = QUOTA_FAMILY_LABELS["gvt"]
-    for fam in ("g4dn", "g5", "g5g", "g6", "g6e", "g6f", "gr6", "gr6f", "g7", "g7e", "vt1"):
-        assert fam in gvt, f"{fam} missing from the gvt label"
-    p = QUOTA_FAMILY_LABELS["p"]
-    for fam in ("p4d", "p5", "p5e", "p5en", "p6-b200", "p6-b300"):
-        assert fam in p, f"{fam} missing from the p label"
-    # Retired families should no longer be advertised.
-    for retired in ("g3,", "p2,", "p3,", "dl1"):
-        assert retired not in gvt + p + QUOTA_FAMILY_LABELS["dl"]
 
 
 # ---------------------------------------------------------------------------

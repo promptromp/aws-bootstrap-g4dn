@@ -6,11 +6,12 @@ from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from fractions import Fraction
 
 import botocore.exceptions
 import click
 
-from .config import LaunchConfig
+from .config import DEFAULT_AMI_FILTER, LaunchConfig
 from .constants import (
     AMI_OWNER_AMAZON,
     AMI_OWNER_CANONICAL,
@@ -108,31 +109,38 @@ def get_latest_ami(ec2_client, ami_filter: str, architecture: str = "x86_64") ->
     response = ec2_client.describe_images(**params)
     images = response["Images"]
     if not images:
-        raise CLIError(_no_ami_message(ami_filter, architecture))
+        region = getattr(getattr(ec2_client, "meta", None), "region_name", None)
+        raise CLIError(_no_ami_message(ami_filter, architecture, region if isinstance(region, str) else None))
 
     images.sort(key=lambda x: x["CreationDate"], reverse=True)
     return images[0]
 
 
-def _no_ami_message(ami_filter: str, architecture: str) -> str:
+def _no_ami_message(ami_filter: str, architecture: str, region: str | None = None) -> str:
     """Actionable 'no AMI' error, naming the architecture that was required.
 
-    The arm64 case is the one that actually bites: the default Deep Learning AMI
-    filter is published for x86_64 only, so an arm64 instance type (g5g, Grace-based
-    P-series) finds nothing and the user has no way to guess why from the filter alone.
+    Two distinct causes. A custom filter is most often written for the other
+    architecture: AWS names its Deep Learning AMIs per architecture ("Deep Learning
+    ARM64 Base …" vs "Deep Learning Base …"), so a filter copied from an x86_64 AMI
+    matches nothing for an arm64 type such as g5g. The default filter spans both,
+    so when *it* finds nothing the region simply doesn't publish that image.
     """
-    msg = f"No {architecture} AMI found matching filter: {ami_filter}"
-    if architecture == "arm64":
-        return (
-            f"{msg}\n\n"
-            "  This instance type is arm64, but the AMI filter matches no arm64 image.\n"
-            "  The default 'Deep Learning Base OSS Nvidia Driver GPU AMI' is x86_64-only;\n"
-            "  AWS publishes separate ARM64 Deep Learning AMIs. Try:\n"
-            '    --ami-filter "Deep Learning ARM64 AMI OSS Nvidia Driver GPU PyTorch*(Ubuntu 24.04)*"\n\n'
-            "  List what is available in the region with:\n"
-            '    aws-bootstrap list amis --filter "Deep Learning ARM64 AMI*" --arch arm64'
-        )
-    return f"{msg}\nTry adjusting --ami-filter or check the region."
+    lines = [f"No {architecture} AMI found matching filter: {ami_filter}", ""]
+    if ami_filter == DEFAULT_AMI_FILTER:
+        lines += [
+            f"  This region does not appear to publish the Deep Learning Base AMI for {architecture};",
+            "  try another --region.",
+        ]
+    else:
+        lines += [
+            f"  This instance type needs an {architecture} image. AWS publishes Deep Learning AMIs per",
+            "  architecture (ARM64 builds carry an 'ARM64' infix in their name), so a filter written",
+            "  for one architecture matches nothing on the other. Check the filter and region, or omit",
+            "  --ami-filter to use the default, which resolves for either architecture.",
+        ]
+    region_flag = f" --region {region}" if region else ""
+    lines += ["  List what is available with:", f"    aws-bootstrap list amis --arch {architecture}{region_flag}"]
+    return "\n".join(lines)
 
 
 def _has_ssh_ingress(permissions: list[dict], ssh_port: int) -> bool:
@@ -905,6 +913,28 @@ def get_spot_price(ec2_client, instance_type: str, availability_zone: str) -> fl
     return float(prices[0]["SpotPrice"])
 
 
+def _gpu_summary(gpu_info: dict) -> str:
+    """One-line GPU description from an instance type's ``GpuInfo``, e.g. ``1x T4 (16384 MiB)``.
+
+    Fractional-GPU types (g6f, gr6f) report ``Count: 0`` with their share of one
+    GPU in ``GpuPartitionSize``, so they render as ``1/8 L4 (2861 MiB)`` rather
+    than a misleading ``0x L4``.
+    """
+    gpus = gpu_info.get("Gpus", [])
+    if not gpus:
+        return ""
+    g = gpus[0]
+    count = g.get("Count")
+    if count:
+        share = f"{count}x"
+    elif g.get("GpuPartitionSize"):
+        share = str(Fraction(g["GpuPartitionSize"]).limit_denominator(64))
+    else:
+        share = "?x"
+    mem = g.get("MemoryInfo", {}).get("SizeInMiB", 0)
+    return f"{share} {g.get('Name', 'GPU')} ({mem} MiB)"
+
+
 def list_instance_types(ec2_client, name_prefix: str = "g4dn") -> list[dict]:
     """List EC2 instance types matching a family name prefix (e.g. 'g4dn', 'p6').
 
@@ -924,18 +954,12 @@ def list_instance_types(ec2_client, name_prefix: str = "g4dn") -> list[dict]:
     results = []
     for page in pages:
         for it in page["InstanceTypes"]:
-            gpus = it.get("GpuInfo", {}).get("Gpus", [])
-            gpu_summary = ""
-            if gpus:
-                g = gpus[0]
-                mem = g.get("MemoryInfo", {}).get("SizeInMiB", 0)
-                gpu_summary = f"{g.get('Count', '?')}x {g.get('Name', 'GPU')} ({mem} MiB)"
             results.append(
                 {
                     "InstanceType": it["InstanceType"],
                     "VCpuCount": it["VCpuInfo"]["DefaultVCpus"],
                     "MemoryMiB": it["MemoryInfo"]["SizeInMiB"],
-                    "GpuSummary": gpu_summary,
+                    "GpuSummary": _gpu_summary(it.get("GpuInfo", {})),
                 }
             )
     results.sort(key=lambda x: x["InstanceType"])

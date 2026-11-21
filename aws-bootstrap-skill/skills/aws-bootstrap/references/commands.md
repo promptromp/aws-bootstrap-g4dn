@@ -296,26 +296,26 @@ There is no `--region` flag — `cleanup` always scans all enabled regions (an S
 ## Instance-type CPU architecture
 
 An AMI must match its instance type's CPU architecture. `launch` and `cluster
-launch` read the architecture from the instance type and select an AMI for it,
-so you do not normally need to think about this — **except** that the default
-`--ami-filter` (Deep Learning Base OSS Nvidia Driver GPU AMI) is published for
-`x86_64` only.
-
-`g5g` (NVIDIA T4g) is arm64. Launching it needs an ARM64 Deep Learning AMI:
+launch` read the architecture from the instance type (via EC2) and select an AMI
+for it, so you do not need to think about this. AWS names the Deep Learning Base
+AMI per architecture (`Deep Learning Base OSS …` for x86_64, `Deep Learning ARM64
+Base OSS …` for arm64), and the default `--ami-filter`
+(`Deep Learning*Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04)*`) spans both — the
+architecture filter picks the build. So an arm64 type such as `g5g` (NVIDIA T4g)
+needs no extra flag:
 
 ```bash
-aws-bootstrap launch --instance-type g5g.xlarge \
-  --ami-filter "Deep Learning ARM64 AMI OSS Nvidia Driver GPU PyTorch*(Ubuntu 24.04)*"
+aws-bootstrap launch --instance-type g5g.xlarge
 ```
 
-If the filter matches nothing for the required architecture the command exits
-non-zero with an error naming the architecture and printing the filter to use —
-so on that error, retry with the suggested `--ami-filter` rather than a
-different region. Discover what exists with
-`aws-bootstrap -o json list amis --filter "Deep Learning ARM64 AMI*" --arch arm64`.
+If no image matches, the command exits non-zero with an error naming the
+architecture and a region-pinned `list amis --arch <arch> --region <r>` command.
+With a **custom** `--ami-filter` the usual cause is a filter written for the other
+architecture — drop or fix it (changing region won't help). With the **default**
+filter it means the region doesn't publish the image — try another `--region`.
 
 Every other current GPU family (g4dn, g5, g6/g6e/g6f, gr6/gr6f, g7/g7e, p4d,
-p5/p5e/p5en, p6-b200/p6-b300) is x86_64 and needs no special handling.
+p5/p5e/p5en, p6-b200/p6-b300) is x86_64.
 
 ## `aws-bootstrap list instance-types`
 
@@ -354,6 +354,9 @@ derived from `--prefix`; suppressed for non-GPU families.
 ]
 ```
 
+Fractional-GPU types (g6f, gr6f) report their share of one GPU, e.g.
+`"gpu": "1/8 L4 (2861 MiB)"`.
+
 `quota_family` is `null` for non-GPU instance types.
 
 ---
@@ -371,7 +374,7 @@ aws-bootstrap list amis [OPTIONS]
 
 | Option | Type | Default | Description |
 |--------|------|---------|-------------|
-| `--filter` | string | `Deep Learning Base OSS Nvidia Driver GPU AMI*` | AMI name pattern |
+| `--filter` | string | `Deep Learning*Base OSS Nvidia Driver GPU AMI*` | AMI name pattern (default: the Deep Learning Base AMI, every OS and architecture) |
 | `--arch` | `x86_64` \| `arm64` | *(all)* | Restrict to one CPU architecture. Results span both by default; the `architecture` field reports each one. |
 | `--region` / `-r` | string (repeatable) | env/profile, then `us-west-2` | Region(s) to query. Each record is tagged with its `region`. |
 
@@ -735,4 +738,4 @@ Terminate all nodes of a cluster, remove their SSH aliases, wait for full termin
 - **EBS volumes** are tagged with `created-by=aws-bootstrap-g4dn` for automatic discovery
 - **Spot capacity**: on a fully-exhausted spot sweep (`InsufficientInstanceCapacity` in every `--region`) **without `--wait`**, the launcher offers the on-demand fallback (auto-confirmed in structured modes). With `--wait` it retries with backoff and hard-fails on timeout (never auto-buys on-demand). Quota errors and `SpotMaxPriceTooLow` are **not** auto-fallback triggers — in multi-region mode they warn and skip to the next region, hard-failing only when every region is blocked.
 - **Remote setup** installs CUDA-matched PyTorch, Jupyter, GPU benchmark, and VSCode CUDA debug configs
-- The default AMI filter targets Ubuntu 24.04 Deep Learning AMIs with the OSS NVIDIA driver
+- The default AMI filter targets the Ubuntu 24.04 Deep Learning Base AMI (OSS NVIDIA driver) for the instance type's architecture — the same image as AWS's SSM "latest DLAMI" parameter. Ubuntu 26.04 builds exist too: `--ami-filter "Deep Learning*Base OSS Nvidia Driver GPU AMI (Ubuntu 26.04)*"`

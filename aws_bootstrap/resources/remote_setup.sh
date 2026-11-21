@@ -68,10 +68,10 @@ else
 fi
 
 # --- CUDA-aware PyTorch installation ---
-# Known PyTorch CUDA wheel tags (ascending order).
-# Update this list when PyTorch publishes new CUDA builds.
-# See: https://download.pytorch.org/whl/
-KNOWN_CUDA_TAGS=(118 121 124 126 128 129 130)
+# torch_index.py picks the newest PyTorch CUDA wheel index (download.pytorch.org/whl/cuNNN)
+# that is no newer than the installed toolkit and actually serves CUDA builds of torch and
+# torchvision for this venv. It discovers the tags from the index itself, so there is no
+# tag list here to fall out of date as PyTorch publishes new CUDA builds.
 
 detect_cuda_version() {
     # Primary: nvcc (actual toolkit installed on the system)
@@ -85,22 +85,6 @@ detect_cuda_version() {
         return
     fi
     echo ""
-}
-
-cuda_version_to_tag() {
-    # "12.9" → "129", "13.0" → "130"
-    echo "$1" | tr -d '.'
-}
-
-find_best_cuda_tag() {
-    local detected_tag="$1"
-    local best=""
-    for tag in "${KNOWN_CUDA_TAGS[@]}"; do
-        if [ "$tag" -le "$detected_tag" ]; then
-            best="$tag"
-        fi
-    done
-    echo "$best"
 }
 
 install_pytorch_cuda() {
@@ -118,21 +102,19 @@ install_pytorch_cuda() {
     fi
     echo "  Detected CUDA version: $cuda_ver"
 
-    local detected_tag
-    detected_tag=$(cuda_version_to_tag "$cuda_ver")
-
+    # Reasons for any rejected index go to stderr (shown in this log); stdout is the tag or nothing.
     local best_tag
-    best_tag=$(find_best_cuda_tag "$detected_tag")
+    best_tag=$(~/venv/bin/python /tmp/torch_index.py "$cuda_ver" --python ~/venv/bin/python || true)
 
     if [ -z "$best_tag" ]; then
-        echo "  WARNING: No matching PyTorch CUDA tag for cu${detected_tag} — installing from PyPI"
+        echo "  WARNING: No PyTorch CUDA index found for CUDA ${cuda_ver} — installing from PyPI"
         uv pip install --python ~/venv/bin/python torch torchvision
         return
     fi
 
-    echo "  Using PyTorch CUDA index: cu${best_tag}"
+    echo "  Using PyTorch CUDA index: ${best_tag}"
     if ! uv pip install --python ~/venv/bin/python \
-            --default-index "https://download.pytorch.org/whl/cu${best_tag}" \
+            --default-index "https://download.pytorch.org/whl/${best_tag}" \
             torch torchvision; then
         echo "  WARNING: CUDA index install failed — falling back to PyPI"
         uv pip install --python ~/venv/bin/python torch torchvision

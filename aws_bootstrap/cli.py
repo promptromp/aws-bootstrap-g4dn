@@ -11,7 +11,7 @@ import botocore.exceptions
 import click
 
 from . import cluster as cluster_mod
-from .config import LaunchConfig
+from .config import DLAMI_BASE_PATTERN, LaunchConfig
 from .constants import (
     DEFAULT_REGION,
     DEFAULT_WAIT_TIMEOUT,
@@ -1400,7 +1400,9 @@ def cleanup(ctx, dry_run, yes, include_ebs, do_sync, key_path, ssh_user, profile
 # list command group
 # ---------------------------------------------------------------------------
 
-DEFAULT_AMI_PREFIX = "Deep Learning Base OSS Nvidia Driver GPU AMI*"
+# Every OS and architecture of the Deep Learning Base AMI (see config.DLAMI_BASE_PATTERN),
+# so `list amis --arch arm64` finds the ARM64 builds without a hand-written filter.
+DEFAULT_AMI_PREFIX = f"{DLAMI_BASE_PATTERN}*"
 
 
 @main.group(name="list")
