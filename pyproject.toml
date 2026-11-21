@@ -44,7 +44,10 @@ ignore_missing_imports = true
 
 [tool.pytest.ini_options]
 testpaths = ["aws_bootstrap/tests"]
-markers = ["slow: long-running test, skipped by the pre-commit hook (-m 'not slow')"]
+markers = [
+    "slow: long-running test, skipped by the pre-commit hook (-m 'not slow')",
+    "real_key_check: run the CLI's real pre-launch SSH key check (conftest stubs it otherwise)",
+]
 # pytest-impacted: the pre-commit hook and pull-request CI run only the tests a change can
 # reach (`pytest --impacted`); a push to main runs them all. The plugin follows imports from
 # aws_bootstrap/ and the test files. Anything else a test depends on needs a rule below, and

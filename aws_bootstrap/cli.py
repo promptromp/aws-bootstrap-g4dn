@@ -28,6 +28,7 @@ from .constants import (
     TAG_VALUE,
 )
 from .ec2 import (
+    AzOption,
     CLIError,
     RegionContext,
     RegionLaunch,
@@ -53,7 +54,9 @@ from .ec2 import (
     list_clusters,
     list_enabled_regions,
     list_instance_types,
+    plan_azs,
     resolve_ebs_placement_az,
+    spot_price_or_none,
     terminate_tagged_instances,
     validate_ebs_volume,
     wait_instance_ready,
@@ -67,9 +70,10 @@ from .quota import (
     get_quota_request_history,
     request_quota_increase,
 )
-from .retry import parse_duration, resolve_regions
+from .retry import group_azs_by_region, parse_duration, resolve_regions
 from .ssh import (
     add_ssh_host,
+    check_key_usable,
     find_drifted_ssh_hosts,
     find_missing_ssh_hosts,
     find_stale_ssh_hosts,
@@ -268,6 +272,48 @@ def main(ctx, output):
     ctx.obj["output_format"] = OutputFormat(output)
 
 
+def _validate_az_flags(
+    availability_zones: tuple[str, ...],
+    cheapest_az: bool,
+    spot: bool,
+    ebs_volume_id: str | None,
+    regions: tuple[str, ...],
+) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
+    """Check --availability-zone / --cheapest-az and merge the AZs into the region list.
+
+    Returns the explicit regions (those of the AZs when no --region was given; empty
+    when neither was) and each region's AZs. Raises CLIError on a bad combination.
+    """
+    if (availability_zones or cheapest_az) and ebs_volume_id:
+        raise CLIError(
+            "--availability-zone / --cheapest-az can't be combined with --ebs-volume-id: "
+            "the volume already pins the instance to its own AZ."
+        )
+    if cheapest_az and not spot:
+        raise CLIError(
+            "--cheapest-az ranks AZs by spot price, and on-demand prices don't vary by AZ. "
+            "Drop it, or pick an AZ with --availability-zone."
+        )
+    try:
+        return group_azs_by_region(regions, availability_zones)
+    except ValueError as e:
+        raise CLIError(str(e)) from None
+
+
+def _az_label(az: str, spot_price: float | None) -> str:
+    """``us-west-2b (spot $0.991/h)``, or just the AZ when the price is unknown."""
+    return f"{az} (spot ${spot_price:.3f}/h)" if spot_price is not None else az
+
+
+def _az_plan_label(plan: list[AzOption], pricing: str) -> str:
+    """``us-west-2b $0.991/h → us-west-2a $2.212/h`` (prices only for spot)."""
+    parts = []
+    for o in plan:
+        price = f" ${o.spot_price:.3f}/h" if pricing == "spot" and o.spot_price is not None else ""
+        parts.append(f"{o.zone}{price}")
+    return " → ".join(parts)
+
+
 @main.command()
 @click.option("--instance-type", default="g4dn.xlarge", show_default=True, help="EC2 instance type.")
 @click.option("--ami-filter", default=None, help="AMI name pattern filter (auto-detected if omitted).")
@@ -332,6 +378,34 @@ def main(ctx, output):
     type=str,
     help="Attach an existing EBS volume by ID (e.g. vol-0abc123). Mounted at /data.",
 )
+@click.option(
+    "--availability-zone",
+    "--az",
+    "availability_zones",
+    multiple=True,
+    metavar="AZ",
+    help=(
+        "Launch only in this availability zone (repeatable; tried in the order given). An AZ implies "
+        "its region: without --region, the regions are those of the AZs. With --ebs-storage, the new "
+        "volume (and every later reattach) lives in the chosen AZ."
+    ),
+)
+@click.option(
+    "--cheapest-az",
+    is_flag=True,
+    default=False,
+    help=(
+        "Spot only: try each region's AZs cheapest-first by current spot price, moving to the next AZ on "
+        "a capacity miss (which may cost more). Region order still comes first. For the cheap AZ or "
+        "nothing, use --availability-zone AZ --wait."
+    ),
+)
+@click.option(
+    "--skip-key-check",
+    is_flag=True,
+    default=False,
+    help="Skip the pre-launch check that the SSH key works without a passphrase prompt.",
+)
 @click.pass_context
 def launch(
     ctx,
@@ -352,12 +426,15 @@ def launch(
     ssh_port,
     ebs_storage,
     ebs_volume_id,
+    availability_zones,
+    cheapest_az,
+    skip_key_check,
 ):
     """Launch a GPU-accelerated EC2 instance."""
     if ebs_storage is not None and ebs_volume_id is not None:
         raise CLIError("--ebs-storage and --ebs-volume-id are mutually exclusive.")
-
-    resolved_regions = resolve_region_list(regions, profile)
+    explicit_regions, az_map = _validate_az_flags(availability_zones, cheapest_az, spot, ebs_volume_id, tuple(regions))
+    resolved_regions = resolve_region_list(explicit_regions, profile)
 
     config = LaunchConfig(
         instance_type=instance_type,
@@ -375,6 +452,8 @@ def launch(
         ebs_volume_id=ebs_volume_id,
         wait=wait,
         wait_timeout=wait_timeout,
+        availability_zones=tuple(availability_zones),
+        cheapest_az=cheapest_az,
     )
     if ami_filter:
         config.ami_filter = ami_filter
@@ -402,6 +481,11 @@ def launch(
             ) from None
         success(f"Generated {private_key_path(config.key_path)} (and .pub)")
 
+    # Before any AWS call: a key ssh can't use without a prompt would leave a
+    # launched, billing instance that setup can never reach (BatchMode=yes).
+    if not skip_key_check:
+        check_key_usable(config.key_path)
+
     multi_region = len(config.regions) > 1
     # "us-west-2" for one region; "us-west-2 → us-east-1 → eu-west-1" for many,
     # to make the in-order, one-at-a-time attempt sequence unambiguous.
@@ -411,14 +495,30 @@ def launch(
     has_ebs = config.ebs_storage is not None or config.ebs_volume_id is not None
     total_steps = 4 if has_ebs else 3
 
+    def region_client(region: str):
+        return boto3.Session(profile_name=config.profile, region_name=region).client("ec2")
+
+    az_plans: dict[str, list[AzOption]] = {}
+
+    def az_plan(region: str, ec2r) -> list[AzOption]:
+        """The AZs to try in *region* (empty: EC2 picks). Read-only; cached per region."""
+        if region not in az_plans:
+            wants = az_map.get(region, ())
+            az_plans[region] = (
+                plan_azs(ec2r, region, config.instance_type, explicit=wants, cheapest=config.cheapest_az)
+                if wants or config.cheapest_az
+                else []
+            )
+        return az_plans[region]
+
     def prepare_region(region: str) -> RegionContext:
-        """Build region-scoped prerequisites: client, AMI, key pair, security group.
+        """Build region-scoped prerequisites: client, AMI, key pair, security group, AZs.
 
         Setup failures (no matching AMI, no default VPC, …) are region-specific —
         prefix them with the region so the message is unambiguous in
         multi-region mode.
         """
-        ec2r = boto3.Session(profile_name=config.profile, region_name=region).client("ec2")
+        ec2r = region_client(region)
         if multi_region:
             _region_rule(region)
         try:
@@ -430,6 +530,10 @@ def launch(
             ami_r = get_latest_ami(ec2r, config.ami_filter, architecture=arch)
             if is_text():
                 click.echo(f"  {_rtag(region)} " + click.style(f"AMI {ami_r['ImageId']}", dim=True))
+            plan = az_plan(region, ec2r)
+            if plan and is_text():
+                tries = click.style(f"AZs to try: {_az_plan_label(plan, pricing)}", dim=True)
+                click.echo(f"  {_rtag(region)} {tries}")
             effective_key = import_key_pair(ec2r, config.key_name, config.key_path)
             sg_id_r = ensure_security_group(ec2r, config.security_group, config.tag_value, ssh_port=config.ssh_port)
         except CLIError as e:
@@ -437,14 +541,31 @@ def launch(
         # Pin the instance to an existing data volume's AZ (EBS is AZ-scoped, so
         # a random AZ would fail to attach). resolve_ebs_placement_az raises a
         # region-named CLIError if the volume isn't in this region.
-        placement_az = resolve_ebs_placement_az(ec2r, config.ebs_volume_id, region) if config.ebs_volume_id else None
+        if config.ebs_volume_id:
+            placement_azs: tuple[str, ...] = (resolve_ebs_placement_az(ec2r, config.ebs_volume_id, region),)
+        else:
+            placement_azs = tuple(o.zone for o in plan)
         return RegionContext(
-            region=region, ec2_client=ec2r, ami=ami_r, sg_id=sg_id_r, key_name=effective_key, placement_az=placement_az
+            region=region,
+            ec2_client=ec2r,
+            ami=ami_r,
+            sg_id=sg_id_r,
+            key_name=effective_key,
+            placement_azs=placement_azs,
+            az_prices={o.zone: o.spot_price for o in plan if o.spot_price is not None},
         )
 
     if config.dry_run:
         ctx0 = prepare_region(config.regions[0])
         ami = ctx0.ami
+        # The AZ plan of every region (read-only calls), not only the one prepared above.
+        dry_plans: dict[str, list[AzOption]] = {}
+        if az_map or config.cheapest_az:
+            for r in config.regions:
+                try:
+                    dry_plans[r] = az_plan(r, ctx0.ec2_client if r == ctx0.region else region_client(r))
+                except CLIError as e:
+                    raise CLIError(f"[{r}] {e.format_message()}") from None
         if is_text(ctx):
             click.echo()
             click.secho("--- Dry Run Summary ---", bold=True, fg="yellow")
@@ -455,6 +576,9 @@ def launch(
             val("Security group", ctx0.sg_id)
             val("Volume", f"{config.volume_size} GB gp3")
             val("Region(s)", regions_label)
+            for r, plan in dry_plans.items():
+                label = _az_plan_label(plan, pricing) if plan else "chosen by EC2"
+                val(f"AZs ({r})" if multi_region or len(dry_plans) > 1 else "AZs", label)
             if config.wait:
                 val("Wait", f"yes (timeout {config.wait_timeout}s)")
             val("Remote setup", "yes" if config.run_setup else "no")
@@ -481,7 +605,21 @@ def launch(
                 "regions": list(config.regions),
                 "wait": config.wait,
                 "wait_timeout_seconds": config.wait_timeout,
+                # Per region, the AZs that would be tried in order (null: EC2 chooses).
+                "availability_zones": (
+                    {
+                        r: [{"zone": o.zone, "spot_price": o.spot_price} for o in plan] or None
+                        for r, plan in dry_plans.items()
+                    }
+                    if dry_plans
+                    else None
+                ),
             }
+            if dry_plans and get_format(ctx) == OutputFormat.TABLE:
+                # A nested mapping renders as a Python repr in the key/value table.
+                result["availability_zones"] = "; ".join(
+                    f"{r}: {_az_plan_label(plan, pricing) if plan else 'EC2 chooses'}" for r, plan in dry_plans.items()
+                )
             if config.ssh_port != SSH_PORT_DEFAULT:
                 result["ssh_port"] = config.ssh_port
             if config.python_version:
@@ -502,10 +640,14 @@ def launch(
         caption = f"Launching {config.instance_type} ({pricing}) in {regions_label}..."
     step(1, total_steps, caption)
 
-    def on_attempt(region: str, market: str, attempt: int) -> None:
+    def on_attempt(region: str, market: str, attempt: int, az: str | None) -> None:
         if is_text():
             verb = click.style(f"requesting {market}", fg="cyan", bold=True)
-            click.echo(f"  {_rtag(region)} {verb} {config.instance_type}…")
+            where = ""
+            if az:
+                price = next((o.spot_price for o in az_plans.get(region, []) if o.zone == az), None)
+                where = f" in {az}" + (f" (${price:.3f}/h)" if market == "spot" and price is not None else "")
+            click.echo(f"  {_rtag(region)} {verb} {config.instance_type}{where}…")
 
     def on_wait(cycle: int, sleep_s: float, elapsed: float, retrying: list[str], skipped: list[str]) -> None:
         if is_text():
@@ -542,9 +684,17 @@ def launch(
     pricing = launched.pricing
     instance = launched.instance
     instance_id = instance["InstanceId"]
+    az = instance.get("Placement", {}).get("AvailabilityZone", "")
+    # Spot price of the AZ it landed in: from the AZ plan, else one best-effort
+    # lookup (never raises — the instance already exists and is billing).
+    spot_price: float | None = None
+    if pricing == "spot" and az:
+        spot_price = launched.context.az_prices.get(az) or spot_price_or_none(ec2, config.instance_type, az)
     val("Instance ID", instance_id)
     val("Region", active_region)
     val("Pricing", pricing)
+    if az:
+        val("Availability zone", _az_label(az, spot_price))
 
     # Step 2: Wait for ready
     step(2, total_steps, "Waiting for instance to be ready...")
@@ -574,6 +724,7 @@ def launch(
                     "availability_zone": az,
                     "region": active_region,
                     "pricing": pricing,
+                    **({"spot_price_per_hour": spot_price} if spot_price is not None else {}),
                     "error": message,
                     # The volume is created and attached *before* the SSH wait, so
                     # an ssh-unavailable launch is already billing for it too —
@@ -687,6 +838,8 @@ def launch(
             "regions_tried": list(config.regions),
             "ssh_alias": alias,
         }
+        if spot_price is not None:
+            result_data["spot_price_per_hour"] = spot_price
         if cuda_version:
             result_data["cuda_version"] = cuda_version
         if ebs_volume_attached:
@@ -710,6 +863,7 @@ def launch(
     val("Public IP", public_ip)
     val("Instance", config.instance_type)
     val("Region", active_region)
+    val("Availability zone", _az_label(az, spot_price))
     val("Pricing", pricing)
     if cuda_version:
         val("CUDA Version", cuda_version)
@@ -1930,6 +2084,26 @@ def cluster_cmd():
     show_default="30m",
     help="Max time to wait per node for spot capacity when --wait is set (e.g. 30m, 90s, 1h).",
 )
+@click.option(
+    "--availability-zone",
+    "--az",
+    "availability_zone",
+    default=None,
+    metavar="AZ",
+    help="AZ for a new cluster (implies its region). An existing cluster stays in its own AZ.",
+)
+@click.option(
+    "--cheapest-az",
+    is_flag=True,
+    default=False,
+    help="Spot only, new cluster: try the region's AZs cheapest-first for the first node; the rest follow it.",
+)
+@click.option(
+    "--skip-key-check",
+    is_flag=True,
+    default=False,
+    help="Skip the pre-launch check that the SSH key works without a passphrase prompt.",
+)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def cluster_launch(
@@ -1948,10 +2122,15 @@ def cluster_launch(
     python_version,
     wait,
     wait_timeout,
+    availability_zone,
+    cheapest_az,
+    skip_key_check,
     profile,
 ):
     """Launch (or grow) a training cluster to N nodes in one AZ + placement group."""
-    region = resolve_single_region(regions[0] if regions else None, profile)
+    az_flag = (availability_zone,) if availability_zone else ()
+    explicit_regions, _ = _validate_az_flags(az_flag, cheapest_az, spot, None, tuple(regions[:1]))
+    region = resolve_single_region(explicit_regions[0] if explicit_regions else None, profile)
     ec2 = boto3.Session(profile_name=profile, region_name=region).client("ec2")
 
     existing = find_cluster_instances(ec2, cluster_id)
@@ -1963,9 +2142,21 @@ def cluster_launch(
         emit({"cluster_id": cluster_id, "nodes_added": 0, "node_count": len(existing)}, ctx=ctx)
         return
 
+    existing_az = existing[0]["AvailabilityZone"] if existing else None
+    if existing_az and availability_zone and availability_zone != existing_az:
+        raise CLIError(
+            f"Cluster '{cluster_id}' is in {existing_az}; its nodes share one AZ and placement group, so it "
+            f"can't grow into {availability_zone}. Use a new --cluster-id for another AZ."
+        )
+    if existing_az and cheapest_az:
+        info(f"Note: cluster '{cluster_id}' is already in {existing_az}; --cheapest-az only applies to a new cluster.")
+
     key = Path(key_path).expanduser()
     if not key.exists():
         generate_ssh_keypair(key)
+    # Before creating anything: every node would be unreachable with a key ssh can't use unprompted.
+    if not skip_key_check:
+        check_key_usable(key)
 
     pg_name = cluster_mod.placement_group_name(cluster_id)
     ensure_cluster_placement_group(ec2, pg_name, TAG_VALUE)
@@ -1990,8 +2181,16 @@ def cluster_launch(
         config.profile = profile
 
     # AZ is captured from the first launched node and pinned for the rest;
-    # AMI/key are looked up once and reused across nodes.
-    shared: dict = {"az": existing[0]["AvailabilityZone"] if existing else None, "ami": None, "key": None}
+    # AMI/key are looked up once and reused across nodes. A new cluster's first
+    # node may get an AZ plan (--availability-zone / --cheapest-az) to try in order.
+    shared: dict = {"az": existing_az, "ami": None, "key": None}
+    first_plan: list[AzOption] = []
+    if not existing_az and (az_flag or cheapest_az):
+        try:
+            first_plan = plan_azs(ec2, region, instance_type, explicit=az_flag, cheapest=cheapest_az)
+        except CLIError as e:
+            raise CLIError(f"[{region}] {e.format_message()}") from None
+        info(f"AZs to try for the first node: {_az_plan_label(first_plan, 'spot' if spot else 'on-demand')}")
 
     def prepare_region(r: str) -> RegionContext:
         if shared["ami"] is None:
@@ -2005,8 +2204,9 @@ def cluster_launch(
             ami=shared["ami"],
             sg_id=sg_id,
             key_name=shared["key"],
-            placement_az=shared["az"],
+            placement_azs=(shared["az"],) if shared["az"] else tuple(o.zone for o in first_plan),
             placement_group=pg_name,
+            az_prices={o.zone: o.spot_price for o in first_plan if o.spot_price is not None},
         )
 
     added: list[dict] = []

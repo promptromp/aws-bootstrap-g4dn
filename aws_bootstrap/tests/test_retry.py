@@ -9,7 +9,9 @@ from aws_bootstrap.retry import (
     BACKOFF_CAP,
     BACKOFF_JITTER,
     backoff_sleep_seconds,
+    group_azs_by_region,
     parse_duration,
+    region_of_az,
     resolve_regions,
 )
 
@@ -83,3 +85,49 @@ def test_backoff_jitter_within_bounds_and_deterministic_with_seed():
 
 def test_backoff_never_negative():
     assert backoff_sleep_seconds(0, jitter=1.0, rng=random.Random(0)) >= 0.0
+
+
+# --- region_of_az / group_azs_by_region --------------------------------------
+
+
+@pytest.mark.parametrize(
+    "az,region",
+    [
+        ("us-west-2b", "us-west-2"),
+        ("ap-southeast-1c", "ap-southeast-1"),
+        ("il-central-1a", "il-central-1"),
+        ("us-gov-west-1a", "us-gov-west-1"),
+        ("us-west-2-lax-1a", "us-west-2"),  # Local Zone
+        ("us-east-1-wl1-bos-wlz-1", "us-east-1"),  # Wavelength Zone
+    ],
+)
+def test_region_of_az(az, region):
+    assert region_of_az(az) == region
+
+
+@pytest.mark.parametrize("bad", ["us-west-2", "useast1a", "", "us-west-2B"])
+def test_region_of_az_rejects_non_az_names(bad):
+    with pytest.raises(ValueError, match="Not an availability zone"):
+        region_of_az(bad)
+
+
+def test_group_azs_without_regions_uses_the_azs_regions_in_first_seen_order():
+    regions, by_region = group_azs_by_region((), ("us-west-2b", "us-east-1c", "us-west-2a", "us-west-2b"))
+    assert regions == ("us-west-2", "us-east-1")
+    assert by_region == {"us-west-2": ("us-west-2b", "us-west-2a"), "us-east-1": ("us-east-1c",)}
+
+
+def test_group_azs_keeps_explicit_region_order():
+    regions, by_region = group_azs_by_region(("us-east-1", "us-west-2"), ("us-west-2b",))
+    assert regions == ("us-east-1", "us-west-2")
+    assert by_region == {"us-west-2": ("us-west-2b",)}
+
+
+def test_group_azs_rejects_an_az_outside_the_given_regions():
+    with pytest.raises(ValueError, match="us-east-1c is not in any --region"):
+        group_azs_by_region(("us-west-2",), ("us-east-1c",))
+
+
+def test_group_azs_no_azs_is_a_no_op():
+    assert group_azs_by_region(("us-west-2",), ()) == (("us-west-2",), {})
+    assert group_azs_by_region((), ()) == ((), {})

@@ -111,6 +111,13 @@ aws-bootstrap launch --key-path ~/.ssh/my_other_key.pub
 - **Missing local key** — if `--key-path` doesn't exist, `launch` auto-generates an Ed25519 key pair there (instead of aborting).
 - **Name collision with a different key** — if an AWS key pair already exists with the target `--key-name` but its public key differs from your local key (e.g. created from another machine), the existing AWS key pair is **left untouched** and your local key is imported under a deterministic derived name `aws-bootstrap-key-<fp8>`, which the instance is launched with. You always hold the matching private key.
 - **Unreachable instance** — if SSH still fails with an authentication/host-key error, `launch` **stops immediately** and prints the real `ssh` error (no more silent 5-minute "SSH not ready" loop masking a `Permission denied (publickey)`).
+- **Passphrase-protected key** — the CLI connects with `BatchMode=yes` (it never prompts), so before
+  any AWS call `launch` / `cluster launch` (including `--dry-run`) check that the key works without
+  a prompt: no passphrase, or loaded in ssh-agent. If not, they stop *before* creating a billed
+  instance setup could never reach, and print the fix (`ssh-add --apple-use-keychain <key>` on
+  macOS, `ssh-add <key>` elsewhere). With `UseKeychain yes` in `~/.ssh/config` the macOS Keychain
+  may supply the passphrase, which can't be checked, so the CLI only warns. `--skip-key-check`
+  turns the check off (e.g. for a passphrase supplied by an `IdentityAgent` it can't see).
 
 ## Usage
 
@@ -151,6 +158,12 @@ aws-bootstrap launch --ebs-storage 96
 # Reattach an existing EBS volume from a previous instance
 aws-bootstrap launch --ebs-volume-id vol-0abc123def456
 
+# Spot prices differ a lot between AZs: try each region's AZs cheapest-first
+aws-bootstrap launch --instance-type g6e.2xlarge --cheapest-az --region us-west-2 --region us-east-1
+
+# Or pick the AZ yourself (implies its region; repeatable, tried in order)
+aws-bootstrap launch --availability-zone us-west-2b --ebs-storage 200
+
 # Use a specific AWS profile
 aws-bootstrap launch --profile my-aws-profile
 ```
@@ -189,6 +202,31 @@ Spot `InsufficientInstanceCapacity` is scoped to a **region and availability zon
 Quota errors (`VcpuLimitExceeded`, `MaxSpotInstanceCountExceeded`) and `SpotMaxPriceTooLow` are **never retried by `--wait`** (waiting can't fix them). In multi-region mode they are *not* fatal on their own: the launcher prints a `WARNING` for that region (with a region-pinned `aws-bootstrap quota …` hint), skips it, and tries the next `--region` — failing hard only once **every** region is blocked, with an aggregated message listing each region's reason and hint. Without `--wait`, a fully-exhausted spot pass still offers the interactive on-demand fallback (across all regions).
 
 **Region default precedence** (a behavior change — previously hardcoded to `us-west-2`): explicit `--region` flags → `AWS_DEFAULT_REGION` / active profile region → `us-west-2`. This applies to every command, so a profile configured for `us-east-1` now operates in `us-east-1` by default. The active region is shown in command output.
+
+#### Choosing the availability zone (`--cheapest-az`, `--availability-zone`)
+
+By default EC2 picks the AZ within each region, but **spot prices can differ several-fold between AZs
+of the same region** (e.g. g6e.2xlarge: us-west-2b $0.99/h vs $2.21/h in us-west-2a/c/d). The AZ also
+matters with `--ebs-storage`: the new volume is created in the instance's AZ, and every later
+`--ebs-volume-id` reattach is pinned there.
+
+- **`--cheapest-az`** (spot only) ranks each region's AZs that offer the type (and have a default
+  subnet) by **current spot price** and tries them cheapest-first. A capacity miss moves to the next
+  AZ in the same region before the next region.
+- **`--availability-zone AZ`** / **`--az AZ`** (repeatable) restricts the launch to those AZs, tried in
+  the order given. An AZ implies its region: without `--region`, the regions are the AZs' own. With
+  `--cheapest-az` too, only the listed AZs are ranked.
+- The chosen AZ and its spot price are always printed (`spot_price_per_hour` in structured output),
+  and `--dry-run` shows the AZ plan for every `--region`.
+
+Price semantics, stated plainly:
+- **Region order still comes first.** Ranking happens *within* a region, so with `--region us-west-2
+  --region us-east-1` every us-west-2 AZ (even a $2.21 one) is tried before us-east-1's cheapest.
+- **A capacity miss can cost you.** Falling through from the cheapest AZ lands in the next one, which
+  may be much pricier (and, with `--ebs-storage`, pins the volume there). For *the cheap AZ or
+  nothing*, pin it and wait: `--availability-zone us-west-2b --wait`.
+- Both flags are incompatible with `--ebs-volume-id` (the volume already decides the AZ);
+  `--cheapest-az` is incompatible with `--on-demand` (on-demand prices don't vary by AZ).
 
 See [docs/capacity-and-retry.md](docs/capacity-and-retry.md) for the backoff design and recommended region lists per instance family.
 
@@ -489,7 +527,7 @@ aws-bootstrap cluster terminate --cluster-id ml1 --yes
 ```
 
 Key behaviors:
-- **One AZ + cluster placement group** — all nodes land in the same availability zone inside a cluster placement group for low-latency NCCL communication. Incremental adds reuse that AZ.
+- **One AZ + cluster placement group** — all nodes land in the same availability zone inside a cluster placement group for low-latency NCCL communication. Incremental adds reuse that AZ. For a **new** cluster, `--availability-zone AZ` picks that AZ and `--cheapest-az` (spot) tries the region's AZs cheapest-first for the first node; the rest follow it. An existing cluster stays in its own AZ.
 - **Shared security group** — a self-referencing ingress rule lets cluster members reach each other on the NCCL/rendezvous ports (in addition to SSH).
 - **Per-node SSH aliases** — each node gets an `aws-<cluster-id>-<rank>` alias in `~/.ssh/config` (e.g. `ssh aws-ml1-0`).
 - **Stable ranks** — nodes are tagged with a stable rank (`0..N-1`); rank 0 is the rendezvous/master node (it also trains).

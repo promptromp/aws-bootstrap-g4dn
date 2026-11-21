@@ -291,7 +291,7 @@ def test_launch_with_retry_falls_through_to_second_region_on_capacity():
     result = launch_with_retry(
         config,
         lambda r: contexts[r],
-        on_attempt=lambda region, market, attempt: calls.append(f"{region}:{market}"),
+        on_attempt=lambda region, market, attempt, az: calls.append(f"{region}:{market}"),
     )
     assert isinstance(result, RegionLaunch)
     assert result.region == "us-east-1"
@@ -985,7 +985,7 @@ def test_launch_with_retry_passes_placement_az_to_run_instances():
         ami={"ImageId": "ami-east"},
         sg_id="sg-1",
         key_name="aws-bootstrap-key",
-        placement_az="us-east-1c",
+        placement_azs=("us-east-1c",),
     )
     config = LaunchConfig(regions=("us-east-1",), spot=True, ebs_volume_id="vol-abc")
 
@@ -1181,7 +1181,7 @@ def test_launch_with_retry_threads_placement_group():
         ami={"ImageId": "ami-east"},
         sg_id="sg-1",
         key_name="aws-bootstrap-key",
-        placement_az="us-east-1c",
+        placement_azs=("us-east-1c",),
         placement_group="aws-bootstrap-cluster-ml1",
     )
     launch_with_retry(LaunchConfig(regions=("us-east-1",), spot=True), lambda r: ctx)

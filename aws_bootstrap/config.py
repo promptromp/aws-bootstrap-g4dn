@@ -49,6 +49,10 @@ class LaunchConfig:
     ebs_volume_id: str | None = None
     wait: bool = False
     wait_timeout: int = DEFAULT_WAIT_TIMEOUT
+    # --availability-zone values (each implies its region; tried in the order given),
+    # and --cheapest-az (rank each region's AZs by current spot price, cheapest first).
+    availability_zones: tuple[str, ...] = ()
+    cheapest_az: bool = False
 
     @property
     def region(self) -> str:
