@@ -68,7 +68,7 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 
 | Command | Purpose | Key Options |
 |---------|---------|-------------|
-| `aws-bootstrap launch` | Provision a GPU instance (spot by default) | `--instance-type`, `--spot/--on-demand`, `--region` (repeatable), `--wait`, `--wait-timeout`, `--ebs-storage`, `--dry-run` |
+| `aws-bootstrap launch` | Provision a GPU instance (spot by default) | `--instance-type`, `--spot/--on-demand`, `--region` (repeatable), `--wait`, `--wait-timeout`, `--cheapest-az`, `--availability-zone`, `--ebs-storage`, `--dry-run` |
 | `aws-bootstrap status` | List running instances (all enabled regions by default) with region, IPs, pricing; also reports orphaned EBS data volumes (detached, still billed) with cost estimates | `--gpu` (CUDA info), `--region/-r` (repeatable), `--no-instructions` |
 | `aws-bootstrap terminate` | Terminate instances and clean up | `[ID_OR_ALIAS...]`, `--keep-ebs`, `--yes` |
 | `aws-bootstrap cleanup` | Sync `~/.ssh/config` with live instances across ALL regions (remove stale; `--sync` adds missing / repairs drifted) | `--sync`, `--include-ebs`, `--dry-run`, `--yes` |
@@ -77,7 +77,7 @@ You can check if the CLI is installed by running: `aws-bootstrap --version`
 | `aws-bootstrap quota show` | Show GPU vCPU quotas (all families) | `--family`, `--region/-r` (repeatable) |
 | `aws-bootstrap quota request` | Request a quota increase (per region) | `--family`, `--type`, `--desired-value`, `--region/-r` (repeatable), `--yes` |
 | `aws-bootstrap quota history` | Show quota increase request history | `--family`, `--type`, `--status`, `--region/-r` (repeatable) |
-| `aws-bootstrap cluster launch` | Launch/grow a multi-node training cluster (1 AZ + placement group) | `--cluster-id` (required), `--nodes`, `--instance-type`, `--region`, `--spot/--on-demand`, `--wait`, `--wait-timeout` |
+| `aws-bootstrap cluster launch` | Launch/grow a multi-node training cluster (1 AZ + placement group) | `--cluster-id` (required), `--nodes`, `--instance-type`, `--region`, `--spot/--on-demand`, `--wait`, `--wait-timeout`, `--cheapest-az`, `--availability-zone` |
 | `aws-bootstrap cluster status` | Show cluster nodes (rank/state/AZ/IP); omit `--cluster-id` to list all clusters | `--cluster-id`, `--region` |
 | `aws-bootstrap cluster prepare` | Verify nodes (reachable/GPU/consistent CUDA), write config, run a distributed canary | `--cluster-id` (required), `--key-path`, `--no-canary` |
 | `aws-bootstrap cluster test` | Re-run the distributed canary across the cluster (heartbeat) | `--cluster-id` (required), `--key-path` |
@@ -290,10 +290,12 @@ The `/data` volume is **not lost on spot interruption** — when AWS reclaims th
 ## Error Handling
 
 - **Spot capacity errors** (`InsufficientInstanceCapacity`): prefer multiple `--region` values (tried in order) and/or `--wait --wait-timeout` over manual retry loops — the CLI handles bounded backoff internally. Without `--wait`, an exhausted spot pass auto-falls back to on-demand in structured modes. `--wait` hard-fails on timeout (it does not auto-buy on-demand).
+- **Spot price differs by AZ** (often 2x or more within one region): add `--cheapest-az` to try a region's AZs cheapest-first. Check the plan with `--dry-run` (`availability_zones`), and read `spot_price_per_hour` from the result. Region order still outranks price, and a capacity miss falls through to a pricier AZ. Use `--availability-zone <az> --wait` for cheap-or-nothing; with `--ebs-storage` the volume stays in that AZ for later reattaches.
 - **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`) and `SpotMaxPriceTooLow`: never retried by `--wait`, but in multi-region mode the launcher warns (with a region-pinned hint) and tries the next `--region`; it fails hard only when every region is blocked. Quotas are per-region — the suggested `aws-bootstrap quota show` / `quota request` commands are auto-pinned to `--region <failed-region>`. Run them as-is; other families: `--family p` (P2-P6), `--family dl`.
 - **`No arm64 AMI found matching filter: ...`** (or `No x86_64 …`): with a **custom** `--ami-filter`, the filter was most likely written for the other CPU architecture (AWS names ARM64 Deep Learning AMIs `Deep Learning ARM64 …`) — drop it (the default resolves for either architecture, including arm64 `g5g`) or fix it; changing `--region` won't help that case. With the **default** filter, the region doesn't publish the image — retry with another `--region`. Either way the error prints a region-pinned `aws-bootstrap list amis --arch <arch> --region <r>` to see what exists.
 - **SSH key handling**: a missing local `--key-path` is auto-generated (ed25519); if an AWS key pair with the target `--key-name` exists but is a *different* key, the existing one is left untouched and the local key is imported under a derived name `<key-name>-<fp8>` so the instance is always reachable.
 - **SSH auth failure**: `launch` fails fast (no long retry loop) and surfaces the real `ssh` error (e.g. `Permission denied (publickey)`) instead of a generic "SSH not ready" — indicates a key mismatch; relaunch with the correct `--key-name`/`--key-path`.
+- **`SSH key ... has a passphrase and isn't loaded in ssh-agent`** (exit 1, before anything is created): aws-bootstrap connects without prompts. Ask the user to run the printed `ssh-add --apple-use-keychain <key>` (macOS) / `ssh-add <key>` in their own terminal, or relaunch with a passphrase-less `--key-path`. Use `--skip-key-check` only if the passphrase is supplied another way. A stderr *warning* about the macOS Keychain (`UseKeychain`) does not stop the launch.
 - **SSH timeouts**: Instance may still be initializing -- check `aws-bootstrap status`
 - **No public IP**: Check VPC settings or assign an Elastic IP
 - **EBS mount failures**: Non-fatal -- instance remains usable, may need manual mount

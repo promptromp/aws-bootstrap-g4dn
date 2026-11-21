@@ -7,6 +7,24 @@ import pytest
 from click.testing import CliRunner
 
 
+@pytest.fixture(autouse=True)
+def key_check_stub(request):
+    """Stub the CLI's pre-launch SSH key check.
+
+    Most launch tests write only a ``.pub`` into tmp_path, so the real check
+    (private key present, no passphrase or loaded in an agent) would stop them
+    before the code under test. Tests of the check itself carry
+    ``@pytest.mark.real_key_check``, or call ``ssh.check_key_usable`` directly.
+    """
+    if request.node.get_closest_marker("real_key_check"):
+        # The real check, but never against the user's ssh-agent: no agent unless a test fakes one.
+        with patch("aws_bootstrap.ssh._agent_sockets", return_value=[]):
+            yield None
+        return
+    with patch("aws_bootstrap.cli.check_key_usable") as stub:
+        yield stub
+
+
 @pytest.fixture
 def runner():
     """A Click CLI test runner."""

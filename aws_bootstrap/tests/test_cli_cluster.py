@@ -129,7 +129,7 @@ def _launch_side_effect(config, prepare_region, **kw):
         ami={"ImageId": "ami-1"},
         sg_id="sg-123",
         key_name="aws-bootstrap-key",
-        placement_az="us-east-1c",
+        placement_azs=("us-east-1c",),
         placement_group="aws-bootstrap-cluster-ml1",
     )
     return RegionLaunch("us-east-1", ctx, {"InstanceId": "i-x"}, "spot")

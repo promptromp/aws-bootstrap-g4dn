@@ -35,6 +35,50 @@ def resolve_regions(explicit: tuple[str, ...], session_region: str | None) -> tu
     return (DEFAULT_REGION,)
 
 
+# The region an AZ belongs to, from its name: the region is everything up to the first
+# "-<number>" ("us-west-2b", the Local Zone "us-west-2-lax-1a" and the Wavelength Zone
+# "us-east-1-wl1-bos-wlz-1" are in "us-west-2"/"us-east-1"; "us-gov-west-1a" and
+# "eusc-de-east-1a" route to their partitions' regions). Used only to route an AZ to the
+# region to query; the AZ itself is then confirmed against describe_availability_zones.
+_AZ_REGION_RE = re.compile(r"^([a-z]+(?:-[a-z]+)+-\d+)(?:[a-z]|-[a-z0-9-]+)$")
+
+
+def region_of_az(az: str) -> str:
+    """``"us-west-2b"`` -> ``"us-west-2"``. Raises ``ValueError`` for a name that isn't an AZ."""
+    match = _AZ_REGION_RE.match(az.strip())
+    if not match:
+        raise ValueError(f"Not an availability zone name: {az!r} (expected e.g. 'us-west-2b')")
+    return match.group(1)
+
+
+def group_azs_by_region(
+    regions: tuple[str, ...], azs: tuple[str, ...]
+) -> tuple[tuple[str, ...], dict[str, tuple[str, ...]]]:
+    """Merge ``--availability-zone`` values into the ordered region list.
+
+    An AZ implies its region. Without explicit regions, the region list is the AZs'
+    regions in order of first appearance; with them, every AZ must belong to one
+    (``ValueError`` otherwise) and the region order stays as given. Returns the
+    region list and each region's AZs, in the order given (regions without listed AZs
+    are absent from the map: EC2, or ``--cheapest-az``, chooses there).
+    """
+    by_region: dict[str, list[str]] = {}
+    for az in azs:
+        region = region_of_az(az)
+        zones = by_region.setdefault(region, [])
+        if az not in zones:
+            zones.append(az)
+    if not regions:
+        regions = tuple(by_region)
+    else:
+        stray = [az for region, zones in by_region.items() if region not in regions for az in zones]
+        if stray:
+            raise ValueError(
+                f"--availability-zone {', '.join(stray)} is not in any --region given ({', '.join(regions)})"
+            )
+    return regions, {region: tuple(zones) for region, zones in by_region.items()}
+
+
 def parse_duration(value: str) -> int:
     """Parse a duration like ``30m``, ``90s``, ``1h`` or a bare ``3600`` into seconds.
 

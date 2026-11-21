@@ -1,9 +1,11 @@
 """SSH key pair management and SSH config management for EC2 instances."""
 
 from __future__ import annotations
+import base64
 import contextlib
 import hashlib
 import os
+import platform
 import re
 import socket
 import subprocess
@@ -94,6 +96,134 @@ _DEFAULT_SSH_CONFIG = Path.home() / ".ssh" / "config"
 def private_key_path(key_path: Path) -> Path:
     """Derive the private key path from a public key path (strips .pub suffix)."""
     return key_path.with_suffix("") if key_path.suffix == ".pub" else key_path
+
+
+# ---------------------------------------------------------------------------
+# Pre-launch check: can ssh use this key without a prompt?
+# ---------------------------------------------------------------------------
+
+_KEY_TOOL_TIMEOUT = 15  # seconds, for ssh-keygen / ssh-add / ssh -G
+# A TEST-NET-3 address standing in for the instance's public IP, so `ssh -G`
+# resolves the config that applies to the hosts this tool actually connects to.
+_PROBE_HOST = "203.0.113.1"
+
+
+def key_fingerprint(pub_path: Path) -> str:
+    """The key's OpenSSH SHA256 fingerprint (``SHA256:…``), as ``ssh-keygen -lf`` and ``ssh-add -l`` print it.
+
+    Raises ``ValueError`` when *pub_path* isn't an OpenSSH public key.
+    """
+    blob = base64.b64decode(_pubkey_blob(pub_path.read_text()), validate=True)
+    return "SHA256:" + base64.b64encode(hashlib.sha256(blob).digest()).decode().rstrip("=")
+
+
+def _run_key_tool(cmd: list[str], env: dict[str, str] | None = None) -> subprocess.CompletedProcess:
+    return subprocess.run(
+        cmd, stdin=subprocess.DEVNULL, capture_output=True, text=True, timeout=_KEY_TOOL_TIMEOUT, env=env
+    )
+
+
+def _agent_sockets() -> list[str]:
+    """The agent ssh would ask, as ``ssh -G`` resolves it for the hosts this tool connects to.
+
+    ``IdentityAgent`` overrides ``$SSH_AUTH_SOCK`` (ssh_config(5)): ``none`` disables
+    agents, the literal ``SSH_AUTH_SOCK`` means the environment's socket, anything
+    else is a socket path (``~`` and ``$VAR`` expanded, e.g. 1Password's). Without an
+    ``identityagent`` line, ssh uses ``$SSH_AUTH_SOCK``.
+    """
+    env_sock = os.environ.get("SSH_AUTH_SOCK")
+    for line in _run_key_tool(["ssh", "-G", _PROBE_HOST]).stdout.splitlines():
+        key, _, value = line.partition(" ")
+        if key != "identityagent" or not value:
+            continue
+        if value.lower() == "none":
+            return []
+        if value == "SSH_AUTH_SOCK":
+            return [env_sock] if env_sock else []
+        return [os.path.expandvars(os.path.expanduser(value))]
+    return [env_sock] if env_sock else []
+
+
+def _agent_has_key(fingerprint: str) -> bool:
+    for sock in _agent_sockets():
+        result = _run_key_tool(["ssh-add", "-l", "-E", "sha256"], env={**os.environ, "SSH_AUTH_SOCK": sock})
+        if result.returncode == 0 and fingerprint in result.stdout.split():
+            return True
+    return False
+
+
+def _uses_macos_keychain(ssh_config: Path) -> bool:
+    """``UseKeychain yes`` in the ssh config: macOS may then supply the passphrase without a prompt.
+
+    Apple's ``ssh -G`` doesn't report UseKeychain, so the config file is read directly
+    (``Include``d files and the system config are not followed; ``--skip-key-check``
+    covers those).
+    """
+    try:
+        text = ssh_config.read_text()
+    except OSError:
+        return False
+    return any(re.match(r"\s*UseKeychain\s*=?\s*(yes|true)\b", line, re.IGNORECASE) for line in text.splitlines())
+
+
+def check_key_usable(key_path: Path, ssh_config: Path | None = None) -> None:
+    """Fail before launch when ssh can't use *key_path* without prompting.
+
+    Every ssh/scp call runs with ``BatchMode=yes`` (:func:`_ssh_opts`), which never
+    prompts. A passphrase-protected key that nothing unlocks would leave a launched,
+    billing instance that setup can never reach. Passes when the agent ssh would use
+    holds the key (even with no private key file on disk, as with 1Password), or the
+    private key has no passphrase. On macOS, only warns when ``UseKeychain`` is
+    configured (the Keychain may hold the passphrase, which can't be checked without
+    side effects). Also only warns when the ssh tools needed to check are missing.
+    """
+    priv = private_key_path(key_path)
+    load = f"ssh-add --apple-use-keychain {priv}" if platform.system() == "Darwin" else f"ssh-add {priv}"
+    try:
+        fingerprint = key_fingerprint(key_path) if key_path.exists() else None
+    except ValueError:
+        raise CLIError(f"{key_path} is not an OpenSSH public key (pass --key-path to a .pub file).") from None
+    try:
+        in_agent = fingerprint is not None and _agent_has_key(fingerprint)
+    except (OSError, subprocess.TimeoutExpired):
+        in_agent = False  # agent unreachable (or `ssh -G` stalled): judge the key file on its own
+    if in_agent:
+        return  # ssh uses the agent's copy; the file's passphrase doesn't matter
+    try:
+        if not priv.exists():
+            raise CLIError(
+                f"SSH private key not found: {priv}, and no ssh-agent holds {key_path}.\n"
+                "  The key would be imported to AWS, but ssh could never authenticate to the instance.\n"
+                "  Pass --key-path to a public key whose private key is next to it (same name without .pub),\n"
+                "  or load the key into your agent."
+            )
+        probe = _run_key_tool(["ssh-keygen", "-y", "-P", "", "-f", str(priv)])
+        if probe.returncode == 0:
+            return  # no passphrase
+        if "UNPROTECTED PRIVATE KEY FILE" in probe.stderr:
+            raise CLIError(
+                f"SSH private key {priv} is readable by others, so ssh will refuse it.\n  Fix: chmod 600 {priv}"
+            )
+    except (OSError, subprocess.TimeoutExpired) as e:
+        click.echo(f"  WARNING: could not check whether {priv} works without a prompt ({e}); continuing.", err=True)
+        return
+    if platform.system() == "Darwin" and _uses_macos_keychain(ssh_config or _DEFAULT_SSH_CONFIG):
+        click.echo(
+            click.style("  WARNING: ", fg="yellow", bold=True)
+            + f"{priv} has a passphrase and isn't loaded in ssh-agent. Relying on the macOS Keychain\n"
+            "  (UseKeychain yes in your ssh config) to supply it; if the Keychain doesn't hold it, SSH to the\n"
+            f"  instance will fail after it launches. To be sure, load it once:  {load}",
+            err=True,
+        )
+        return
+    raise CLIError(
+        f"SSH key {priv} has a passphrase and isn't loaded in ssh-agent.\n"
+        "  aws-bootstrap connects with BatchMode=yes (no prompts), so the instance would launch and bill,\n"
+        "  but setup could never connect to it. Before launching, either:\n"
+        f"    - load it into the agent once:  {load}\n"
+        "    - or pass a key without a passphrase:  --key-path <key>.pub\n"
+        "  Or pass --skip-key-check if your ssh setup supplies the passphrase some other way."
+    )
 
 
 def _ssh_opts(key_path: Path, connect_timeout: int = SSH_CONNECT_TIMEOUT) -> list[str]:

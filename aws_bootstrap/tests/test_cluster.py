@@ -54,7 +54,7 @@ def _fake_launch(rank_holder):
             ami={"ImageId": "ami-x"},
             sg_id="sg-1",
             key_name="k",
-            placement_az="us-east-1c",
+            placement_azs=("us-east-1c",),
             placement_group="aws-bootstrap-cluster-ml1",
         )
         return RegionLaunch("us-east-1", ctx, {"InstanceId": f"i-{i}"}, "spot")

@@ -4,7 +4,7 @@ from __future__ import annotations
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from fractions import Fraction
 
@@ -375,13 +375,20 @@ class RegionContext:
     # Effective key-pair name for this region — may differ from config.key_name
     # when import_key_pair had to side-step a mismatched same-named pair.
     key_name: str
-    # AZ to pin the instance to (the AZ of an existing --ebs-volume-id), or None
-    # to let AWS pick. EBS volumes are AZ-scoped, so an instance must launch in
-    # the volume's AZ to be able to attach it.
-    placement_az: str | None = None
+    # AZs to try, in order; empty lets EC2 pick. A single AZ is a hard pin: the AZ
+    # of an existing --ebs-volume-id (EBS volumes are AZ-scoped, so the instance
+    # must launch there to attach it) or of a cluster's first node. Several come
+    # from --availability-zone / --cheapest-az: a capacity miss in one moves to the next.
+    placement_azs: tuple[str, ...] = ()
     # Cluster placement-group name to launch into, or None. Set for cluster
     # nodes so they land in the same group (and AZ) for fast NCCL comms.
     placement_group: str | None = None
+    # Current spot price per AZ in placement_azs (for display), where known.
+    az_prices: dict[str, float] = field(default_factory=dict)
+    # The single AZ in placement_azs is required, not a preference: an existing
+    # --ebs-volume-id's AZ, or a cluster's. An AZ-level failure there can't be
+    # routed around by trying another AZ (a plan that happens to hold one AZ can).
+    hard_pin: bool = False
 
 
 @dataclass
@@ -492,22 +499,46 @@ def _run_instances(
                 f"Spot price for {config.instance_type} in {region} exceeds the default maximum.\n\n"
                 "  Waiting will not help — retry with --on-demand or a different instance type.",
             ) from None
+        if code == "Unsupported" and placement_az:
+            # Often the type isn't offered in this AZ, so another AZ of the region may
+            # work; the sweep decides (a hard pin re-raises the original error).
+            aws_msg = e.response["Error"].get("Message", "")
+            raise AzUnsupportedError(f"{placement_az}: {aws_msg or 'request unsupported'}") from None
         raise
     return response["Instances"][0]
 
 
-def _describe_failures(regions: tuple[str, ...], failures: dict[str, tuple[str, str]], market: str) -> str:
-    """One '- region: reason' line per region, in attempt order."""
+class AzUnsupportedError(Exception):
+    """EC2 returned ``Unsupported`` for a launch pinned to an AZ (message keeps AWS's text).
+
+    The sweep moves on to the region's next AZ; if every AZ of the plan raises it,
+    the region is dropped like a quota/price failure. For a hard pin
+    (``RegionContext.hard_pin``: an ``--ebs-volume-id`` or cluster AZ, where no
+    other AZ will do) it becomes a region-named ``CLIError`` carrying AWS's text.
+    Never justifies a ``--wait`` sleep.
+    """
+
+
+def _describe_failures(
+    regions: tuple[str, ...],
+    failures: dict[str, tuple[str, str]],
+    market: str,
+    azs_tried: dict[str, list[str]] | None = None,
+) -> str:
+    """One '- region: reason' line per region, in attempt order (naming the AZs tried, if pinned)."""
     reason = {
         "capacity": f"no {market} capacity",
         "quota": f"{market} quota exceeded",
         "price": "spot price exceeds the default maximum",
+        "unsupported": "instance type not supported in the requested AZs",
     }
     lines = []
     for region in regions:
         if region in failures:
             kind = failures[region][0]
-            lines.append(f"    - {region}: {reason.get(kind, kind)}")
+            tried = (azs_tried or {}).get(region)
+            where = f" (tried {', '.join(tried)})" if tried else ""
+            lines.append(f"    - {region}: {reason.get(kind, kind)}{where}")
     return "\n".join(lines)
 
 
@@ -518,18 +549,27 @@ def _aggregated_error(
     market: str,
     *,
     suffix: str = "",
+    azs_tried: dict[str, list[str]] | None = None,
 ) -> CLIError:
     """Hard-fail message: per-region reasons + full hint for every quota/price region."""
     header = f"Could not launch {config.instance_type} ({market}) in any region{suffix}:\n\n"
-    body = _describe_failures(regions, failures, market)
+    body = _describe_failures(regions, failures, market, azs_tried)
     hints: list[str] = []
     for region in regions:
-        if region in failures and failures[region][0] in ("quota", "price"):
+        if region in failures and failures[region][0] in ("quota", "price", "unsupported"):
             msg = failures[region][1]
             if msg not in hints:
                 hints.append(msg)
     if hints:
         tail = "\n\n" + "\n\n".join(f"  {h}" for h in hints)
+        if all(kind == "unsupported" for kind, _ in failures.values()):
+            tail += "\n\n  The AZs tried don't support this launch. List the AZs that do, per region, with:"
+            for region in regions:
+                if failures.get(region, ("",))[0] == "unsupported":
+                    tail += (
+                        f"\n    aws-bootstrap launch --dry-run --cheapest-az --instance-type {config.instance_type}"
+                        f" --region {region}"
+                    )
     else:
         tail = "\n\n  Try --wait, more --region values, --on-demand, or a different instance type."
     return CLIError(header + body + tail)
@@ -539,7 +579,7 @@ def launch_with_retry(
     config: LaunchConfig,
     prepare_region: Callable[[str], RegionContext],
     *,
-    on_attempt: Callable[[str, str, int], None] | None = None,
+    on_attempt: Callable[[str, str, int, str | None], None] | None = None,
     on_wait: Callable[[int, float, float, list[str], list[str]], None] | None = None,
     on_region_fatal: Callable[[str, str, str], None] | None = None,
     confirm_on_demand: Callable[[], bool] | None = None,
@@ -560,10 +600,19 @@ def launch_with_retry(
     each quota/price region. Without ``--wait``, a fully-exhausted spot sweep
     offers the on-demand fallback (across all regions).
 
-    ``prepare_region`` builds region-scoped prerequisites (client, AMI, SG); it
-    is invoked at most once per region and cached. ``on_attempt(region, market,
-    attempt)``'s ``attempt`` is the 0-based ``--wait`` backoff-cycle index; it
-    stays ``0`` outside the wait loop (no-wait pass and on-demand fallback).
+    ``prepare_region`` builds region-scoped prerequisites (client, AMI, SG, and
+    the AZs to try); it is invoked at most once per region and cached. Within a
+    region, each AZ in ``ctx.placement_azs`` is tried in order (none: EC2 picks).
+    A capacity miss, a spot price above the maximum, or ``Unsupported`` moves to
+    the next AZ before the next region (all three can differ by AZ); quota is
+    region-wide and drops the region at once. The region counts as
+    capacity-limited once every AZ has missed and at least one missed on
+    capacity; if every AZ failed on price/unsupported it is dropped. For a hard
+    pin (``ctx.hard_pin``: an EBS volume's or cluster's AZ) ``Unsupported`` is a
+    region-named ``CLIError`` with AWS's text, since no other AZ will do.
+    ``on_attempt(region, market, attempt, az)``'s ``attempt`` is the 0-based
+    ``--wait`` backoff-cycle index; it stays ``0`` outside the wait loop (no-wait
+    pass and on-demand fallback). ``az`` is the AZ requested, or None.
     """
     regions = config.regions
     primary_spot = config.spot
@@ -571,11 +620,19 @@ def launch_with_retry(
     start = clock()
     deadline = start + config.wait_timeout if config.wait else None
     attempt = 0
+    azs_tried: dict[str, list[str]] = {}
 
     def ctx_for(region: str) -> RegionContext:
         if region not in cache:
             cache[region] = prepare_region(region)
         return cache[region]
+
+    def mark_fatal(region: str, kind: str, message: str, failures: dict, fatal: set[str]) -> None:
+        failures[region] = (kind, message)
+        if region not in fatal:
+            fatal.add(region)
+            if on_region_fatal:
+                on_region_fatal(region, kind, message)
 
     def sweep(
         spot: bool,
@@ -586,31 +643,54 @@ def launch_with_retry(
         mkt = "spot" if spot else "on-demand"
         for region in candidates:
             ctx = ctx_for(region)
-            if on_attempt:
-                on_attempt(region, mkt, attempt)
-            try:
-                inst = _run_instances(
-                    ctx.ec2_client,
-                    config,
-                    ctx.ami["ImageId"],
-                    ctx.sg_id,
-                    region,
-                    spot,
-                    ctx.key_name,
-                    ctx.placement_az,
-                    ctx.placement_group,
-                )
-            except CapacityError as e:
-                failures[region] = ("capacity", str(e))
-                continue
-            except RegionFatalError as e:
-                failures[region] = (e.kind, e.message)
-                if region not in fatal:
-                    fatal.add(region)
-                    if on_region_fatal:
-                        on_region_fatal(region, e.kind, e.message)
-                continue
-            return RegionLaunch(region, ctx, inst, mkt)
+            azs: tuple[str | None, ...] = ctx.placement_azs or (None,)
+            capacity_miss: CapacityError | None = None
+            az_failures: list[tuple[str, str]] = []  # AZ-level (kind, message): price / unsupported
+            for az in azs:
+                if az:
+                    tried = azs_tried.setdefault(region, [])
+                    if az not in tried:
+                        tried.append(az)
+                if on_attempt:
+                    on_attempt(region, mkt, attempt, az)
+                try:
+                    inst = _run_instances(
+                        ctx.ec2_client,
+                        config,
+                        ctx.ami["ImageId"],
+                        ctx.sg_id,
+                        region,
+                        spot,
+                        ctx.key_name,
+                        az,
+                        ctx.placement_group,
+                    )
+                except CapacityError as e:
+                    capacity_miss = e
+                    continue
+                except AzUnsupportedError as e:
+                    if ctx.hard_pin:
+                        # The volume's / cluster's AZ is required: report AWS's reason, don't skip.
+                        raise CLIError(f"[{region}] {config.instance_type} can't launch in {e}") from None
+                    az_failures.append(("unsupported", f"{config.instance_type}: {e}"))
+                    continue
+                except RegionFatalError as e:
+                    if e.kind == "price":
+                        # Spot prices differ by AZ: another AZ (if any) may be under the maximum;
+                        # with every AZ over it, the region is dropped below.
+                        az_failures.append(("price", e.message))
+                        continue
+                    # Quota is region-wide: the region's other AZs would only repeat it.
+                    mark_fatal(region, e.kind, e.message, failures, fatal)
+                    break
+                return RegionLaunch(region, ctx, inst, mkt)
+            else:
+                if capacity_miss is not None:
+                    failures[region] = ("capacity", str(capacity_miss))
+                elif az_failures:
+                    kind = "price" if any(k == "price" for k, _ in az_failures) else "unsupported"
+                    message = "\n  ".join(dict.fromkeys(m for k, m in az_failures if k == kind))
+                    mark_fatal(region, kind, message, failures, fatal)
         return None
 
     # --- Primary market (spot unless --on-demand), with optional wait loop ---
@@ -630,7 +710,9 @@ def launch_with_retry(
             now = clock()
             assert deadline is not None
             if now >= deadline:
-                raise _aggregated_error(config, regions, failures, market, suffix=f" within {config.wait_timeout}s")
+                raise _aggregated_error(
+                    config, regions, failures, market, suffix=f" within {config.wait_timeout}s", azs_tried=azs_tried
+                )
             sleep_s = min(backoff_sleep_seconds(attempt, rng=rng), max(0.0, deadline - now))
             if on_wait:
                 # Only capacity-limited regions are re-swept; quota/price
@@ -644,7 +726,8 @@ def launch_with_retry(
         break
 
     # --- No-wait on-demand fallback (spot was the primary market) ---
-    if primary_spot:
+    # Not when every region failed as "unsupported": on-demand would hit the same AZs.
+    if primary_spot and any(kind != "unsupported" for kind, _ in failures.values()):
         secho(
             f"\n  No spot capacity for {config.instance_type} in {', '.join(regions)}.",
             fg="yellow",
@@ -662,9 +745,9 @@ def launch_with_retry(
         result = sweep(False, list(regions), od_failures, od_fatal)
         if result is not None:
             return result
-        raise _aggregated_error(config, regions, od_failures, "on-demand")
+        raise _aggregated_error(config, regions, od_failures, "on-demand", azs_tried=azs_tried)
 
-    raise _aggregated_error(config, regions, failures, "on-demand")
+    raise _aggregated_error(config, regions, failures, market, azs_tried=azs_tried)
 
 
 _UBUNTU_AMI = "ubuntu/images/hvm-ssd-gp3/ubuntu-noble-24.04-amd64-server-*"
@@ -911,6 +994,134 @@ def get_spot_price(ec2_client, instance_type: str, availability_zone: str) -> fl
     if not prices:
         return None
     return float(prices[0]["SpotPrice"])
+
+
+def spot_price_or_none(ec2_client, instance_type: str, availability_zone: str) -> float | None:
+    """:func:`get_spot_price` that never raises.
+
+    For display after ``RunInstances``: a denied or throttled price lookup must not
+    abort the command and lose the record of an instance that is already billing.
+    """
+    try:
+        return get_spot_price(ec2_client, instance_type, availability_zone)
+    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError, KeyError, ValueError):
+        return None
+
+
+def spot_prices_by_az(ec2_client, instance_type: str) -> dict[str, float]:
+    """Current spot price of *instance_type* in every AZ of the client's region.
+
+    One paginated ``describe_spot_price_history`` with ``StartTime=now`` returns the
+    price in effect in each AZ (no per-AZ calls); the latest record per AZ wins.
+    """
+    latest: dict[str, tuple[datetime, float]] = {}
+    paginator = ec2_client.get_paginator("describe_spot_price_history")
+    for page in paginator.paginate(
+        InstanceTypes=[instance_type],
+        ProductDescriptions=["Linux/UNIX"],
+        StartTime=datetime.now(UTC),
+    ):
+        for rec in page.get("SpotPriceHistory", []):
+            zone, stamp = rec["AvailabilityZone"], rec["Timestamp"]
+            if zone not in latest or stamp > latest[zone][0]:
+                latest[zone] = (stamp, float(rec["SpotPrice"]))
+    return {zone: price for zone, (_, price) in latest.items()}
+
+
+def offered_azs(ec2_client, instance_type: str) -> set[str]:
+    """AZs of the client's region that offer *instance_type*."""
+    paginator = ec2_client.get_paginator("describe_instance_type_offerings")
+    zones: set[str] = set()
+    for page in paginator.paginate(
+        LocationType="availability-zone",
+        Filters=[{"Name": "instance-type", "Values": [instance_type]}],
+    ):
+        zones.update(o["Location"] for o in page.get("InstanceTypeOfferings", []))
+    return zones
+
+
+def default_subnet_azs(ec2_client) -> set[str]:
+    """AZs with a default subnet: where an instance launched into the default VPC can land."""
+    paginator = ec2_client.get_paginator("describe_subnets")
+    zones: set[str] = set()
+    for page in paginator.paginate(Filters=[{"Name": "default-for-az", "Values": ["true"]}]):
+        zones.update(s["AvailabilityZone"] for s in page.get("Subnets", []))
+    return zones
+
+
+def _confirm_zones(ec2_client, region: str, zones: tuple[str, ...]) -> None:
+    """Fail (naming the region) unless every zone exists there and is usable (opted in)."""
+    try:
+        resp = ec2_client.describe_availability_zones(ZoneNames=list(zones), AllAvailabilityZones=True)
+    except botocore.exceptions.EndpointConnectionError:
+        raise CLIError(
+            f"Can't reach EC2 in region {region} (from availability zone {', '.join(zones)}): is the AZ name right?"
+        ) from None
+    except botocore.exceptions.ClientError as e:
+        raise CLIError(
+            f"Unknown availability zone in {region}: {', '.join(zones)} ({e.response['Error'].get('Message', e)}).\n"
+            f"  List them with: aws ec2 describe-availability-zones --region {region}"
+        ) from None
+    not_opted = [z["ZoneName"] for z in resp["AvailabilityZones"] if z.get("OptInStatus") == "not-opted-in"]
+    if not_opted:
+        raise CLIError(f"Availability zone {', '.join(not_opted)} in {region} is not opted in to this account.")
+
+
+@dataclass(frozen=True)
+class AzOption:
+    """An AZ to try, with its current spot price for the instance type (None: unknown)."""
+
+    zone: str
+    spot_price: float | None
+
+
+def plan_azs(
+    ec2_client,
+    region: str,
+    instance_type: str,
+    explicit: tuple[str, ...] = (),
+    cheapest: bool = False,
+) -> list[AzOption]:
+    """The AZs to try in *region*, in order, for ``--availability-zone`` / ``--cheapest-az``.
+
+    Candidates are the AZs that offer the type and, when the region has default
+    subnets, have one (the tool launches into the default VPC). Explicit zones are
+    confirmed with EC2 and must be candidates. ``cheapest`` orders by current spot
+    price, unknown prices last; otherwise explicit zones keep the order given.
+    """
+    if explicit:
+        _confirm_zones(ec2_client, region, explicit)
+    offered = offered_azs(ec2_client, instance_type)
+    if not offered:
+        raise CLIError(f"{instance_type} is not offered in any availability zone of {region}.")
+    with_subnet = default_subnet_azs(ec2_client)
+    usable = offered & with_subnet if with_subnet else offered
+    if explicit:
+        bad = [z for z in explicit if z not in usable]
+        if bad:
+            raise CLIError(
+                f"{instance_type} can't launch in {', '.join(bad)}: not offered there"
+                f"{' or no default subnet' if with_subnet else ''}.\n"
+                f"  Usable AZs in {region}: {', '.join(sorted(usable)) or '(none)'}"
+            )
+        zones = list(explicit)
+    else:
+        zones = sorted(usable)
+        if not zones:  # offered only in AZs without a default subnet
+            raise CLIError(
+                f"{instance_type} is offered in {region} only in AZs without a default subnet "
+                f"({', '.join(sorted(offered))}); the tool launches into the default VPC."
+            )
+    try:
+        prices = spot_prices_by_az(ec2_client, instance_type)
+    except botocore.exceptions.ClientError:
+        if cheapest:
+            raise  # the ranking needs prices
+        prices = {}  # explicit AZs: prices are only for display
+    options = [AzOption(z, prices.get(z)) for z in zones]
+    if cheapest:
+        options.sort(key=lambda o: (o.spot_price is None, o.spot_price or 0.0))  # stable: ties keep order
+    return options
 
 
 def _gpu_summary(gpu_info: dict) -> str:

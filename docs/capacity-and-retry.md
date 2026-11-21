@@ -121,6 +121,58 @@ A single exhausted spot pass (no `--wait`) still offers the interactive
 listed regions. In structured output modes (`-o json/yaml/table`) this is
 auto-confirmed.
 
+### Availability zones within a region (`--cheapest-az`, `--availability-zone`)
+
+Without these flags EC2 picks the AZ inside each region. With them, each
+region gets an ordered **AZ plan**, and an AZ is a third loop level, inside
+the region sweep:
+
+```
+for each backoff cycle (--wait):        # outer
+  for each --region, in order:           # middle
+    for each AZ in that region's plan:   # inner
+      try RunInstances (spot)
+```
+
+- **`--cheapest-az`** (spot only): the region's AZs that offer the type and
+  have a default subnet, sorted by current spot price (one
+  `describe_spot_price_history` call per region). Unknown prices sort last.
+- **`--availability-zone AZ`** (repeatable): only those AZs, tried in the order
+  given. Each AZ implies its region. Unknown or not-opted-in zones are rejected
+  up front.
+- **Per AZ:** a capacity miss, a `SpotMaxPriceTooLow`, or `Unsupported` moves
+  to the next AZ in the same region, since spot price and support differ by AZ.
+  A quota error is region-wide, so it skips the region's remaining AZs. The
+  region counts as capacity-limited, and so is re-swept by `--wait`, once
+  **every** AZ in its plan has missed and at least one missed on capacity. If
+  every AZ failed on price or support, the region is dropped. The final error
+  names the AZs actually tried. When every failure was `Unsupported`, there is
+  no on-demand fallback, because on-demand would hit the same AZs.
+- **An `--ebs-volume-id`'s AZ and a cluster's AZ are hard pins.** No other AZ
+  will do there, so an `Unsupported` is reported as an error with AWS's reason
+  rather than skipped. A plan that happens to hold one AZ (a single
+  `--availability-zone`) is not a pin: its region is dropped and the next
+  `--region` is tried.
+- **Every region's plan is computed before anything launches.** A bad explicit
+  AZ in a later region fails up front. A region with only `--cheapest-az`
+  that can't host the type is skipped with a warning.
+- **Plans are computed once per region** and reused across `--wait` cycles.
+  Prices move slowly, and re-ranking mid-wait would reshuffle the order.
+
+**Price semantics.** Ranking is *within* a region: region order still
+outranks price, so every AZ of the first `--region` is tried before any AZ of
+the second. A capacity miss in the cheapest AZ falls through to the next,
+possibly much pricier one. With `--ebs-storage`, the new volume (and every
+later reattach) lives wherever the instance landed. For *the cheap AZ or
+nothing*:
+
+```bash
+aws-bootstrap launch --instance-type g6e.2xlarge --availability-zone us-west-2b --wait --wait-timeout 1h
+```
+
+`--ebs-volume-id` already pins its volume's AZ, so it can't be combined with
+either flag. `--dry-run` prints the AZ plan for every `--region`.
+
 ## Region default precedence
 
 `--region` resolution (all commands):
