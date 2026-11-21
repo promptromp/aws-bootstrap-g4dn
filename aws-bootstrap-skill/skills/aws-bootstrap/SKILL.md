@@ -260,7 +260,7 @@ After launch and remote setup, each instance comes pre-configured with:
 ### Python Virtual Environment (`~/venv`)
 
 - Located at `~/venv`, **auto-activated on SSH login** (via `~/.bashrc`)
-- **PyTorch** is pre-installed with the correct CUDA wheel matching the host's CUDA toolkit version (e.g. `cu124`, `cu128`) — `torch.cuda.is_available()` works out of the box
+- **PyTorch** is pre-installed from the newest PyTorch CUDA wheel index at or below the host's CUDA toolkit version (e.g. `cu134` on a CUDA 13.5 AMI), discovered at setup time — `torch.cuda.is_available()` works out of the box
 - **torchvision** is also pre-installed with matching CUDA support
 - Additional numerical/ML libraries from `requirements.txt`: `numpy`, `tqdm`, and other common dependencies
 - Use `--python-version` on launch to pin a specific Python version (e.g. `3.13`)
@@ -291,7 +291,7 @@ The `/data` volume is **not lost on spot interruption** — when AWS reclaims th
 
 - **Spot capacity errors** (`InsufficientInstanceCapacity`): prefer multiple `--region` values (tried in order) and/or `--wait --wait-timeout` over manual retry loops — the CLI handles bounded backoff internally. Without `--wait`, an exhausted spot pass auto-falls back to on-demand in structured modes. `--wait` hard-fails on timeout (it does not auto-buy on-demand).
 - **Quota limits** (`MaxSpotInstanceCountExceeded`, `VcpuLimitExceeded`) and `SpotMaxPriceTooLow`: never retried by `--wait`, but in multi-region mode the launcher warns (with a region-pinned hint) and tries the next `--region`; it fails hard only when every region is blocked. Quotas are per-region — the suggested `aws-bootstrap quota show` / `quota request` commands are auto-pinned to `--region <failed-region>`. Run them as-is; other families: `--family p` (P2-P6), `--family dl`.
-- **`No arm64 AMI found matching filter: ...`**: the instance type is arm64 (`g5g`) but `--ami-filter` matches only x86_64 images — the default Deep Learning AMI is x86_64-only. Retry with the ARM64 filter the error prints (`--ami-filter "Deep Learning ARM64 AMI OSS Nvidia Driver GPU PyTorch*(Ubuntu 24.04)*"`). Changing `--region` will **not** help. Every other current GPU family is x86_64.
+- **`No arm64 AMI found matching filter: ...`** (or `No x86_64 …`): a **custom** `--ami-filter` was written for the other CPU architecture (AWS names ARM64 Deep Learning AMIs `Deep Learning ARM64 …`). Drop the custom filter — the default resolves for either architecture, including arm64 `g5g` — or check `aws-bootstrap -o json list amis --arch arm64`. Changing `--region` will **not** help.
 - **SSH key handling**: a missing local `--key-path` is auto-generated (ed25519); if an AWS key pair with the target `--key-name` exists but is a *different* key, the existing one is left untouched and the local key is imported under a derived name `<key-name>-<fp8>` so the instance is always reachable.
 - **SSH auth failure**: `launch` fails fast (no long retry loop) and surfaces the real `ssh` error (e.g. `Permission denied (publickey)`) instead of a generic "SSH not ready" — indicates a key mismatch; relaunch with the correct `--key-name`/`--key-path`.
 - **SSH timeouts**: Instance may still be initializing -- check `aws-bootstrap status`

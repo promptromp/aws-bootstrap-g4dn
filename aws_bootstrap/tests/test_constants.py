@@ -12,10 +12,12 @@ def test_constants_reexport_config_defaults():
     assert constants.TAG_VALUE == config.DEFAULT_TAG_VALUE
     assert constants.ALIAS_PREFIX == config.DEFAULT_ALIAS_PREFIX
     assert constants.SSH_PORT_DEFAULT == config.DEFAULT_SSH_PORT
+    assert constants.DEFAULT_AMI_FILTER == config.DEFAULT_AMI_FILTER
 
 
 def test_launchconfig_defaults_track_constants():
     c = LaunchConfig()
+    assert c.ami_filter == constants.DEFAULT_AMI_FILTER
     assert c.tag_value == constants.TAG_VALUE
     assert c.alias_prefix == constants.ALIAS_PREFIX
     assert c.ssh_port == constants.SSH_PORT_DEFAULT

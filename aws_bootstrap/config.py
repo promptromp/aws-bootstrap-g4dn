@@ -15,11 +15,22 @@ DEFAULT_TAG_VALUE = "aws-bootstrap-g4dn"
 DEFAULT_SSH_PORT = 22
 DEFAULT_ALIAS_PREFIX = "aws-gpu"
 
+# AWS Deep Learning Base AMI (OSS NVIDIA driver), as an EC2 image-name pattern.
+# AWS names the builds per architecture — "Deep Learning Base OSS …" for x86_64,
+# "Deep Learning ARM64 Base OSS …" for arm64 — so the "*" after "Deep Learning"
+# spans that infix, and get_latest_ami's architecture filter (taken from EC2 for
+# the instance type) picks the right build. One pattern then serves every
+# architecture, and resolves to the same image as AWS's public SSM pointer
+# /aws/service/deeplearning/ami/<arch>/base-oss-nvidia-driver-gpu-ubuntu-24.04/latest/ami-id.
+DLAMI_BASE_PATTERN = "Deep Learning*Base OSS Nvidia Driver GPU AMI"
+DEFAULT_AMI_OS = "Ubuntu 24.04"
+DEFAULT_AMI_FILTER = f"{DLAMI_BASE_PATTERN} ({DEFAULT_AMI_OS})*"
+
 
 @dataclass
 class LaunchConfig:
     instance_type: str = "g4dn.xlarge"
-    ami_filter: str = "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04)*"
+    ami_filter: str = DEFAULT_AMI_FILTER
     spot: bool = True
     key_path: Path = field(default_factory=lambda: Path.home() / ".ssh" / "id_ed25519.pub")
     key_name: str = "aws-bootstrap-key"

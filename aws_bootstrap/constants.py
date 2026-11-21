@@ -12,6 +12,7 @@ from __future__ import annotations
 
 from .config import (  # noqa: F401  (re-export: single import surface)
     DEFAULT_ALIAS_PREFIX,
+    DEFAULT_AMI_FILTER,
     DEFAULT_REGION,
     DEFAULT_SSH_PORT,
     DEFAULT_TAG_VALUE,

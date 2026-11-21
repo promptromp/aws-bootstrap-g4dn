@@ -273,6 +273,7 @@ def wait_for_ssh(
 # script picks them up from there. Names are relative to the resources dir.
 SETUP_PAYLOAD: tuple[str, ...] = (
     "requirements.txt",
+    "torch_index.py",
     "gpu_benchmark.py",
     "gpu_smoke_test.ipynb",
     "saxpy.cu",

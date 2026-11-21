@@ -197,7 +197,7 @@ The setup script runs automatically on the instance after SSH becomes available:
 | **GPU verify** | Confirms `nvidia-smi` and `nvcc` are working |
 | **Utilities** | Installs `htop`, `tmux`, `tree`, `jq`, `ffmpeg` |
 | **Python venv** | Creates `~/venv` with `uv`, auto-activates in `~/.bashrc`. Use `--python-version` to pin a specific Python (e.g. `3.13`) |
-| **CUDA-aware PyTorch** | Detects CUDA toolkit version → installs PyTorch from the matching `cu{TAG}` wheel index |
+| **CUDA-aware PyTorch** | Detects the CUDA toolkit version → installs PyTorch from the newest `cu{TAG}` wheel index PyTorch publishes at or below it (discovered from the index, not a hardcoded list) |
 | **CUDA smoke test** | Runs `torch.cuda.is_available()` + GPU matmul to verify the stack |
 | **GPU benchmark** | Copies `gpu_benchmark.py` to `~/gpu_benchmark.py` |
 | **GPU smoke test notebook** | Copies `gpu_smoke_test.ipynb` to `~/gpu_smoke_test.ipynb` (open in JupyterLab) |
@@ -299,18 +299,20 @@ aws-bootstrap list instance-types --prefix g6
 
 # --prefix is a *prefix* match, so it also finds hyphenated families:
 #   p6  -> p6-b200.48xlarge, p6-b300.48xlarge
-#   g6  -> g6, g6e and g6f types
+#   g6  -> g6, g6e and g6f types (fractional-GPU types such as g6f show their
+#          share of one GPU, e.g. "1/8 L4")
 aws-bootstrap list instance-types --prefix p6
 
-# List Deep Learning AMIs (default filter) — each AMI is labelled with its region
+# List Deep Learning Base AMIs — every OS (Ubuntu 22.04/24.04/26.04, Amazon Linux
+# 2023, …) and architecture; each AMI is labelled with its region
 aws-bootstrap list amis
 
 # List AMIs with a custom filter
 aws-bootstrap list amis --filter "ubuntu/images/hvm-ssd-gp3/ubuntu-noble*"
 
-# Results cover every CPU architecture; --arch narrows them. ARM64 Deep Learning
-# AMIs are what arm64 GPU types (g5g) need — see "ARM64 instance types" below.
-aws-bootstrap list amis --filter "Deep Learning ARM64 AMI*" --arch arm64
+# --arch narrows to one architecture, e.g. the ARM64 builds that arm64 GPU types
+# (g5g) run — see "ARM64 instance types" below
+aws-bootstrap list amis --arch arm64
 
 # Use a specific region (the active region is shown in the output header)
 aws-bootstrap list instance-types --region us-east-1
@@ -333,18 +335,23 @@ checking and raising your vCPU quota.
 
 An AMI must match its instance type's CPU architecture, and not every GPU family
 is x86_64 — `g5g` (NVIDIA T4g) is arm64-only. `launch` reads the architecture
-from the instance type and looks up an AMI for it, so the default
-x86_64-only Deep Learning AMI is no longer silently paired with an arm64
-instance (which used to fail late, inside `run_instances`). AWS publishes ARM64
-Deep Learning AMIs under a different name, so pass a matching `--ami-filter`:
+from the instance type (via EC2) and looks up an AMI for it. AWS names the
+Deep Learning Base AMI per architecture (`Deep Learning Base OSS …` for x86_64,
+`Deep Learning ARM64 Base OSS …` for arm64), and the default `--ami-filter`
+(`Deep Learning*Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04)*`) spans both,
+so no extra flag is needed — it resolves to the same image as AWS's public SSM
+"latest DLAMI" parameter for that architecture:
 
 ```bash
-aws-bootstrap launch --instance-type g5g.xlarge \
-  --ami-filter "Deep Learning ARM64 AMI OSS Nvidia Driver GPU PyTorch*(Ubuntu 24.04)*"
+aws-bootstrap launch --instance-type g5g.xlarge
 ```
 
-If the filter matches no image for the required architecture, the error says so
-and prints this command, rather than a generic "no AMI found".
+If you pass your own `--ami-filter` and it matches no image for the required
+architecture, the error says so and shows how to list what the region offers,
+rather than a generic "no AMI found".
+
+Ubuntu 26.04 builds of the same AMI are also published; to use one, pass
+`--ami-filter "Deep Learning*Base OSS Nvidia Driver GPU AMI (Ubuntu 26.04)*"`.
 
 ### 🖥️ Managing Instances
 

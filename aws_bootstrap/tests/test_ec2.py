@@ -1,6 +1,7 @@
 """Tests for EC2 helper functions."""
 
 from __future__ import annotations
+import fnmatch
 import io
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
@@ -9,7 +10,7 @@ import botocore.exceptions
 import click
 import pytest
 
-from aws_bootstrap.config import LaunchConfig
+from aws_bootstrap.config import DEFAULT_AMI_FILTER, LaunchConfig
 from aws_bootstrap.constants import TAG_CREATED_BY, TAG_VALUE
 from aws_bootstrap.ec2 import (
     CapacityError,
@@ -18,6 +19,7 @@ from aws_bootstrap.ec2 import (
     RegionFatalError,
     RegionLaunch,
     _build_launch_params,
+    _gpu_summary,
     _quota_error_message,
     _quota_hint,
     _run_instances,
@@ -129,16 +131,47 @@ def test_get_latest_ami_filters_on_requested_architecture(arch):
     assert {"Name": "architecture", "Values": [arch]} in filters
 
 
-def test_get_latest_ami_arm64_miss_explains_the_arch_mismatch():
-    """The default DLAMI is x86_64-only — the error must say so, not just 'no AMI'."""
+def test_get_latest_ami_arch_miss_explains_the_mismatch():
+    """A filter written for x86_64 finds nothing for arm64 — the error must say why."""
     ec2 = MagicMock()
     ec2.describe_images.return_value = {"Images": []}
     with pytest.raises(click.ClickException) as exc:
-        get_latest_ami(ec2, "Deep Learning Base OSS Nvidia Driver GPU AMI*", architecture="arm64")
+        get_latest_ami(ec2, "Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04)*", architecture="arm64")
     msg = exc.value.format_message()
-    assert "arm64" in msg
-    assert "Deep Learning ARM64 AMI" in msg
-    assert "--ami-filter" in msg
+    assert "No arm64 AMI found" in msg
+    assert "ARM64" in msg
+    assert "Omit --ami-filter" in msg
+    assert "aws-bootstrap list amis --arch arm64" in msg
+    # The old hint pointed at the PyTorch 2.10-2.12 DLAMIs, which AWS no longer patches.
+    assert "PyTorch" not in msg
+
+
+def test_get_latest_ami_miss_with_default_filter_does_not_suggest_omitting_it():
+    ec2 = MagicMock()
+    ec2.describe_images.return_value = {"Images": []}
+    with pytest.raises(click.ClickException) as exc:
+        get_latest_ami(ec2, DEFAULT_AMI_FILTER, architecture="x86_64")
+    msg = exc.value.format_message()
+    assert "Omit --ami-filter" not in msg
+    assert "aws-bootstrap list amis --arch x86_64" in msg
+
+
+@pytest.mark.parametrize(
+    "name,matches",
+    [
+        ("Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261120", True),
+        ("Deep Learning ARM64 Base OSS Nvidia Driver GPU AMI (Ubuntu 24.04) 20261120", True),
+        ("Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu 26.04) 20261120", False),
+        ("Deep Learning Base OSS Nvidia Driver GPU AMI (Ubuntu Pro 24.04) 20261118", False),
+        ("Deep Learning ARM64 AMI OSS Nvidia Driver GPU PyTorch 2.12 (Ubuntu 24.04) 20261120", False),
+    ],
+)
+def test_default_ami_filter_spans_architectures_but_not_other_images(name, matches):
+    """One default for every architecture: the arch filter, not the name, picks the build.
+
+    Glob semantics match EC2's name filter (`*` = any run of characters).
+    """
+    assert fnmatch.fnmatchcase(name, DEFAULT_AMI_FILTER) is matches
 
 
 def _make_client_error(code: str, message: str = "test") -> botocore.exceptions.ClientError:
@@ -628,6 +661,33 @@ def test_list_instance_types_no_gpu():
     results = list_instance_types(ec2, "t3")
     assert len(results) == 1
     assert results[0]["GpuSummary"] == ""
+
+
+@pytest.mark.parametrize(
+    "gpu,expected",
+    [
+        ({"Count": 4, "Name": "T4", "MemoryInfo": {"SizeInMiB": 16384}}, "4x T4 (16384 MiB)"),
+        # Fractional GPUs (g6f/gr6f) report Count 0 and their share in GpuPartitionSize.
+        (
+            {
+                "Count": 0,
+                "LogicalGpuCount": 1,
+                "GpuPartitionSize": 0.125,
+                "Name": "L4",
+                "MemoryInfo": {"SizeInMiB": 2861},
+            },
+            "1/8 L4 (2861 MiB)",
+        ),
+        ({"Count": 0, "GpuPartitionSize": 0.5, "Name": "L4", "MemoryInfo": {"SizeInMiB": 11444}}, "1/2 L4 (11444 MiB)"),
+        ({"Name": "X"}, "?x X (0 MiB)"),
+    ],
+)
+def test_gpu_summary(gpu, expected):
+    assert _gpu_summary({"Gpus": [gpu]}) == expected
+
+
+def test_gpu_summary_without_gpus():
+    assert _gpu_summary({}) == ""
 
 
 @pytest.mark.parametrize(
