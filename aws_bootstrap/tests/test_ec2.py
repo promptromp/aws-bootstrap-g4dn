@@ -39,7 +39,6 @@ from aws_bootstrap.ec2 import (
     list_clusters,
     list_enabled_regions,
     list_instance_types,
-    resolve_ebs_placement_az,
     terminate_tagged_instances,
 )
 
@@ -317,6 +316,53 @@ def test_run_instances_omits_placement_without_az_or_group(ec2):
     assert "Placement" not in ec2.run_instances.call_args[1]
 
 
+PROFILE_ARN = "arn:aws:iam::123456789012:instance-profile/team/app"
+PROFILE_REJECTED = _make_client_error(
+    "InvalidParameterValue",
+    "Value (app) for parameter iamInstanceProfile.name is invalid. Invalid IAM Instance Profile name",
+)
+
+
+@pytest.mark.parametrize("spot", [True, False], ids=["spot", "on-demand"])
+@pytest.mark.parametrize(
+    "profile,expected",
+    [
+        pytest.param(None, None, id="none"),
+        pytest.param("app", {"Name": "app"}, id="name"),
+        pytest.param(PROFILE_ARN, {"Arn": PROFILE_ARN}, id="arn"),
+    ],
+)
+def test_run_instances_attaches_the_instance_profile(ec2, profile, expected, spot):
+    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-test"}]}
+    _run_instances(ec2, LaunchConfig(iam_instance_profile=profile), "ami-1", "sg-1", "us-west-2", spot, "k")
+    assert ec2.run_instances.call_args[1].get("IamInstanceProfile") == expected
+
+
+@pytest.mark.parametrize(
+    "error,match",
+    [
+        pytest.param(PROFILE_REJECTED, "EC2 rejected IAM instance profile 'app'", id="invalid-profile"),
+        pytest.param(
+            _make_client_error("UnauthorizedOperation", "Encoded authorization failure message: xyz"),
+            "iam:PassRole",
+            id="pass-role-denied",
+        ),
+    ],
+)
+def test_run_instances_profile_errors_become_cli_errors(ec2, error, match):
+    ec2.run_instances.side_effect = error
+    with pytest.raises(CLIError, match=match):
+        _run_instances(ec2, LaunchConfig(iam_instance_profile="app"), "ami-1", "sg-1", "us-west-2", True, "k")
+
+
+def test_run_instances_does_not_blame_the_profile_for_other_bad_parameters(ec2):
+    ec2.run_instances.side_effect = _make_client_error(
+        "InvalidParameterValue", "Value (x) for parameter blockDeviceMapping is invalid"
+    )
+    with pytest.raises(botocore.exceptions.ClientError):
+        _run_instances(ec2, LaunchConfig(iam_instance_profile="app"), "ami-1", "sg-1", "us-west-2", True, "k")
+
+
 # ---------------------------------------------------------------------------
 # launch_with_retry
 # ---------------------------------------------------------------------------
@@ -552,6 +598,24 @@ def test_launch_with_retry_sends_the_pinned_az_to_run_instances(ctx_fields, expe
     result = launch_with_retry(LaunchConfig(regions=("us-east-1",), spot=True, ebs_volume_id="vol-abc"), lambda r: ctx)
     assert result.region == "us-east-1"
     assert ctx.ec2_client.run_instances.call_args[1]["Placement"] == expected
+
+
+@pytest.mark.parametrize("wait", [False, True], ids=["no-wait", "wait"])
+def test_launch_with_retry_profile_error_never_falls_through(wait):
+    """A bad profile fails the same in every region and market: stop at once —
+    no next region, no on-demand prompt, no --wait sleep."""
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", PROFILE_REJECTED),
+        "us-east-1": _region_ctx("us-east-1", [_ok_instance()]),
+    }
+    confirm = MagicMock(return_value=True)
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True, iam_instance_profile="app", wait=wait)
+    with pytest.raises(CLIError, match="rejected IAM instance profile"):
+        launch_with_retry(
+            config, lambda r: contexts[r], confirm_on_demand=confirm, sleeper=lambda s: pytest.fail("slept")
+        )
+    contexts["us-east-1"].ec2_client.run_instances.assert_not_called()
+    confirm.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -856,32 +920,6 @@ def test_find_tagged_instances_in_regions_propagates_credential_error():
 
 
 # ---------------------------------------------------------------------------
-# EBS AZ pinning: an existing data volume is AZ-scoped, so the instance must be
-# launched in the volume's AZ. resolve_ebs_placement_az looks up the AZ once;
-# _run_instances pins the run_instances request to it via Placement.
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_ebs_placement_az_returns_volume_az(ec2):
-    ec2.describe_volumes.return_value = {"Volumes": [{"VolumeId": "vol-abc", "AvailabilityZone": "us-east-1c"}]}
-    assert resolve_ebs_placement_az(ec2, "vol-abc", "us-east-1") == "us-east-1c"
-    ec2.describe_volumes.assert_called_once_with(VolumeIds=["vol-abc"])
-
-
-@pytest.mark.parametrize(
-    "describe",
-    [
-        pytest.param({"side_effect": _make_client_error("InvalidVolume.NotFound", "not found")}, id="not-found-error"),
-        pytest.param({"return_value": {"Volumes": []}}, id="empty-response"),
-    ],
-)
-def test_resolve_ebs_placement_az_not_found_names_region(ec2, describe):
-    ec2.describe_volumes.configure_mock(**describe)
-    with pytest.raises(CLIError, match="EBS volume not found: vol-x in us-west-2"):
-        resolve_ebs_placement_az(ec2, "vol-x", "us-west-2")
-
-
-# ---------------------------------------------------------------------------
 # Cluster placement-group lifecycle / intra-cluster SG rule / discovery
 # ---------------------------------------------------------------------------
 
@@ -964,6 +1002,20 @@ def test_find_cluster_instances_sorted_by_rank(ec2):
     assert nodes[0]["AvailabilityZone"] == "us-east-1c"
     filters = ec2.describe_instances.call_args[1]["Filters"]
     assert {"Name": "tag:aws-bootstrap-cluster", "Values": ["ml1"]} in filters
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        pytest.param({}, "", id="none"),
+        pytest.param({"IamInstanceProfile": {"Arn": PROFILE_ARN, "Id": "AIPA123"}}, "app", id="attached"),
+    ],
+)
+def test_instance_discovery_reports_the_profile_name(ec2, raw, expected):
+    """describe_instances gives only the profile's ARN; status and clusters show its name."""
+    ec2.describe_instances.return_value = _reservations(_raw_instance(**raw))
+    assert find_tagged_instances(ec2, "aws-bootstrap-g4dn")[0]["IamInstanceProfile"] == expected
+    assert find_cluster_instances(ec2, "ml1")[0]["IamInstanceProfile"] == expected
 
 
 def test_list_clusters_groups_by_cluster_id(ec2):

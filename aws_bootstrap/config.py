@@ -53,6 +53,8 @@ class LaunchConfig:
     # and --cheapest-az (rank each region's AZs by current spot price, cheapest first).
     availability_zones: tuple[str, ...] = ()
     cheapest_az: bool = False
+    # An existing IAM instance profile (name or ARN) attached at RunInstances, or None.
+    iam_instance_profile: str | None = None
 
     @property
     def region(self) -> str:

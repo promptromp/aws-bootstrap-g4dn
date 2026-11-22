@@ -32,6 +32,7 @@ from .ec2 import (
     CLIError,
     RegionContext,
     RegionLaunch,
+    VolumeLocation,
     attach_ebs_volume,
     create_ebs_volume,
     delete_cluster_placement_group,
@@ -54,13 +55,14 @@ from .ec2 import (
     list_clusters,
     list_enabled_regions,
     list_instance_types,
+    locate_ebs_volume,
     plan_azs,
-    resolve_ebs_placement_az,
     spot_price_or_none,
     terminate_tagged_instances,
     validate_ebs_volume,
     wait_instance_ready,
 )
+from .iam import check_instance_profile, instance_profile_name
 from .output import OutputFormat, emit, get_format, is_text
 from .quota import (
     QUOTA_FAMILIES,
@@ -276,6 +278,12 @@ def main(ctx, output):
     ctx.obj["output_format"] = OutputFormat(output)
 
 
+_IAM_PROFILE_HELP = (
+    "Attach an existing IAM instance profile (name or ARN) so the instance gets AWS credentials, "
+    "e.g. to read S3. Checked before anything is created; aws-bootstrap never creates roles or policies."
+)
+
+
 def _validate_az_flags(
     availability_zones: tuple[str, ...],
     cheapest_az: bool,
@@ -316,6 +324,50 @@ def _az_plan_label(plan: list[AzOption], pricing: str) -> str:
         price = f" ${o.spot_price:.3f}/h" if pricing == "spot" and o.spot_price is not None else ""
         parts.append(f"{o.zone}{price}")
     return " → ".join(parts)
+
+
+def _check_profile(aws_profile: str | None, value: str | None) -> list[str] | None:
+    """Pre-launch check of --iam-instance-profile (read-only; IAM is global). Returns its roles."""
+    if not value:
+        return None
+    return check_instance_profile(boto3.Session(profile_name=aws_profile).client("iam"), value)
+
+
+def _profile_label(value: str, roles: list[str] | None) -> str:
+    """``onepass-ec2 (role onepass-ec2)``; notes when the roles are unknown or missing."""
+    name = instance_profile_name(value)
+    if roles is None:
+        return f"{name} (not verified)"
+    return f"{name} (role {', '.join(roles)})" if roles else f"{name} (no role)"
+
+
+def _locate_volume(
+    aws_profile: str | None, volume_id: str, explicit_regions: tuple[str, ...], regions: tuple[str, ...]
+) -> VolumeLocation:
+    """Find an --ebs-volume-id's region and AZ, and check it can be attached, before launching.
+
+    Searches *regions* (the requested or default ones) first, then every enabled
+    region, so the volume implies its region the way --availability-zone does. A
+    volume outside an explicit --region is an error, as is one that isn't
+    ``available``: attaching it would fail only after the instance is billing.
+    """
+    session = boto3.Session(profile_name=aws_profile)
+    loc = locate_ebs_volume(
+        session, volume_id, regions, lambda: list_enabled_regions(session.client("ec2", region_name=regions[0]))
+    )
+    if explicit_regions and loc.region not in explicit_regions:
+        raise CLIError(
+            f"EBS volume {volume_id} is in {loc.region} ({loc.availability_zone}), "
+            f"not in --region {', '.join(explicit_regions)}.\n"
+            f"  Drop --region (the volume implies its region) or pass --region {loc.region}."
+        )
+    if loc.state != "available":
+        attached = f" (attached to {loc.attached_to})" if loc.attached_to else ""
+        raise CLIError(
+            f"EBS volume {volume_id} is '{loc.state}'{attached}; it must be 'available' to attach.\n"
+            "  Detach it, or wait for its previous instance to finish terminating, then re-run."
+        )
+    return loc
 
 
 @main.command()
@@ -410,6 +462,12 @@ def _az_plan_label(plan: list[AzOption], pricing: str) -> str:
     default=False,
     help="Skip the pre-launch check that the SSH key works without a passphrase prompt.",
 )
+@click.option(
+    "--iam-instance-profile",
+    default=None,
+    metavar="NAME|ARN",
+    help=_IAM_PROFILE_HELP,
+)
 @click.pass_context
 def launch(
     ctx,
@@ -433,6 +491,7 @@ def launch(
     availability_zones,
     cheapest_az,
     skip_key_check,
+    iam_instance_profile,
 ):
     """Launch a GPU-accelerated EC2 instance."""
     if ebs_storage is not None and ebs_volume_id is not None:
@@ -458,6 +517,7 @@ def launch(
         wait_timeout=wait_timeout,
         availability_zones=tuple(availability_zones),
         cheapest_az=cheapest_az,
+        iam_instance_profile=iam_instance_profile,
     )
     if ami_filter:
         config.ami_filter = ami_filter
@@ -489,6 +549,15 @@ def launch(
     # launched, billing instance that setup can never reach (BatchMode=yes).
     if not skip_key_check:
         check_key_usable(config.key_path)
+
+    # Read-only checks next, still before anything is created.
+    profile_roles = _check_profile(config.profile, config.iam_instance_profile)
+    volume: VolumeLocation | None = None
+    if config.ebs_volume_id:
+        volume = _locate_volume(config.profile, config.ebs_volume_id, explicit_regions, config.regions)
+        if config.regions != (volume.region,):
+            info(f"{volume.volume_id} is in {volume.availability_zone} → launching in {volume.region}")
+            config.regions = (volume.region,)
 
     multi_region = len(config.regions) > 1
     # "us-west-2" for one region; "us-west-2 → us-east-1 → eu-west-1" for many,
@@ -542,13 +611,10 @@ def launch(
             sg_id_r = ensure_security_group(ec2r, config.security_group, config.tag_value, ssh_port=config.ssh_port)
         except CLIError as e:
             raise CLIError(f"[{region}] {e.format_message()}") from None
-        # Pin the instance to an existing data volume's AZ (EBS is AZ-scoped, so
-        # a random AZ would fail to attach). resolve_ebs_placement_az raises a
-        # region-named CLIError if the volume isn't in this region.
-        if config.ebs_volume_id:
-            placement_azs: tuple[str, ...] = (resolve_ebs_placement_az(ec2r, config.ebs_volume_id, region),)
-        else:
-            placement_azs = tuple(o.zone for o in plan)
+        # Pin the instance to an existing data volume's AZ (EBS is AZ-scoped, so a
+        # random AZ would fail to attach). The volume was located up front, and
+        # config.regions narrowed to its region.
+        placement_azs = (volume.availability_zone,) if volume else tuple(o.zone for o in plan)
         return RegionContext(
             region=region,
             ec2_client=ec2r,
@@ -557,7 +623,7 @@ def launch(
             key_name=effective_key,
             placement_azs=placement_azs,
             az_prices={o.zone: o.spot_price for o in plan if o.spot_price is not None},
-            hard_pin=bool(config.ebs_volume_id),  # the volume's AZ is required
+            hard_pin=volume is not None,  # the volume's AZ is required
         )
 
     # Plan every region's AZs up front (read-only), so a bad --availability-zone in a
@@ -601,6 +667,8 @@ def launch(
             val("Security group", ctx0.sg_id)
             val("Volume", f"{config.volume_size} GB gp3")
             val("Region(s)", regions_label)
+            if config.iam_instance_profile:
+                val("IAM instance profile", _profile_label(config.iam_instance_profile, profile_roles))
             for r, plan in dry_plans.items():
                 label = _az_plan_label(plan, pricing) if plan else "chosen by EC2"
                 val(f"AZs ({r})" if multi_region or len(dry_plans) > 1 else "AZs", label)
@@ -613,8 +681,11 @@ def launch(
                 val("Python version", config.python_version)
             if config.ebs_storage:
                 val("EBS data volume", f"{config.ebs_storage} GB gp3 (new, mounted at {EBS_MOUNT_POINT})")
-            if config.ebs_volume_id:
-                val("EBS data volume", f"{config.ebs_volume_id} (existing, mounted at {EBS_MOUNT_POINT})")
+            if volume:
+                val(
+                    "EBS data volume",
+                    f"{volume.volume_id} (existing, {volume.availability_zone}, mounted at {EBS_MOUNT_POINT})",
+                )
             click.echo()
             click.secho("No resources launched (dry-run mode).", fg="yellow")
         else:
@@ -651,8 +722,11 @@ def launch(
                 result["python_version"] = config.python_version
             if config.ebs_storage:
                 result["ebs_storage_gb"] = config.ebs_storage
-            if config.ebs_volume_id:
-                result["ebs_volume_id"] = config.ebs_volume_id
+            if volume:
+                result["ebs_volume_id"] = volume.volume_id
+                result["ebs_volume_availability_zone"] = volume.availability_zone
+            if config.iam_instance_profile:
+                result["iam_instance_profile"] = instance_profile_name(config.iam_instance_profile)
             emit(result, ctx=ctx)
         return
 
@@ -731,6 +805,7 @@ def launch(
     # Declared before _incomplete so the no-public-ip call (which runs before the
     # EBS block) reads a bound name rather than raising UnboundLocalError.
     ebs_volume_attached: str | None = None
+    profile_name = instance_profile_name(config.iam_instance_profile) if config.iam_instance_profile else None
 
     def _incomplete(status: str, message: str) -> None:
         """Report a launch that left a running-but-unusable instance.
@@ -751,6 +826,7 @@ def launch(
                     "region": active_region,
                     "pricing": pricing,
                     **({"spot_price_per_hour": spot_price} if spot_price is not None else {}),
+                    **({"iam_instance_profile": profile_name} if profile_name else {}),
                     "error": message,
                     # The volume is created and attached *before* the SSH wait, so
                     # an ssh-unavailable launch is already billing for it too —
@@ -866,6 +942,8 @@ def launch(
         }
         if spot_price is not None:
             result_data["spot_price_per_hour"] = spot_price
+        if profile_name:
+            result_data["iam_instance_profile"] = profile_name
         if cuda_version:
             result_data["cuda_version"] = cuda_version
         if ebs_volume_attached:
@@ -891,6 +969,8 @@ def launch(
     val("Region", active_region)
     val("Availability zone", _az_label(az, spot_price))
     val("Pricing", pricing)
+    if profile_name:
+        val("IAM instance profile", profile_name)
     if cuda_version:
         val("CUDA Version", cuda_version)
     val("SSH alias", alias)
@@ -1058,6 +1138,8 @@ def status(ctx, region, profile, gpu, instructions):
             val("    Type", inst["InstanceType"])
             if inst["PublicIp"]:
                 val("    IP", inst["PublicIp"])
+            if inst["IamInstanceProfile"]:
+                val("    IAM profile", inst["IamInstanceProfile"])
 
         # Build structured record
         inst_data: dict = {
@@ -1069,6 +1151,7 @@ def status(ctx, region, profile, gpu, instructions):
             "ssh_alias": alias,
             "lifecycle": inst["Lifecycle"],
             "availability_zone": inst["AvailabilityZone"],
+            "iam_instance_profile": inst["IamInstanceProfile"] or None,
             "launch_time": inst["LaunchTime"],
         }
 
@@ -1206,6 +1289,7 @@ def status(ctx, region, profile, gpu, instructions):
             "public_ip": "IP",
             "ssh_alias": "Alias",
             "lifecycle": "Pricing",
+            "iam_instance_profile": "IAM Profile",
             "uptime_seconds": "Uptime (s)",
         }
         if get_format(ctx) == OutputFormat.TABLE:
@@ -2081,6 +2165,34 @@ def cluster_cmd():
     """Manage multi-node training clusters (launch, status, terminate)."""
 
 
+def _warn_profile_mismatch(cluster_id: str, existing: list[dict], value: str | None, region: str) -> None:
+    """Warn when growing a cluster whose nodes carry a different instance profile than new ones will.
+
+    New nodes still get the requested profile; mixed credentials are allowed (nothing
+    breaks at launch), but a job that needs them on every rank would fail on the others.
+    """
+    want = instance_profile_name(value) if value else ""
+    others = [n for n in existing if n.get("IamInstanceProfile", "") != want]
+    if not others:
+        return
+    have = ", ".join(sorted({n.get("IamInstanceProfile") or "none" for n in others}))
+    nodes = ", ".join(n["InstanceId"] for n in others)
+    fix = (
+        f"  To give them the same profile:  aws ec2 associate-iam-instance-profile --region {region} "
+        f"--instance-id <id> --iam-instance-profile Name={want}"
+        if want
+        else ""
+    )
+    # stderr, unconditionally: structured-output users must see it too.
+    click.echo(
+        click.style("  WARNING: ", fg="yellow", bold=True)
+        + f"cluster '{cluster_id}' node(s) {nodes} have IAM instance profile {have}; "
+        + f"new nodes get {want or 'none'}."
+        + (f"\n{fix}" if fix else ""),
+        err=True,
+    )
+
+
 @cluster_cmd.command(name="launch")
 @click.option("--cluster-id", required=True, help="Cluster identifier (used as an EC2 tag).")
 @click.option("--nodes", default=2, show_default=True, type=int, help="Target number of nodes.")
@@ -2130,6 +2242,7 @@ def cluster_cmd():
     default=False,
     help="Skip the pre-launch check that the SSH key works without a passphrase prompt.",
 )
+@click.option("--iam-instance-profile", default=None, metavar="NAME|ARN", help=_IAM_PROFILE_HELP)
 @click.option("--profile", default=None, help="AWS profile override.")
 @click.pass_context
 def cluster_launch(
@@ -2151,6 +2264,7 @@ def cluster_launch(
     availability_zone,
     cheapest_az,
     skip_key_check,
+    iam_instance_profile,
     profile,
 ):
     """Launch (or grow) a training cluster to N nodes in one AZ + placement group."""
@@ -2184,6 +2298,8 @@ def cluster_launch(
     # unreachable with a key ssh can't use unprompted.
     if not skip_key_check:
         check_key_usable(key)
+    _check_profile(profile, iam_instance_profile)
+    _warn_profile_mismatch(cluster_id, existing, iam_instance_profile, region)
 
     # A new cluster's first node may get an AZ plan (--availability-zone / --cheapest-az).
     # Planned (read-only) before anything is created, so a bad AZ leaves nothing behind.
@@ -2213,6 +2329,7 @@ def cluster_launch(
         python_version=python_version,
         wait=wait,
         wait_timeout=wait_timeout,
+        iam_instance_profile=iam_instance_profile,
     )
     if profile:
         config.profile = profile

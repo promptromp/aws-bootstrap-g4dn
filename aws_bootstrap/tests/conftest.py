@@ -7,7 +7,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from click.testing import CliRunner
 
-from aws_bootstrap.ec2 import RegionContext, RegionLaunch
+from aws_bootstrap.ec2 import RegionContext, RegionLaunch, VolumeLocation
 
 
 @pytest.fixture(autouse=True)
@@ -77,6 +77,11 @@ def region_launch():
     return make
 
 
+def located_volume(session, volume_id, first, everywhere, **kw):
+    """``locate_ebs_volume`` stand-in: the volume is available in us-west-2a."""
+    return VolumeLocation(volume_id, "us-west-2", "us-west-2a", "available")
+
+
 @pytest.fixture
 def launch_aws(cli_session):
     """Patch the per-region setup ``launch`` does before it launches (all a ``--dry-run`` needs).
@@ -84,14 +89,26 @@ def launch_aws(cli_session):
     ``instance_type_architecture`` is pinned to ``x86_64`` (``arch``): left real, it
     would return whatever the mocked client's ``describe_instance_types`` yields (a
     MagicMock), not a real architecture. Set ``arch.return_value`` to test arm64.
+    The pre-launch lookups are stubbed too: ``volume`` (``--ebs-volume-id``: an
+    available volume in us-west-2a) and ``profile_check`` (``--iam-instance-profile``).
     """
     with (
         patch("aws_bootstrap.cli.get_latest_ami", return_value={"ImageId": "ami-123", "Name": "TestAMI"}) as ami,
         patch("aws_bootstrap.cli.instance_type_architecture", return_value="x86_64") as arch,
         patch("aws_bootstrap.cli.import_key_pair", return_value="aws-bootstrap-key") as import_key,
         patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123") as sg,
+        patch("aws_bootstrap.cli.locate_ebs_volume", side_effect=located_volume) as volume,
+        patch("aws_bootstrap.cli.check_instance_profile", return_value=["app-role"]) as profile_check,
     ):
-        yield SimpleNamespace(session=cli_session, ami=ami, arch=arch, import_key=import_key, sg=sg)
+        yield SimpleNamespace(
+            session=cli_session,
+            ami=ami,
+            arch=arch,
+            import_key=import_key,
+            sg=sg,
+            volume=volume,
+            profile_check=profile_check,
+        )
 
 
 @pytest.fixture

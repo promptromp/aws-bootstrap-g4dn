@@ -28,6 +28,7 @@ def _instance(instance_id="i-abc123", **overrides):
         "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
         "Lifecycle": "spot",
         "AvailabilityZone": "us-west-2a",
+        "IamInstanceProfile": "",
         **overrides,
     }
 
@@ -55,6 +56,7 @@ _HELP_CASES = [
             "--ssh-port",
             "--ebs-storage",
             "--ebs-volume-id",
+            "--iam-instance-profile",
         ],
     ),
     (
@@ -688,6 +690,35 @@ def test_status_structured_output_carries_instances_and_orphans(runner, status_a
     data = load(result.output)
     assert data["instances"][0]["instance_id"] == "i-abc123"
     assert data["orphan_volumes"][0]["volume_id"] == "vol-orphan1"
+
+
+@pytest.mark.parametrize("profile", ["app", ""], ids=["attached", "none"])
+@pytest.mark.parametrize("fmt,load", [("json", json.loads), ("yaml", yaml.safe_load)], ids=["json", "yaml"])
+def test_status_structured_output_carries_the_iam_profile(runner, status_aws, fmt, load, profile):
+    status_aws.find.return_value = [_instance(IamInstanceProfile=profile)]
+    result = runner.invoke(main, ["-o", fmt, *STATUS])
+    assert result.exit_code == 0, result.output
+    assert load(result.output)["instances"][0]["iam_instance_profile"] == (profile or None)
+
+
+@pytest.mark.parametrize(
+    "fmt,profile,present,absent",
+    [
+        ("text", "app", ["IAM profile", "app"], []),
+        ("text", "", [], ["IAM profile"]),
+        ("table", "app", ["IAM Profile", "app"], []),
+        ("table", "", ["IAM Profile"], ["app"]),  # the column is always there
+    ],
+    ids=["text-attached", "text-none", "table-attached", "table-none"],
+)
+def test_status_renders_the_iam_profile(runner, status_aws, fmt, profile, present, absent):
+    status_aws.find.return_value = [_instance(IamInstanceProfile=profile)]
+    result = runner.invoke(main, ["-o", fmt, *STATUS])
+    assert result.exit_code == 0, result.output
+    for text in present:
+        assert text in result.output
+    for text in absent:
+        assert text not in result.output
 
 
 def test_status_table_renders_orphans_in_their_own_table(runner, status_aws, orphans):

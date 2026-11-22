@@ -18,7 +18,7 @@ from aws_bootstrap.cluster import NodeResult
 from aws_bootstrap.gpu import GpuInfo
 
 
-def _node(instance_id="i-1", cluster_id="ml1", rank=0, state="running"):
+def _node(instance_id="i-1", cluster_id="ml1", rank=0, state="running", **overrides):
     return {
         "InstanceId": instance_id,
         "ClusterId": cluster_id,
@@ -30,6 +30,8 @@ def _node(instance_id="i-1", cluster_id="ml1", rank=0, state="running"):
         "AvailabilityZone": "us-east-1c",
         "Lifecycle": "spot",
         "LaunchTime": datetime(2026, 5, 21),
+        "IamInstanceProfile": "",
+        **overrides,
     }
 
 
@@ -150,7 +152,7 @@ def cluster_launch(launched, region_launch, cluster_nodes, key_path):
         patch("aws_bootstrap.cli.ensure_cluster_security_group_rule"),
     ):
         argv = ["cluster", "launch", "--cluster-id", "ml1", "--region", "us-east-1", "--key-path", str(key_path)]
-        yield SimpleNamespace(mocks=launched, argv=argv)
+        yield SimpleNamespace(mocks=launched, argv=argv, nodes=cluster_nodes)
 
 
 def test_cluster_launch_two_nodes_tags_ranks(runner, cluster_launch):
@@ -185,6 +187,31 @@ def test_cluster_launch_threads_wait_into_config(runner, cluster_launch):
     cfg = cluster_launch.mocks.launch.call_args[0][0]
     assert cfg.wait is True
     assert cfg.wait_timeout == 90
+
+
+def test_cluster_launch_checks_and_threads_the_profile(runner, cluster_launch):
+    result = runner.invoke(main, [*cluster_launch.argv, "--nodes", "1", "--no-setup", "--iam-instance-profile", "app"])
+    assert result.exit_code == 0, result.output
+    cluster_launch.mocks.profile_check.assert_called_once()
+    assert cluster_launch.mocks.launch.call_args[0][0].iam_instance_profile == "app"
+    assert "WARNING" not in result.output  # a new cluster has no nodes to disagree with
+
+
+@pytest.mark.parametrize(
+    "existing_profile,flag,expected",
+    [
+        pytest.param(
+            "", ["--iam-instance-profile", "app"], "have IAM instance profile none; new nodes get app", id="add"
+        ),
+        pytest.param("old", [], "have IAM instance profile old; new nodes get none", id="drop"),
+    ],
+)
+def test_growing_a_cluster_warns_about_mismatched_profiles(runner, cluster_launch, existing_profile, flag, expected):
+    cluster_launch.nodes.return_value = [_node("i-0", IamInstanceProfile=existing_profile)]
+    result = runner.invoke(main, [*cluster_launch.argv, "--nodes", "2", "--no-setup", *flag])
+    assert result.exit_code == 0, result.output
+    assert "i-0" in result.output and expected in result.output
+    assert ("associate-iam-instance-profile" in result.output) == bool(flag)
 
 
 def test_cluster_launch_reports_nothing_to_add_for_a_half_dead_cluster(runner, cluster_nodes):

@@ -162,12 +162,9 @@ def test_ebs_volume_az_is_a_hard_pin(plan_azs, key_path):
         captured["ctx"] = prepare_region("us-west-2")
         raise CLIError("stop here")
 
-    with (
-        patch("aws_bootstrap.cli.resolve_ebs_placement_az", return_value="us-west-2c"),
-        patch("aws_bootstrap.cli.launch_with_retry", side_effect=fake_launch),
-    ):
+    with patch("aws_bootstrap.cli.launch_with_retry", side_effect=fake_launch):
         _run("launch", "--key-path", str(key_path), "--ebs-volume-id", "vol-1", "--region", "us-west-2")
-    assert captured["ctx"].placement_azs == ("us-west-2c",)
+    assert captured["ctx"].placement_azs == ("us-west-2a",)  # the located volume's AZ (conftest)
     assert captured["ctx"].hard_pin is True
 
 

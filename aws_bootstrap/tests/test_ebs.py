@@ -9,12 +9,14 @@ import pytest
 from aws_bootstrap.ec2 import (
     EBS_DEVICE_NAME,
     CLIError,
+    VolumeLocation,
     attach_ebs_volume,
     create_ebs_volume,
     delete_ebs_volume,
     find_ebs_volumes_for_instance,
     find_orphan_ebs_volumes,
     find_orphan_ebs_volumes_in_regions,
+    locate_ebs_volume,
     validate_ebs_volume,
 )
 
@@ -228,3 +230,76 @@ def test_find_orphan_ebs_volumes_in_regions_survives_region_failure():
     )
     orphans = find_orphan_ebs_volumes_in_regions(session, "aws-bootstrap-g4dn", ["eu-west-1", "us-west-2"], set())
     assert [v["VolumeId"] for v in orphans] == ["vol-w"]
+
+
+# ---------------------------------------------------------------------------
+# locate_ebs_volume: an --ebs-volume-id implies its region and AZ
+# ---------------------------------------------------------------------------
+
+ATTACHED = {**_volume(state="in-use", az="us-east-1d", volume_id="vol-1"), "Attachments": [{"InstanceId": "i-old"}]}
+
+
+def _volume_client(volume: dict | None = None, error: Exception | None = None) -> MagicMock:
+    """describe_volumes in one region: *volume*, *error*, or (neither) InvalidVolume.NotFound."""
+    client = MagicMock()
+    if volume:
+        client.describe_volumes.return_value = {"Volumes": [volume]}
+    else:
+        client.describe_volumes.side_effect = error or _client_error("InvalidVolume.NotFound")
+    return client
+
+
+def test_locate_finds_the_volume_in_the_first_regions_without_listing_others():
+    everywhere = MagicMock()
+    session = _session({"us-west-2": _volume_client(_volume(volume_id="vol-1"))})
+    assert locate_ebs_volume(session, "vol-1", ("us-west-2",), everywhere) == VolumeLocation(
+        "vol-1", "us-west-2", "us-west-2a", "available"
+    )
+    everywhere.assert_not_called()
+
+
+def test_locate_then_searches_the_other_enabled_regions():
+    clients = {"us-west-2": _volume_client(), "eu-west-1": _volume_client(), "us-east-1": _volume_client(ATTACHED)}
+    loc = locate_ebs_volume(_session(clients), "vol-1", ("us-west-2",), lambda: ["eu-west-1", "us-east-1", "us-west-2"])
+    assert loc == VolumeLocation("vol-1", "us-east-1", "us-east-1d", "in-use", attached_to="i-old")
+    clients["us-west-2"].describe_volumes.assert_called_once()  # not searched twice
+
+
+def test_locate_rejects_a_malformed_id_without_searching_on():
+    everywhere = MagicMock()
+    session = _session({"us-west-2": _volume_client(error=_client_error("InvalidParameterValue"))})
+    with pytest.raises(CLIError, match="vol-bogus is not a valid EBS volume ID"):
+        locate_ebs_volume(session, "vol-bogus", ("us-west-2",), everywhere)
+    everywhere.assert_not_called()
+
+
+def _cannot_list() -> list[str]:
+    raise _client_error("UnauthorizedOperation")
+
+
+@pytest.mark.parametrize(
+    "clients,everywhere,match",
+    [
+        pytest.param(
+            {"us-west-2": _volume_client(), "us-east-1": _volume_client()},
+            lambda: ["us-east-1", "us-west-2"],
+            r"vol-1 not found in any of the 2 region\(s\) searched\.$",
+            id="nowhere",
+        ),
+        pytest.param(
+            {"us-west-2": _volume_client(), "eu-west-1": _volume_client(error=_client_error("AuthFailure"))},
+            lambda: ["eu-west-1"],
+            r"Couldn't check: eu-west-1 \(.*AuthFailure",
+            id="unqueryable-region-is-named",
+        ),
+        pytest.param(
+            {"us-west-2": _volume_client()},
+            _cannot_list,
+            r"Couldn't check: other regions \(could not list them",
+            id="region-list-unavailable",
+        ),
+    ],
+)
+def test_locate_not_found_says_what_was_and_wasnt_searched(clients, everywhere, match):
+    with pytest.raises(CLIError, match=match):
+        locate_ebs_volume(_session(clients), "vol-1", ("us-west-2",), everywhere)
