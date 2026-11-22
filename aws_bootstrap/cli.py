@@ -62,6 +62,7 @@ from .ec2 import (
     validate_ebs_volume,
     wait_instance_ready,
 )
+from .errors import CREDENTIAL_ERROR_CODES
 from .iam import InstanceProfileError, check_instance_profile, instance_profile_name
 from .output import OutputFormat, emit, get_format, is_text
 from .quota import (
@@ -252,7 +253,7 @@ class _AWSGroup(click.Group):
             ) from None
         except botocore.exceptions.ClientError as e:
             code = e.response["Error"]["Code"]
-            if code in ("AuthFailure", "UnauthorizedOperation", "ExpiredTokenException", "ExpiredToken"):
+            if code in CREDENTIAL_ERROR_CODES or code == "UnauthorizedOperation":
                 raise CLIError(
                     f"AWS authorization failed: {e.response['Error']['Message']}\n\n"
                     "  Your credentials may be expired or lack the required permissions.\n"

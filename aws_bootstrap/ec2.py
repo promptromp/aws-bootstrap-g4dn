@@ -33,7 +33,7 @@ from .constants import (
     TAG_NAME,
     VOLUME_TYPE,
 )
-from .errors import CLIError
+from .errors import CREDENTIAL_ERROR_CODES, CLIError
 from .iam import InstanceProfileError, instance_profile_name, instance_profile_spec
 from .output import echo, is_text, secho
 from .retry import backoff_sleep_seconds
@@ -1353,6 +1353,15 @@ def _volume_location(volume_id: str, region: str, volume: dict) -> VolumeLocatio
     )
 
 
+def _failure_reason(exc: Exception) -> str:
+    """A short reason for a region that couldn't be queried (its messages can be long and unique)."""
+    if isinstance(exc, botocore.exceptions.ClientError):
+        if exc.response["Error"]["Code"] in CREDENTIAL_ERROR_CODES:
+            raise exc  # bad credentials fail everywhere: let the CLI's credentials message handle it
+        return exc.response["Error"]["Code"]
+    return type(exc).__name__
+
+
 def _sweep_for_volume(
     session, volume_id: str, regions: list[str], failures: dict[str, str], max_workers: int
 ) -> tuple[str, dict] | None:
@@ -1367,7 +1376,7 @@ def _sweep_for_volume(
             try:
                 volume = future.result()
             except (botocore.exceptions.ClientError, *_UNREACHABLE) as exc:
-                failures[region] = str(exc)
+                failures[region] = _failure_reason(exc)
                 continue
             if volume is not None:
                 return region, volume
@@ -1386,36 +1395,39 @@ def locate_ebs_volume(
 ) -> VolumeLocation:
     """Find the region and AZ of an existing EBS volume.
 
-    Asks the requested regions (*first*, usually one) in turn. An error there
-    propagates, so a credentials or permission problem gets the CLI's usual message
-    instead of a misleading "not found", and an unreachable endpoint is a
-    region-named :class:`CLIError`. Only if the volume isn't there are the rest of
-    ``everywhere()`` (the enabled regions) swept in parallel, so the caller can name
-    where it really is; a region that fails in that sweep is reported, never read as
-    "not there". Raises :class:`CLIError` for a malformed ID or a volume found nowhere.
+    Asks *first* (the requested regions, usually one) and, only if the volume isn't
+    there, the rest of ``everywhere()`` (the enabled regions) in parallel, so the
+    caller can name where it really is. A region that can't be queried (a regional
+    deny, an unreachable endpoint) is reported in the not-found error, never read as
+    "not there", and doesn't stop the search. Bad credentials propagate (the CLI has
+    a message for them). Raises :class:`CLIError` for a malformed ID or a volume
+    found nowhere.
     """
     searched = list(dict.fromkeys(first))
-    for region in searched:
-        try:
-            volume = _describe_volume_in(session, volume_id, region)
-        except _UNREACHABLE as exc:
-            raise CLIError(f"[{region}] couldn't reach EC2 to look up {volume_id}: {exc}") from None
-        if volume is not None:
-            return _volume_location(volume_id, region, volume)
-
     failures: dict[str, str] = {}
-    try:
-        rest = [r for r in everywhere() if r not in searched]
-    except (botocore.exceptions.ClientError, *_UNREACHABLE) as exc:
-        failures["other regions"] = f"could not list them: {exc}"
-        rest = []
-    found = _sweep_for_volume(session, volume_id, rest, failures, max_workers)
+    found = _sweep_for_volume(session, volume_id, searched, failures, max_workers)
+    rest: list[str] = []
+    if found is None:
+        try:
+            rest = [r for r in everywhere() if r not in searched]
+        except (botocore.exceptions.ClientError, *_UNREACHABLE) as exc:
+            failures["other regions"] = f"could not list them: {_failure_reason(exc)}"
+        found = _sweep_for_volume(session, volume_id, rest, failures, max_workers)
     if found:
         return _volume_location(volume_id, *found)
-    checked = len(searched) + len([r for r in rest if r not in failures])
-    message = f"EBS volume {volume_id} not found in the {checked} region(s) checked."
+    checked = len([r for r in searched + rest if r not in failures])
+    message = (
+        f"EBS volume {volume_id} not found in the {checked} region(s) checked."
+        if checked
+        else f"Couldn't look up EBS volume {volume_id}: no region answered."
+    )
     if failures:
-        message += "\n  Couldn't check: " + "; ".join(f"{r} ({err})" for r, err in sorted(failures.items()))
+        by_reason: dict[str, list[str]] = {}
+        for region, reason in failures.items():
+            by_reason.setdefault(reason, []).append(region)
+        message += "\n  Couldn't check: " + "; ".join(
+            f"{', '.join(sorted(regions))} ({reason})" for reason, regions in sorted(by_reason.items())
+        )
     raise CLIError(message)
 
 

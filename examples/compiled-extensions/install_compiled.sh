@@ -56,11 +56,12 @@ set -euo pipefail
 
 warn() { echo "[compiled] WARNING: $*" >&2; }
 
+# A URL (incl. "name @ url") or a local directory/file, rather than a package name.
 is_direct_reference() {
     case "$1" in
-        *://* | *" @ "* | .* | /*) return 0 ;;
-        *) return 1 ;;
+        *://* | *" @ "*) return 0 ;;
     esac
+    [ -e "$1" ]
 }
 
 # The cache key (see WHY above), from the venv's python and the GPU.
@@ -106,9 +107,15 @@ build_wheel() {
     # build made against an earlier torch on this instance.
     "$py" -m pip wheel --no-build-isolation --no-deps --no-cache-dir --no-binary :all: \
         --wheel-dir "$work/build" "$spec" >&2
-    local -a built=("$work/build"/*.whl)
-    if [ "${#built[@]}" -ne 1 ] || [ ! -e "${built[0]}" ]; then
-        echo "[compiled] $spec: expected one wheel from the build, found: ${built[*]}" >&2
+    local -a built
+    shopt -s nullglob
+    built=("$work/build"/*.whl)
+    shopt -u nullglob
+    if [ "${#built[@]}" -eq 0 ]; then
+        echo "[compiled] $spec: pip built no wheel (does an environment marker exclude this Python?)" >&2
+        return 1
+    elif [ "${#built[@]}" -gt 1 ]; then
+        echo "[compiled] $spec: expected one wheel from the build, got: ${built[*]##*/}" >&2
         return 1
     fi
     mkdir -p "$dest" && mv -f "${built[0]}" "$dest/"

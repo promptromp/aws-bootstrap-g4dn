@@ -222,7 +222,7 @@ def test_cluster_launch_profile_check_fails_before_anything_is_created(runner, c
         pytest.param(
             "old", PROFILE, "profile old; new nodes get app", "replace-iam-instance-profile", "associate-", id="swap"
         ),
-        pytest.param("old", [], "profile old; new nodes get none", None, "aws ec2", id="drop"),
+        pytest.param("old", [], "profile old; new nodes get none", "", "aws ec2", id="drop"),
     ],
 )
 def test_growing_a_cluster_warns_about_mismatched_profiles(
@@ -232,7 +232,7 @@ def test_growing_a_cluster_warns_about_mismatched_profiles(
     result = runner.invoke(main, [*cluster_launch.argv, "--nodes", "2", "--no-setup", *flag])
     assert result.exit_code == 0, result.output
     assert f"node(s) i-0 have IAM instance {expected}" in result.output
-    assert hint is None or hint in result.output
+    assert hint in result.output
     assert no_hint not in result.output
 
 

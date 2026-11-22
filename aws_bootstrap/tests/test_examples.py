@@ -36,12 +36,18 @@ def test_install_compiled_without_packages_is_a_usage_error(tmp_path):
 # install_compiled.sh, end to end (slow: builds a venv and real wheels)
 # ---------------------------------------------------------------------------
 
-_FAKE_TORCH = 'class version:\n    cuda = "13.4"\n__version__ = "2.15.0+cu134"\n'
-_SETUP_PY = """\
+_TORCH_SETUP_PY = """\
+from setuptools import setup
+setup(name="torch", version="{version}", packages=["torch"])
+"""
+_TORCH_INIT = 'class version:\n    cuda = "13.4"\n__version__ = "2.15.0+cu134"\n'
+_FANCY_SETUP_PY = """\
 import torch  # like a CUDA extension: needs the venv's torch at build time (--no-build-isolation)
 from setuptools import setup
-setup(name="Fancy_Ext", version="{version}", py_modules=["fancy_ext"])
+setup(name="Fancy_Ext", version="{version}", py_modules=["fancy_ext"], install_requires={requires!r})
 """
+# Fancy_Ext 3.0 needs another torch: installing it must fail rather than replace the venv's.
+_FANCY_REQUIRES = {"1.0": [], "1.2": [], "2.0": [], "3.0": ["torch==9.9"]}
 _STUBS = {
     "nvidia-smi": "echo 8.9",
     "nvcc": 'echo "Cuda compilation tools, release 13.5, V13.5.1"',
@@ -65,30 +71,39 @@ def _run_quiet(*cmd: str | Path, **kw) -> None:
 
 @pytest.fixture(scope="module")
 def toolchain(tmp_path_factory):
-    """A venv with pip, setuptools, the build tools and a stand-in torch, plus Fancy_Ext 1.0/1.2/2.0 sdists."""
+    """A venv with pip, setuptools, the build tools and a stand-in torch 2.15.0+cu134, plus:
+
+    - ``sdists/`` (pip's find-links): Fancy_Ext 1.0, 1.2, 2.0 and 3.0 sdists, and a prebuilt 2.0 wheel;
+    - ``wheels/`` (uv's find-links): the torch wheels, including the 9.9 that Fancy_Ext 3.0 asks for.
+    """
     uv = shutil.which("uv")
     if not uv or not shutil.which("bash"):
         pytest.skip("needs uv and bash")
     root = tmp_path_factory.mktemp("toolchain")
-    venv = root / "venv"
-    python = venv / "bin" / "python"
+    python = root / "venv" / "bin" / "python"
     try:
-        _run_quiet(uv, "venv", "--python", sys.executable, venv)
+        _run_quiet(uv, "venv", "--python", sys.executable, root / "venv")
         _run_quiet(uv, "pip", "install", "--python", python, "pip", "setuptools", "wheel", "ninja", "packaging")
     except subprocess.CalledProcessError as e:  # e.g. offline with a cold uv cache
         pytest.skip(f"could not build the scratch venv: {e.stderr.decode()[-300:]}")
-    purelib = subprocess.check_output([python, "-c", "import sysconfig; print(sysconfig.get_path('purelib'))"])
-    torch = Path(purelib.decode().strip()) / "torch"
-    torch.mkdir()
-    (torch / "__init__.py").write_text(_FAKE_TORCH)
-    sdists = root / "sdists"
-    for version in ("1.0", "1.2", "2.0"):
+    wheels, sdists = root / "wheels", root / "sdists"
+    build_wheel = (python, "-m", "pip", "wheel", "-q", "--no-deps", "--no-build-isolation")
+    for version in ("2.15.0+cu134", "9.9"):  # real distributions, so uv knows torch's version
+        src = root / "torch-src" / version
+        (src / "torch").mkdir(parents=True)
+        (src / "torch" / "__init__.py").write_text(_TORCH_INIT)
+        (src / "setup.py").write_text(_TORCH_SETUP_PY.format(version=version))
+        _run_quiet(*build_wheel, "-w", wheels, src)
+    _run_quiet(uv, "pip", "install", "--python", python, "--no-index", "--find-links", wheels, "torch==2.15.0+cu134")
+    for version, requires in _FANCY_REQUIRES.items():
         src = root / "src" / f"Fancy_Ext-{version}"
         src.mkdir(parents=True)
-        (src / "setup.py").write_text(_SETUP_PY.format(version=version))
+        (src / "setup.py").write_text(_FANCY_SETUP_PY.format(version=version, requires=requires))
         (src / "fancy_ext.py").write_text("")
         _run_quiet(python, "setup.py", "-q", "sdist", "-d", sdists, cwd=src)
-    return {"uv": uv, "python": python, "sdists": sdists, "src": root / "src"}
+    # A prebuilt wheel on the index: the script must still compile from source (--no-binary).
+    _run_quiet(*build_wheel, "-w", sdists, root / "src" / "Fancy_Ext-2.0")
+    return {"uv": uv, "python": python, "root": root, "sdists": sdists, "wheels": wheels}
 
 
 @pytest.fixture
@@ -112,22 +127,32 @@ def instance(tmp_path, toolchain):
             (bin_dir / tool).chmod(0o755)
         (bin_dir / "uv").symlink_to(toolchain["uv"])
 
-        def run(*packages: str, cache: bool = True, aws_fail: bool = False) -> tuple[int, str, Path | None]:
+        def run(
+            *packages: str, cache: bool = True, aws_fail: bool = False, cwd: Path | None = None
+        ) -> tuple[int, str, Path | None]:
             env = {
                 "HOME": str(home),
                 "PATH": "/usr/bin:/bin",
                 "VENV": str(toolchain["python"].parent.parent),
                 "FAKE_S3": str(fake_s3),
-                # Builds resolve from the local sdists, never the network.
+                # Everything resolves locally, never from the network.
                 "PIP_NO_INDEX": "1",
                 "PIP_FIND_LINKS": str(toolchain["sdists"]),
+                "UV_NO_INDEX": "1",
+                "UV_FIND_LINKS": str(toolchain["wheels"]),
                 "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(tmp_path / "uv-cache")),
                 **({"WHEEL_CACHE": "s3://bucket/wheels"} if cache else {}),
                 **({"AWS_FAIL": "1"} if aws_fail else {}),
             }
             with INSTALL_COMPILED.open() as script:
                 proc = subprocess.run(
-                    ["bash", "-s", "--", *packages], stdin=script, env=env, capture_output=True, text=True, timeout=180
+                    ["bash", "-s", "--", *packages],
+                    stdin=script,
+                    env=env,
+                    cwd=cwd,
+                    capture_output=True,
+                    text=True,
+                    timeout=180,
                 )
             caches = list((home / "wheels").glob("*"))
             return proc.returncode, proc.stdout + proc.stderr, caches[0] if caches else None
@@ -138,8 +163,8 @@ def instance(tmp_path, toolchain):
     return make
 
 
-def _installed_version(toolchain) -> str:
-    code = "import importlib.metadata as m; print(m.version('fancy-ext'))"
+def _installed_version(toolchain, dist: str = "fancy-ext") -> str:
+    code = f"import importlib.metadata as m; print(m.version({dist!r}))"
     return subprocess.check_output([toolchain["python"], "-c", code]).decode().strip()
 
 
@@ -170,7 +195,7 @@ def test_the_next_instance_installs_from_the_s3_cache(instance, toolchain):
 @pytest.mark.parametrize(
     "spec,expected_version,builds",
     [
-        pytest.param("fancy_ext>=1.1", "2.0", True, id="cache-does-not-satisfy"),
+        pytest.param("fancy_ext>=1.1,<3", "2.0", True, id="cache-does-not-satisfy"),
         pytest.param("fancy-ext~=1.0", "1.0", False, id="cache-satisfies"),
         pytest.param("fancy-ext", "1.0", False, id="unpinned-reuses-cache"),
     ],
@@ -185,15 +210,46 @@ def test_pip_decides_whether_the_cache_satisfies_the_spec(instance, toolchain, s
 
 
 @pytest.mark.slow
-def test_a_direct_reference_builds_but_stays_out_of_the_cache(instance, toolchain):
+@pytest.mark.parametrize(
+    "spec,cwd",
+    [
+        pytest.param("{root}/src/Fancy_Ext-1.2", None, id="absolute-path"),
+        pytest.param("src/Fancy_Ext-1.2", "root", id="relative-path"),
+        pytest.param("fancy_ext-1.2.tar.gz", "sdists", id="sdist-file"),
+        pytest.param("fancy-ext @ file://{root}/src/Fancy_Ext-1.2", None, id="url"),
+    ],
+)
+def test_a_direct_reference_builds_but_stays_out_of_the_cache(instance, toolchain, spec, cwd):
     run = instance()
     run("fancy-ext==1.0")
-    rc, out, cache = run(str(toolchain["src"] / "Fancy_Ext-1.2"))
+    rc, out, cache = run(spec.format(root=toolchain["root"]), cwd=toolchain[cwd] if cwd else None)
     assert rc == 0, out
     assert "building against torch" in out
     assert "aws cp" not in out
     assert [w.name for w in cache.iterdir()] == ["fancy_ext-1.0-py3-none-any.whl"]  # 1.2 isn't cached
+    assert not (instance.s3 / "bucket" / "wheels" / cache.name / "fancy_ext-1.2-py3-none-any.whl").exists()
     assert _installed_version(toolchain) == "1.2"
+
+
+@pytest.mark.slow
+def test_compiles_even_when_the_index_has_a_prebuilt_wheel(instance):
+    rc, out, _ = instance()("fancy-ext==2.0")
+    assert rc == 0, out
+    assert "Building wheel for fancy" in out  # compiled here, not the index's prebuilt wheel
+
+
+@pytest.mark.slow
+def test_a_wheel_that_needs_another_torch_fails_instead_of_replacing_it(instance, toolchain):
+    rc, out, _ = instance()("fancy-ext==3.0")
+    assert rc != 0, out
+    assert _installed_version(toolchain, "torch") == "2.15.0+cu134"
+
+
+@pytest.mark.slow
+def test_a_spec_whose_marker_excludes_this_python_explains_itself(instance):
+    rc, out, _ = instance()("fancy-ext==1.0; python_version < '3'")
+    assert rc != 0
+    assert "pip built no wheel (does an environment marker exclude this Python?)" in out
 
 
 @pytest.mark.slow

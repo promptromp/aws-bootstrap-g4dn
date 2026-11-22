@@ -275,20 +275,27 @@ def test_locate_rejects_a_malformed_id_without_searching_on(code):
     everywhere.assert_not_called()
 
 
-def test_locate_lets_a_requested_regions_api_error_through():
-    """Bad credentials must reach the CLI's credentials message, not read as "not found"."""
-    everywhere = MagicMock()
-    session = _session({"us-west-2": _volume_client(error=_client_error("AuthFailure"))})
+@pytest.mark.parametrize("region_answering", ["us-west-2", "eu-west-1"], ids=["requested", "elsewhere"])
+def test_locate_lets_bad_credentials_through(region_answering):
+    """Bad credentials fail everywhere: they must reach the CLI's credentials message, not read as "not found"."""
+    clients = {"us-west-2": _volume_client(), "eu-west-1": _volume_client()}
+    clients[region_answering] = _volume_client(error=_client_error("AuthFailure"))
     with pytest.raises(botocore.exceptions.ClientError, match="AuthFailure"):
-        locate_ebs_volume(session, "vol-1", ("us-west-2",), everywhere)
-    everywhere.assert_not_called()
+        locate_ebs_volume(_session(clients), "vol-1", ("us-west-2",), lambda: ["eu-west-1"])
 
 
-def test_locate_names_an_unreachable_requested_region():
-    timeout = botocore.exceptions.ConnectTimeoutError(endpoint_url="https://ec2.us-west-2.amazonaws.com")
-    session = _session({"us-west-2": _volume_client(error=timeout)})
-    with pytest.raises(CLIError, match=r"\[us-west-2\] couldn't reach EC2 to look up vol-1"):
-        locate_ebs_volume(session, "vol-1", ("us-west-2",), MagicMock())
+@pytest.mark.parametrize(
+    "error",
+    [
+        pytest.param(_client_error("UnauthorizedOperation"), id="regional-deny"),
+        pytest.param(botocore.exceptions.ConnectTimeoutError(endpoint_url="https://ec2"), id="unreachable"),
+    ],
+)
+def test_locate_looks_past_a_requested_region_it_cannot_query(error):
+    """An SCP denying the default region, or its endpoint timing out, mustn't hide a volume elsewhere."""
+    clients = {"us-west-2": _volume_client(error=error), "us-east-1": _volume_client(ATTACHED)}
+    loc = locate_ebs_volume(_session(clients), "vol-1", ("us-west-2",), lambda: ["us-east-1", "us-west-2"])
+    assert loc.region == "us-east-1"
 
 
 def _cannot_list() -> list[str]:
@@ -305,9 +312,9 @@ def _cannot_list() -> list[str]:
             id="nowhere",
         ),
         pytest.param(
-            {"us-west-2": _volume_client(), "eu-west-1": _volume_client(error=_client_error("AuthFailure"))},
+            {"us-west-2": _volume_client(), "eu-west-1": _volume_client(error=_client_error("UnauthorizedOperation"))},
             lambda: ["eu-west-1"],
-            r"not found in the 1 region\(s\) checked\.\n  Couldn't check: eu-west-1 \(.*AuthFailure",
+            r"not found in the 1 region\(s\) checked\.\n  Couldn't check: eu-west-1 \(UnauthorizedOperation\)$",
             id="unqueryable-region-is-named",
         ),
         pytest.param(
@@ -316,13 +323,24 @@ def _cannot_list() -> list[str]:
                 "eu-west-1": _volume_client(error=botocore.exceptions.ReadTimeoutError(endpoint_url="https://x")),
             },
             lambda: ["eu-west-1"],
-            r"Couldn't check: eu-west-1 \(Read timeout",
+            r"Couldn't check: eu-west-1 \(ReadTimeoutError\)$",
             id="timed-out-region-is-named",
+        ),
+        pytest.param(
+            {
+                "us-west-2": _volume_client(error=_client_error("UnauthorizedOperation")),
+                "eu-west-1": _volume_client(error=_client_error("UnauthorizedOperation")),
+                "us-east-1": _volume_client(error=_client_error("OptInRequired")),
+            },
+            lambda: ["eu-west-1", "us-east-1"],
+            r"no region answered\.\n  Couldn't check: us-east-1 \(OptInRequired\); "
+            r"eu-west-1, us-west-2 \(UnauthorizedOperation\)$",
+            id="nothing-answered-grouped-by-reason",
         ),
         pytest.param(
             {"us-west-2": _volume_client()},
             _cannot_list,
-            r"Couldn't check: other regions \(could not list them",
+            r"Couldn't check: other regions \(could not list them: UnauthorizedOperation\)$",
             id="region-list-unavailable",
         ),
     ],

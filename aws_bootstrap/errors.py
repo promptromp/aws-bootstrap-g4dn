@@ -5,6 +5,10 @@ from __future__ import annotations
 import click
 
 
+# AWS error codes that mean the credentials themselves are bad, in every region.
+CREDENTIAL_ERROR_CODES = frozenset({"AuthFailure", "ExpiredToken", "ExpiredTokenException"})
+
+
 class CLIError(click.ClickException):
     """A ClickException that displays the error message in red."""
 
