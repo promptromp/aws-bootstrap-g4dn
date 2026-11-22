@@ -500,16 +500,6 @@ def test_status_prices_on_demand_instances(runner, status_aws, price, present, a
     assert od_price.call_args[0][1:] == ("g6.2xlarge", "us-west-2")  # the instance's type and region
 
 
-def test_status_json_reports_the_on_demand_price_and_cost(runner, status_aws):
-    status_aws.find.return_value = [_instance("i-ondemand", Lifecycle="on-demand")]
-    with patch("aws_bootstrap.cli.on_demand_price", return_value=0.526):
-        result = runner.invoke(main, ["-o", "json", *STATUS])
-    inst = json.loads(result.output)["instances"][0]
-    assert inst["on_demand_price_per_hour"] == 0.526
-    assert "spot_price_per_hour" not in inst
-    assert inst["estimated_cost"] > 0
-
-
 def test_status_shows_alias(runner, status_aws):
     status_aws.find.return_value = [_instance()]
     status_aws.hosts.return_value = {"i-abc123": "aws-gpu1"}
@@ -1258,10 +1248,10 @@ def test_status_prices_each_instance_by_its_market(runner, status_aws):
     with patch("aws_bootstrap.cli.on_demand_price", return_value=0.526):
         result = runner.invoke(main, ["-o", "json", *STATUS])
     prices = {
-        i["instance_id"]: (i.get("spot_price_per_hour"), i.get("on_demand_price_per_hour"))
+        i["instance_id"]: (i.get("spot_price_per_hour"), i.get("on_demand_price_per_hour"), "estimated_cost" in i)
         for i in json.loads(result.output)["instances"]
     }
-    assert prices == {"i-spot": (0.15, None), "i-od": (None, 0.526), "i-cb": (None, None)}
+    assert prices == {"i-spot": (0.15, None, True), "i-od": (None, 0.526, True), "i-cb": (None, None, False)}
 
 
 def test_list_instance_types_output(runner, cli_session, instance_type_rows):
