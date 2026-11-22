@@ -137,10 +137,12 @@ status` afterward to confirm nothing remains.)
 - **One AZ.** Cluster nodes are pinned to a single AZ for low-latency NCCL. A
   spot shortage in that AZ affects the whole cluster — use `--wait`, or start a
   fresh cluster id (which can land in a different AZ).
-- **EFA is out of scope.** `g4dn`/`g5` instances run NCCL over ordinary VPC
-  networking (EFA, for the lowest-latency collective comms, is essentially
-  P-series only). This is fine for development, learning DDP, and modest-scale
-  training; it is not tuned for large-scale LLM throughput.
+- **EFA isn't configured (yet).** Nodes run NCCL over ordinary VPC networking.
+  EFA, for the lowest-latency collective comms, is available on the P-series and
+  on larger G types (e.g. g6.12xlarge, g6e.12xlarge, g7e.8xlarge and up; see the
+  EFA column of `aws-bootstrap list instance-types`), but aws-bootstrap doesn't
+  attach EFA interfaces. Plain networking is fine for development, learning DDP,
+  and modest-scale training; it is not tuned for large-scale LLM throughput.
 - **Spot vs on-demand.** Spot is the default and cheapest. `cluster launch` does
   not silently fall back to on-demand — if spot is exhausted, re-run with
   `--wait` (retry) or `--on-demand` (and ensure you have on-demand quota).

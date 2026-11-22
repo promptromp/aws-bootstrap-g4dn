@@ -98,7 +98,9 @@ def launch_aws(cli_session):
     would return whatever the mocked client's ``describe_instance_types`` yields (a
     MagicMock), not a real architecture. Set ``arch.return_value`` to test arm64.
     The pre-launch lookups are stubbed too: ``volume`` (``--ebs-volume-id``: an
-    available volume in us-west-2a) and ``profile_check`` (``--iam-instance-profile``).
+    available volume in us-west-2a) and ``profile_check`` (``--iam-instance-profile``),
+    and so are the dry run's pool facts (``pools``): unknown prices, scores and quota
+    unless a test sets them.
     """
     with (
         patch("aws_bootstrap.cli.get_latest_ami", return_value={"ImageId": "ami-123", "Name": "TestAMI"}) as ami,
@@ -107,6 +109,10 @@ def launch_aws(cli_session):
         patch("aws_bootstrap.cli.ensure_security_group", return_value="sg-123") as sg,
         patch("aws_bootstrap.cli.locate_ebs_volume", side_effect=located_volume) as volume,
         patch("aws_bootstrap.cli.check_instance_profile", return_value=["app-role"]) as profile_check,
+        patch("aws_bootstrap.cli.on_demand_price", return_value=None) as od_price,
+        patch("aws_bootstrap.cli.spot_placement_scores", return_value={}) as scores,
+        patch("aws_bootstrap.cli.instance_type_vcpus", return_value=4),
+        patch("aws_bootstrap.cli.vcpu_fit", return_value=None) as quota_fit,
     ):
         yield SimpleNamespace(
             session=cli_session,
@@ -116,6 +122,7 @@ def launch_aws(cli_session):
             sg=sg,
             volume=volume,
             profile_check=profile_check,
+            pools=SimpleNamespace(od_price=od_price, scores=scores, quota_fit=quota_fit),
         )
 
 
@@ -173,6 +180,7 @@ def instance_type_rows():
             "VCpuCount": 4,
             "MemoryMiB": 16384,
             "GpuSummary": "1x T4 (16384 MiB)",
+            "EfaSupported": False,
         }
     ]
 

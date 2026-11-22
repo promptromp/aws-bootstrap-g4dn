@@ -84,6 +84,7 @@ aws-bootstrap launch [OPTIONS]
   "regions_tried": ["us-west-2", "us-east-1"],
   "ssh_alias": "aws-gpu1",
   "spot_price_per_hour": 0.9911,
+  "on_demand_price_per_hour": 0.526,
   "iam_instance_profile": "my-ec2-s3-profile",
   "cuda_version": "13.2",
   "ebs_volume": {
@@ -94,7 +95,7 @@ aws-bootstrap launch [OPTIONS]
 }
 ```
 
-`status` is the outcome discriminator, present on every non-dry-run `launch` result: `"ready"` on success, `"no-public-ip"` or `"ssh-unavailable"` on an **incomplete launch**. The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id` is used. `cuda_version` is present only when remote setup ran and a CUDA version was detected (omitted with `--no-setup` or on non-CUDA/smoke-test instances). `region` is the region the instance actually launched in; `regions_tried` lists all regions attempted in order. `spot_price_per_hour` is the current spot price in the chosen `availability_zone` (spot launches only; omitted if the lookup fails, which never fails the launch). `iam_instance_profile` (the profile's name) is present only with `--iam-instance-profile`, also on an incomplete launch.
+`status` is the outcome discriminator, present on every non-dry-run `launch` result: `"ready"` on success, `"no-public-ip"` or `"ssh-unavailable"` on an **incomplete launch**. The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id` is used. `cuda_version` is present only when remote setup ran and a CUDA version was detected (omitted with `--no-setup` or on non-CUDA/smoke-test instances). `region` is the region the instance actually launched in; `regions_tried` lists all regions attempted in order. `spot_price_per_hour` is the current spot price in the chosen `availability_zone` (spot launches only; omitted if the lookup fails, which never fails the launch). `on_demand_price_per_hour` is the region's on-demand price for the type, for comparison: present for either market, omitted if unknown. `iam_instance_profile` (the profile's name) is present only with `--iam-instance-profile`, also on an incomplete launch.
 
 **Incomplete launch** (exit code 1 — the instance **exists and is billing**, but is unusable):
 ```json
@@ -131,12 +132,33 @@ the instance rather than leaking it. Branch on `status`, not on the exit code al
   "wait_timeout_seconds": 1800,
   "availability_zones": {
     "us-west-2": [
-      {"zone": "us-west-2b", "spot_price": 0.9911},
-      {"zone": "us-west-2a", "spot_price": 2.2122}
+      {"zone": "us-west-2b", "spot_price": 0.9911, "placement_score": 9},
+      {"zone": "us-west-2a", "spot_price": 2.2122, "placement_score": 3}
     ]
+  },
+  "on_demand_price_per_hour": {"us-west-2": 0.526},
+  "spot_pools": {
+    "us-west-2": [
+      {"zone": "us-west-2a", "spot_price": 2.2122, "placement_score": 3},
+      {"zone": "us-west-2b", "spot_price": 0.9911, "placement_score": 9}
+    ]
+  },
+  "quota_fit": {
+    "us-west-2": {
+      "family": "gvt",
+      "spot": {"quota": 8, "in_use": 4, "needed": 4, "fits": true},
+      "on-demand": {"quota": 8, "in_use": 8, "needed": 4, "fits": false}
+    }
   }
 }
 ```
+
+**Choosing a pool from a dry run.** These are display only and never change what launches:
+- `on_demand_price_per_hour` per region;
+- `spot_pools` per region (spot only): every usable AZ with its spot price and **placement score**. The score is EC2's 1–10 estimate that a spot request succeeds there; a low-score cheapest AZ often has no capacity.
+- `quota_fit` per region: whether one more instance fits each market's vCPU quota, given running instances. `fits: false` means the launch would be refused in that market, so don't launch into it; text mode prints the exact `quota request` to fix it.
+
+Prefer a high-score AZ with `--az <zone>`; `--cheapest-az` ranks by price only. Any of these is `null` (or `unknown` in text) when its lookup isn't permitted (`pricing:GetProducts`, `ec2:GetSpotPlacementScores`, `servicequotas:GetServiceQuota`). AZ names are per account.
 
 With `--ebs-volume-id`, the dry run also carries `ebs_volume_id` and `ebs_volume_availability_zone`, and `regions` is the volume's region; with `--iam-instance-profile`, `iam_instance_profile`.
 
@@ -216,7 +238,7 @@ aws-bootstrap status [OPTIONS]
 }
 ```
 
-Top-level `regions_queried` lists every region the query was attempted against (including any that subsequently failed). `regions_failed` is present only when one or more regions could not be queried (e.g. unauthorized); those regions appear in both lists. Per-instance fields `gpu`, `ebs_volumes`, `spot_price_per_hour`, `uptime_seconds`, and `estimated_cost` are conditional. `iam_instance_profile` is always present: the attached profile's name, or `null`.
+Top-level `regions_queried` lists every region the query was attempted against (including any that subsequently failed). `regions_failed` is present only when one or more regions could not be queried (e.g. unauthorized); those regions appear in both lists. Per-instance fields `gpu`, `ebs_volumes`, `spot_price_per_hour` (spot) / `on_demand_price_per_hour` (on-demand, from the Price List API), `uptime_seconds`, and `estimated_cost` (running instances whose price is known) are conditional. `iam_instance_profile` is always present: the attached profile's name, or `null`.
 
 `orphan_volumes` is **always present** (empty list when none): aws-bootstrap data volumes that are detached and whose linked instance no longer exists — they still bill (`monthly_cost_usd` is an estimate at the common gp3 rate) until reattached (`launch --ebs-volume-id <id> --region <region>`) or deleted (`cleanup --include-ebs`). Reported even when `instances` is empty; in `table` mode orphans render as a second table.
 
@@ -372,10 +394,13 @@ derived from `--prefix`; suppressed for non-GPU families.
     "vcpus": 4,
     "memory_mib": 16384,
     "quota_family": "gvt",
+    "efa_supported": false,
     "gpu": "1x T4 (16384 MiB)"
   }
 ]
 ```
+
+`efa_supported` comes from EC2 (`NetworkInfo.EfaSupported`): EFA exists beyond the P-series, e.g. on g6.12xlarge, g6e.12xlarge, g7e.8xlarge and up. aws-bootstrap doesn't configure EFA yet.
 
 Fractional-GPU types (g6f, gr6f) report their share of one GPU, e.g.
 `"gpu": "1/8 L4 (2861 MiB)"`.

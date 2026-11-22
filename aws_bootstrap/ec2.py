@@ -1,6 +1,7 @@
 """EC2 instance provisioning: AMI lookup, security groups, and instance launch."""
 
 from __future__ import annotations
+import json
 import time
 from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -80,6 +81,15 @@ def instance_type_architecture(ec2_client, instance_type: str) -> str:
     if not arches or "x86_64" in arches:
         return "x86_64"
     return arches[0]
+
+
+def instance_type_vcpus(ec2_client, instance_type: str) -> int | None:
+    """Default vCPU count of an instance type (what its quota counts), or None if unknown."""
+    try:
+        types = ec2_client.describe_instance_types(InstanceTypes=[instance_type])["InstanceTypes"]
+        return int(types[0]["VCpuInfo"]["DefaultVCpus"]) if types else None
+    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError, KeyError, ValueError):
+        return None
 
 
 def get_latest_ami(ec2_client, ami_filter: str, architecture: str = "x86_64") -> dict:
@@ -1152,6 +1162,78 @@ def plan_azs(
     return options
 
 
+# ---------------------------------------------------------------------------
+# Pool facts shown by `launch --dry-run` (and the on-demand price after a launch).
+# All best-effort: None / {} on any error, never raise, never change what launches.
+# ---------------------------------------------------------------------------
+
+# The Price List API's endpoint for the aws partition (it serves every region's prices).
+_PRICING_REGION = "us-east-1"
+# What `launch` runs: shared-tenancy Linux with no pre-installed software or licence,
+# billed per running hour. With instanceType + regionCode, exactly one product matches.
+_ON_DEMAND_TERMS = {
+    "operatingSystem": "Linux",
+    "tenancy": "Shared",
+    "preInstalledSw": "NA",
+    "capacitystatus": "Used",
+    "licenseModel": "No License required",
+}
+
+
+def on_demand_price(session, instance_type: str, region: str) -> float | None:
+    """Current on-demand Linux price per hour of *instance_type* in *region*, from the Price List API.
+
+    ``None`` unless exactly one product and one price match (never a guess), and on
+    any error, e.g. no ``pricing:GetProducts`` permission or another AWS partition.
+    """
+    filters = [
+        {"Type": "TERM_MATCH", "Field": field_name, "Value": value}
+        for field_name, value in {"instanceType": instance_type, "regionCode": region, **_ON_DEMAND_TERMS}.items()
+    ]
+    try:
+        pricing = session.client("pricing", region_name=_PRICING_REGION)
+        products = pricing.get_products(ServiceCode="AmazonEC2", Filters=filters, MaxResults=2)["PriceList"]
+        if len(products) != 1:
+            return None
+        terms = json.loads(products[0])["terms"]["OnDemand"].values()
+        prices = [float(dim["pricePerUnit"]["USD"]) for term in terms for dim in term["priceDimensions"].values()]
+    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError, KeyError, TypeError, ValueError):
+        return None
+    return prices[0] if len(prices) == 1 and prices[0] > 0 else None
+
+
+def spot_placement_scores(session, instance_type: str, regions: tuple[str, ...]) -> dict[str, dict[str, int]]:
+    """EC2's spot placement score (1-10, how likely a spot request succeeds) per AZ: ``{region: {az: score}}``.
+
+    One ``get_spot_placement_scores`` call covers every region. AWS answers with zone
+    *IDs* (``use1-az6``), which each account maps to its own zone *names*, so each
+    region's ``describe_availability_zones`` translates them. ``{}`` on any error
+    (it needs ``ec2:GetSpotPlacementScores``).
+    """
+    if not regions:
+        return {}
+    try:
+        paginator = session.client("ec2", region_name=regions[0]).get_paginator("get_spot_placement_scores")
+        records = [
+            (rec["Region"], rec["AvailabilityZoneId"], int(rec["Score"]))
+            for page in paginator.paginate(
+                InstanceTypes=[instance_type], TargetCapacity=1, SingleAvailabilityZone=True, RegionNames=list(regions)
+            )
+            for rec in page.get("SpotPlacementScores", [])
+        ]
+        names: dict[str, str] = {}
+        for region in sorted({r for r, _, _ in records}):
+            zones = session.client("ec2", region_name=region).describe_availability_zones()["AvailabilityZones"]
+            names.update({z["ZoneId"]: z["ZoneName"] for z in zones})
+    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError, KeyError, TypeError, ValueError):
+        return {}
+    scores: dict[str, dict[str, int]] = {}
+    for region, zone_id, score in records:
+        if zone_id in names:
+            scores.setdefault(region, {})[names[zone_id]] = score
+    return scores
+
+
 def _gpu_summary(gpu_info: dict) -> str:
     """One-line GPU description from an instance type's ``GpuInfo``, e.g. ``1x T4 (16384 MiB)``.
 
@@ -1199,6 +1281,7 @@ def list_instance_types(ec2_client, name_prefix: str = "g4dn") -> list[dict]:
                     "VCpuCount": it["VCpuInfo"]["DefaultVCpus"],
                     "MemoryMiB": it["MemoryInfo"]["SizeInMiB"],
                     "GpuSummary": _gpu_summary(it.get("GpuInfo", {})),
+                    "EfaSupported": bool(it.get("NetworkInfo", {}).get("EfaSupported", False)),
                 }
             )
     results.sort(key=lambda x: x["InstanceType"])

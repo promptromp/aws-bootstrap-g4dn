@@ -1,6 +1,7 @@
 """AZ selection: spot-price ranking (plan_azs and its helpers) and the AZ-aware launch sweep."""
 
 from __future__ import annotations
+import json
 from datetime import UTC, datetime
 from unittest.mock import MagicMock
 
@@ -15,13 +16,16 @@ from aws_bootstrap.ec2 import (
     RegionContext,
     _run_instances,
     default_subnet_azs,
+    instance_type_vcpus,
     launch_with_retry,
     offered_azs,
+    on_demand_price,
     plan_azs,
+    spot_placement_scores,
     spot_price_or_none,
     spot_prices_by_az,
 )
-from aws_bootstrap.tests.helpers import client_error
+from aws_bootstrap.tests.helpers import client_error, session_with_clients
 
 
 CAPACITY = client_error("InsufficientInstanceCapacity")
@@ -337,3 +341,119 @@ def test_wait_resweeps_the_azs_and_the_final_error_names_them():
         )
     assert attempts[:4] == ["us-west-2b", "us-west-2a", "us-west-2b", "us-west-2a"]
     assert "us-west-2: no spot capacity (tried us-west-2b, us-west-2a)" in exc.value.format_message()
+
+
+# ---------------------------------------------------------------------------
+# Pool facts for the dry run: on-demand price, placement scores, vCPUs
+# ---------------------------------------------------------------------------
+
+
+def _product(*prices: str) -> str:
+    """A Price List product (a JSON string, as get_products returns it) with these hourly prices."""
+    dims = {f"dim{i}": {"unit": "Hrs", "pricePerUnit": {"USD": p}} for i, p in enumerate(prices)}
+    return json.dumps({"terms": {"OnDemand": {"term": {"priceDimensions": dims}}}})
+
+
+def _pricing_session(*, products=None, error=None) -> MagicMock:
+    session = MagicMock()
+    pricing = session.client.return_value
+    if error:
+        pricing.get_products.side_effect = error
+    else:
+        pricing.get_products.return_value = {"PriceList": list(products or [])}
+    return session
+
+
+def test_on_demand_price_asks_the_price_list_api_for_what_launch_runs():
+    session = _pricing_session(products=[_product("3.3631200000")])
+    assert on_demand_price(session, "g7e.2xlarge", "us-east-1") == 3.36312
+    session.client.assert_called_once_with("pricing", region_name="us-east-1")
+    kwargs = session.client.return_value.get_products.call_args.kwargs
+    assert kwargs["ServiceCode"] == "AmazonEC2"
+    assert {f["Field"]: f["Value"] for f in kwargs["Filters"]} == {
+        "instanceType": "g7e.2xlarge",
+        "regionCode": "us-east-1",
+        "operatingSystem": "Linux",
+        "tenancy": "Shared",
+        "preInstalledSw": "NA",
+        "capacitystatus": "Used",
+        "licenseModel": "No License required",
+    }
+
+
+@pytest.mark.parametrize(
+    "session",
+    [
+        pytest.param(_pricing_session(products=[]), id="no-product"),
+        pytest.param(_pricing_session(products=[_product("1.0"), _product("2.0")]), id="ambiguous-products"),
+        pytest.param(_pricing_session(products=[_product("1.0", "2.0")]), id="ambiguous-prices"),
+        pytest.param(_pricing_session(products=[_product("0.0000000000")]), id="zero-price"),
+        pytest.param(_pricing_session(products=["not json"]), id="malformed"),
+        pytest.param(_pricing_session(error=client_error("AccessDeniedException")), id="no-permission"),
+        pytest.param(
+            _pricing_session(error=botocore.exceptions.EndpointConnectionError(endpoint_url="https://api.pricing")),
+            id="unreachable",
+        ),
+    ],
+)
+def test_on_demand_price_is_none_unless_exactly_one_price_matches(session):
+    assert on_demand_price(session, "g7e.2xlarge", "us-east-1") is None
+
+
+def _scores_client(records=None, error=None, zones=()) -> MagicMock:
+    client = MagicMock()
+    if error:
+        client.get_paginator.return_value.paginate.side_effect = error
+    else:
+        client.get_paginator.return_value.paginate.return_value = [{"SpotPlacementScores": records or []}]
+    client.describe_availability_zones.return_value = {
+        "AvailabilityZones": [{"ZoneId": zone_id, "ZoneName": name} for zone_id, name in zones]
+    }
+    return client
+
+
+def test_spot_placement_scores_map_zone_ids_to_this_accounts_zone_names():
+    records = [
+        {"Region": "us-east-1", "AvailabilityZoneId": "use1-az6", "Score": 9},
+        {"Region": "us-east-1", "AvailabilityZoneId": "use1-az2", "Score": 1},
+        {"Region": "us-west-2", "AvailabilityZoneId": "usw2-az1", "Score": 3},
+    ]
+    east = _scores_client(records, zones=[("use1-az6", "us-east-1c"), ("use1-az2", "us-east-1a")])
+    west = _scores_client(zones=[("usw2-az1", "us-west-2b")])
+    session = session_with_clients({"us-east-1": east, "us-west-2": west})
+    assert spot_placement_scores(session, "g7e.2xlarge", ("us-east-1", "us-west-2")) == {
+        "us-east-1": {"us-east-1c": 9, "us-east-1a": 1},
+        "us-west-2": {"us-west-2b": 3},
+    }
+    east.get_paginator.assert_called_once_with("get_spot_placement_scores")
+    assert east.get_paginator.return_value.paginate.call_args.kwargs == {
+        "InstanceTypes": ["g7e.2xlarge"],
+        "TargetCapacity": 1,
+        "SingleAvailabilityZone": True,
+        "RegionNames": ["us-east-1", "us-west-2"],
+    }
+
+
+@pytest.mark.parametrize(
+    "regions,client",
+    [
+        pytest.param((), _scores_client(), id="no-regions"),
+        pytest.param(("us-east-1",), _scores_client(error=client_error("UnauthorizedOperation")), id="no-permission"),
+    ],
+)
+def test_spot_placement_scores_are_empty_when_unavailable(regions, client):
+    assert spot_placement_scores(session_with_clients({"us-east-1": client}), "g7e.2xlarge", regions) == {}
+
+
+@pytest.mark.parametrize(
+    "describe,expected",
+    [
+        pytest.param({"return_value": {"InstanceTypes": [{"VCpuInfo": {"DefaultVCpus": 8}}]}}, 8, id="known"),
+        pytest.param({"return_value": {"InstanceTypes": []}}, None, id="unknown-type"),
+        pytest.param({"side_effect": client_error("InvalidInstanceType")}, None, id="error"),
+    ],
+)
+def test_instance_type_vcpus(describe, expected):
+    ec2 = MagicMock()
+    ec2.describe_instance_types.configure_mock(**describe)
+    assert instance_type_vcpus(ec2, "g7e.2xlarge") == expected

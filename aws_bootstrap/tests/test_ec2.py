@@ -740,6 +740,17 @@ def test_list_instance_types_returns_sorted(ec2):
     assert "T4" in results[1]["GpuSummary"]
 
 
+@pytest.mark.parametrize(
+    "network,efa", [({"EfaSupported": True}, True), ({"EfaSupported": False}, False), (None, False)]
+)
+def test_list_instance_types_reports_efa_support(ec2, network, efa):
+    it = {"InstanceType": "g7e.8xlarge", "VCpuInfo": {"DefaultVCpus": 32}, "MemoryInfo": {"SizeInMiB": 1}}
+    if network is not None:
+        it["NetworkInfo"] = network
+    ec2.get_paginator.return_value.paginate.return_value = [{"InstanceTypes": [it]}]
+    assert list_instance_types(ec2, "g7e")[0]["EfaSupported"] is efa
+
+
 def test_list_instance_types_no_gpu(ec2):
     ec2.get_paginator.return_value.paginate.return_value = [
         {

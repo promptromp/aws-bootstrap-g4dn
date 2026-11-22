@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import botocore.exceptions
 
-from .ec2 import _FAMILY_PREFIXES, CLIError
+from .ec2 import _FAMILY_PREFIXES, CLIError, instance_type_to_family
 
 
 SERVICE_CODE = "ec2"
@@ -92,6 +92,53 @@ def get_family_quotas(sq_client, family: str) -> list[dict]:
         q["family"] = family
         results.append(q)
     return results
+
+
+def _running_vcpus(ec2_client, family: str) -> dict[str, int]:
+    """vCPUs of the pending/running instances of a quota family in the client's region, by market.
+
+    All instances count, not just this tool's: the quota is the account's. A vCPU is
+    ``CoreCount x ThreadsPerCore``, what the quota counts. Spot instances carry
+    ``InstanceLifecycle: spot``; the rest are on-demand.
+    """
+    used = {"spot": 0, "on-demand": 0}
+    paginator = ec2_client.get_paginator("describe_instances")
+    for page in paginator.paginate(Filters=[{"Name": "instance-state-name", "Values": ["pending", "running"]}]):
+        for reservation in page["Reservations"]:
+            for inst in reservation["Instances"]:
+                if instance_type_to_family(inst["InstanceType"]) != family:
+                    continue
+                cpu = inst.get("CpuOptions", {})
+                market = "spot" if inst.get("InstanceLifecycle") == "spot" else "on-demand"
+                used[market] += cpu.get("CoreCount", 0) * cpu.get("ThreadsPerCore", 1)
+    return used
+
+
+def vcpu_fit(sq_client, ec2_client, instance_type: str, vcpus: int) -> dict | None:
+    """Whether one more *instance_type* (*vcpus*) fits the region's spot and on-demand vCPU quotas.
+
+    ``{"family": ..., "spot": {quota, in_use, needed, fits}, "on-demand": {...}}``, or
+    ``None`` for a type outside the GPU quota families or when a lookup fails (display
+    only: it never blocks a launch). Open spot requests without an instance aren't
+    counted; one-time RunInstances creates none.
+    """
+    family = instance_type_to_family(instance_type)
+    if family is None:
+        return None
+    try:
+        quotas = {q["quota_type"]: q["value"] for q in get_family_quotas(sq_client, family)}
+        used = _running_vcpus(ec2_client, family)
+    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError, CLIError, KeyError):
+        return None
+    fit: dict = {"family": family}
+    for market, quota in quotas.items():
+        fit[market] = {
+            "quota": int(quota),
+            "in_use": used[market],
+            "needed": vcpus,
+            "fits": used[market] + vcpus <= quota,
+        }
+    return fit
 
 
 def request_quota_increase(sq_client, quota_code: str, desired_value: float) -> dict:
