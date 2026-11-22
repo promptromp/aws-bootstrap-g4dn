@@ -1356,14 +1356,16 @@ def _volume_location(volume_id: str, region: str, volume: dict) -> VolumeLocatio
 def _failure_reason(exc: Exception) -> str:
     """A short reason for a region that couldn't be queried (its messages can be long and unique)."""
     if isinstance(exc, botocore.exceptions.ClientError):
-        if exc.response["Error"]["Code"] in CREDENTIAL_ERROR_CODES:
-            raise exc  # bad credentials fail everywhere: let the CLI's credentials message handle it
         return exc.response["Error"]["Code"]
     return type(exc).__name__
 
 
+def _is_credential_error(exc: Exception) -> bool:
+    return isinstance(exc, botocore.exceptions.ClientError) and exc.response["Error"]["Code"] in CREDENTIAL_ERROR_CODES
+
+
 def _sweep_for_volume(
-    session, volume_id: str, regions: list[str], failures: dict[str, str], max_workers: int
+    session, volume_id: str, regions: list[str], failures: dict[str, Exception], max_workers: int
 ) -> tuple[str, dict] | None:
     """Query *regions* in parallel; the first that has the volume wins. Failures go to *failures*."""
     if not regions:
@@ -1376,7 +1378,7 @@ def _sweep_for_volume(
             try:
                 volume = future.result()
             except (botocore.exceptions.ClientError, *_UNREACHABLE) as exc:
-                failures[region] = _failure_reason(exc)
+                failures[region] = exc
                 continue
             if volume is not None:
                 return region, volume
@@ -1398,24 +1400,28 @@ def locate_ebs_volume(
     Asks *first* (the requested regions, usually one) and, only if the volume isn't
     there, the rest of ``everywhere()`` (the enabled regions) in parallel, so the
     caller can name where it really is. A region that can't be queried (a regional
-    deny, an unreachable endpoint) is reported in the not-found error, never read as
-    "not there", and doesn't stop the search. Bad credentials propagate (the CLI has
-    a message for them). Raises :class:`CLIError` for a malformed ID or a volume
-    found nowhere.
+    deny, an opt-in region refusing these credentials, an unreachable endpoint) is
+    reported in the not-found error, never read as "not there", and doesn't stop the
+    search. Only when no region answered at all is a credentials error re-raised, for
+    the CLI's credentials message. Raises :class:`CLIError` for a malformed ID or a
+    volume found nowhere.
     """
     searched = list(dict.fromkeys(first))
-    failures: dict[str, str] = {}
+    failures: dict[str, Exception] = {}
     found = _sweep_for_volume(session, volume_id, searched, failures, max_workers)
     rest: list[str] = []
     if found is None:
         try:
             rest = [r for r in everywhere() if r not in searched]
         except (botocore.exceptions.ClientError, *_UNREACHABLE) as exc:
-            failures["other regions"] = f"could not list them: {_failure_reason(exc)}"
+            failures["other regions"] = exc
         found = _sweep_for_volume(session, volume_id, rest, failures, max_workers)
     if found:
         return _volume_location(volume_id, *found)
     checked = len([r for r in searched + rest if r not in failures])
+    credential_error = next((e for e in failures.values() if _is_credential_error(e)), None)
+    if not checked and credential_error:
+        raise credential_error  # nothing answered and the credentials are bad: the CLI explains that
     message = (
         f"EBS volume {volume_id} not found in the {checked} region(s) checked."
         if checked
@@ -1423,7 +1429,10 @@ def locate_ebs_volume(
     )
     if failures:
         by_reason: dict[str, list[str]] = {}
-        for region, reason in failures.items():
+        for region, failure in failures.items():
+            reason = _failure_reason(failure)
+            if region == "other regions":
+                reason = f"could not list them: {reason}"
             by_reason.setdefault(reason, []).append(region)
         message += "\n  Couldn't check: " + "; ".join(
             f"{', '.join(sorted(regions))} ({reason})" for reason, regions in sorted(by_reason.items())

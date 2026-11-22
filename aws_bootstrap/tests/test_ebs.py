@@ -268,11 +268,9 @@ def test_locate_rejects_a_malformed_id_without_searching_on(code):
     everywhere.assert_not_called()
 
 
-@pytest.mark.parametrize("region_answering", ["us-west-2", "eu-west-1"], ids=["requested", "elsewhere"])
-def test_locate_lets_bad_credentials_through(region_answering):
-    """Bad credentials fail everywhere: they must reach the CLI's credentials message, not read as "not found"."""
-    clients = {"us-west-2": _volume_client(), "eu-west-1": _volume_client()}
-    clients[region_answering] = _volume_client(error=client_error("AuthFailure"))
+def test_locate_reraises_bad_credentials_only_when_no_region_answered():
+    """Then the credentials are the problem: the CLI's credentials message beats "not found"."""
+    clients = {r: _volume_client(error=client_error("AuthFailure")) for r in ("us-west-2", "eu-west-1")}
     with pytest.raises(botocore.exceptions.ClientError, match="AuthFailure"):
         locate_ebs_volume(session_with_clients(clients), "vol-1", ("us-west-2",), lambda: ["eu-west-1"])
 
@@ -281,14 +279,18 @@ def test_locate_lets_bad_credentials_through(region_answering):
     "error",
     [
         pytest.param(client_error("UnauthorizedOperation"), id="regional-deny"),
+        pytest.param(client_error("AuthFailure"), id="credentials-refused-in-one-region"),
         pytest.param(botocore.exceptions.ConnectTimeoutError(endpoint_url="https://ec2"), id="unreachable"),
     ],
 )
-def test_locate_looks_past_a_requested_region_it_cannot_query(error):
-    """An SCP denying the default region, or its endpoint timing out, mustn't hide a volume elsewhere."""
-    clients = {"us-west-2": _volume_client(error=error), "us-east-1": _volume_client(ATTACHED)}
-    loc = locate_ebs_volume(session_with_clients(clients), "vol-1", ("us-west-2",), lambda: ["us-east-1", "us-west-2"])
-    assert loc.region == "us-east-1"
+@pytest.mark.parametrize("failing", ["us-west-2", "eu-west-1"], ids=["requested-region", "swept-region"])
+def test_locate_looks_past_a_region_it_cannot_query(error, failing):
+    """A regional deny, an opt-in region refusing these credentials, or a timeout mustn't hide a
+    volume elsewhere, whichever region answers first."""
+    clients = {"us-west-2": _volume_client(), "eu-west-1": _volume_client(), "us-east-1": _volume_client(ATTACHED)}
+    clients[failing] = _volume_client(error=error)
+    everywhere = lambda: ["eu-west-1", "us-east-1", "us-west-2"]  # noqa: E731
+    assert locate_ebs_volume(session_with_clients(clients), "vol-1", ("us-west-2",), everywhere).region == "us-east-1"
 
 
 def _cannot_list() -> list[str]:
