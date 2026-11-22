@@ -741,12 +741,12 @@ def test_list_instance_types_returns_sorted(ec2):
 
 
 @pytest.mark.parametrize(
-    "network,efa", [({"EfaSupported": True}, True), ({"EfaSupported": False}, False), (None, False)]
+    "extra,efa",
+    [({"NetworkInfo": {"EfaSupported": True}}, True), ({"NetworkInfo": {"EfaSupported": False}}, False), ({}, False)],
+    ids=["supported", "unsupported", "not-reported"],
 )
-def test_list_instance_types_reports_efa_support(ec2, network, efa):
-    it = {"InstanceType": "g7e.8xlarge", "VCpuInfo": {"DefaultVCpus": 32}, "MemoryInfo": {"SizeInMiB": 1}}
-    if network is not None:
-        it["NetworkInfo"] = network
+def test_list_instance_types_reports_efa_support(ec2, extra, efa):
+    it = {"InstanceType": "g7e.8xlarge", "VCpuInfo": {"DefaultVCpus": 32}, "MemoryInfo": {"SizeInMiB": 1}, **extra}
     ec2.get_paginator.return_value.paginate.return_value = [{"InstanceTypes": [it]}]
     assert list_instance_types(ec2, "g7e")[0]["EfaSupported"] is efa
 

@@ -234,8 +234,11 @@ def test_instance_type_to_family(instance_type: str, expected: str | None):
 # ---------------------------------------------------------------------------
 
 
-def _running(*instances: tuple[str, str | None, int, int]) -> MagicMock:
-    """An EC2 client whose describe_instances lists (type, lifecycle, cores, threads) instances."""
+_DEFAULT_VCPUS = {"g6.2xlarge": 8, "g6.xlarge": 4, "p5.4xlarge": 16}
+
+
+def _running(*instances: tuple[str, str | None]) -> MagicMock:
+    """An EC2 client listing (type, lifecycle) instances, each running with SMT off (half its vCPUs)."""
     ec2 = MagicMock()
     ec2.get_paginator.return_value.paginate.return_value = [
         {
@@ -245,14 +248,17 @@ def _running(*instances: tuple[str, str | None, int, int]) -> MagicMock:
                         {
                             "InstanceType": itype,
                             **({"InstanceLifecycle": lifecycle} if lifecycle else {}),
-                            "CpuOptions": {"CoreCount": cores, "ThreadsPerCore": threads},
+                            "CpuOptions": {"CoreCount": _DEFAULT_VCPUS.get(itype, 2) // 2, "ThreadsPerCore": 1},
                         }
                     ]
                 }
-                for itype, lifecycle, cores, threads in instances
+                for itype, lifecycle in instances
             ]
         }
     ]
+    ec2.describe_instance_types.side_effect = lambda InstanceTypes: {
+        "InstanceTypes": [{"InstanceType": t, "VCpuInfo": {"DefaultVCpus": _DEFAULT_VCPUS[t]}} for t in InstanceTypes]
+    }
     return ec2
 
 
@@ -266,11 +272,13 @@ def _quotas(spot: float, on_demand: float) -> MagicMock:
 
 
 def test_vcpu_fit_counts_running_vcpus_per_market_within_the_family():
+    """Quota usage is each type's default vCPUs, whatever CPU options the instance runs with."""
     ec2 = _running(
-        ("g6.2xlarge", "spot", 4, 2),  # 8 spot vCPUs
-        ("g6.xlarge", None, 2, 2),  # 4 on-demand vCPUs
-        ("p5.4xlarge", "spot", 8, 2),  # another family: not counted
-        ("t3.large", None, 1, 2),  # not a GPU family: not counted
+        ("g6.2xlarge", "spot"),  # 8 spot vCPUs (though running with 4)
+        ("g6.xlarge", None),  # 4 on-demand vCPUs
+        ("g6.2xlarge", "capacity-block"),  # Capacity Blocks don't count against the quotas
+        ("p5.4xlarge", "spot"),  # another family: not counted
+        ("t3.large", None),  # not a GPU family: not counted
     )
     fit = vcpu_fit(_quotas(spot=16, on_demand=8), ec2, "g7e.2xlarge", 8)
     assert fit == {

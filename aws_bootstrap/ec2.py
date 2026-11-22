@@ -9,6 +9,7 @@ from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from fractions import Fraction
 
+import botocore.config
 import botocore.exceptions
 import click
 
@@ -83,12 +84,24 @@ def instance_type_architecture(ec2_client, instance_type: str) -> str:
     return arches[0]
 
 
+def default_vcpus(ec2_client, instance_types) -> dict[str, int]:
+    """Default vCPU count per instance type: what vCPU quotas count, whatever CPU options an instance has.
+
+    One ``describe_instance_types`` per 100 types (the API's limit). Raises on API errors.
+    """
+    wanted = sorted(set(instance_types))
+    counts: dict[str, int] = {}
+    for i in range(0, len(wanted), 100):
+        resp = ec2_client.describe_instance_types(InstanceTypes=wanted[i : i + 100])
+        counts.update({t["InstanceType"]: int(t["VCpuInfo"]["DefaultVCpus"]) for t in resp["InstanceTypes"]})
+    return counts
+
+
 def instance_type_vcpus(ec2_client, instance_type: str) -> int | None:
-    """Default vCPU count of an instance type (what its quota counts), or None if unknown."""
+    """Default vCPU count of one instance type, or None if unknown (display only: never raises)."""
     try:
-        types = ec2_client.describe_instance_types(InstanceTypes=[instance_type])["InstanceTypes"]
-        return int(types[0]["VCpuInfo"]["DefaultVCpus"]) if types else None
-    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError, KeyError, ValueError):
+        return default_vcpus(ec2_client, [instance_type]).get(instance_type)
+    except Exception:  # display-only lookup: never abort the command
         return None
 
 
@@ -1170,14 +1183,26 @@ def plan_azs(
 # The Price List API's endpoint for the aws partition (it serves every region's prices).
 _PRICING_REGION = "us-east-1"
 # What `launch` runs: shared-tenancy Linux with no pre-installed software or licence,
-# billed per running hour. With instanceType + regionCode, exactly one product matches.
+# billed per running hour, bought on demand. With instanceType + regionCode, exactly one
+# product matches (verified 2026-11-22). Without marketoption, P types also match their
+# Capacity Block product (p5.48xlarge: 2 products).
 _ON_DEMAND_TERMS = {
     "operatingSystem": "Linux",
     "tenancy": "Shared",
     "preInstalledSw": "NA",
     "capacitystatus": "Used",
     "licenseModel": "No License required",
+    "marketoption": "OnDemand",
 }
+# Display-only lookups run after RunInstances too: a slow or blocked endpoint must cost
+# seconds, not botocore's default minutes (60s connect + 60s read, 3 attempts).
+_LOOKUP_CONFIG = botocore.config.Config(
+    connect_timeout=5, read_timeout=10, retries={"max_attempts": 2, "mode": "standard"}
+)
+# AWS documents that spot placement scores for fewer than three instance types come out
+# low, except for these families. Confirmed live: single t3/c5 types score at most 3
+# everywhere while g4dn scores 9. No API exposes the rule, hence the list.
+_SINGLE_TYPE_SCORED_PREFIXES = ("p", "g", "trn", "inf")
 
 
 def on_demand_price(session, instance_type: str, region: str) -> float | None:
@@ -1185,19 +1210,22 @@ def on_demand_price(session, instance_type: str, region: str) -> float | None:
 
     ``None`` unless exactly one product and one price match (never a guess), and on
     any error, e.g. no ``pricing:GetProducts`` permission or another AWS partition.
+    Never raises: it also runs after RunInstances.
     """
     filters = [
         {"Type": "TERM_MATCH", "Field": field_name, "Value": value}
         for field_name, value in {"instanceType": instance_type, "regionCode": region, **_ON_DEMAND_TERMS}.items()
     ]
     try:
-        pricing = session.client("pricing", region_name=_PRICING_REGION)
-        products = pricing.get_products(ServiceCode="AmazonEC2", Filters=filters, MaxResults=2)["PriceList"]
-        if len(products) != 1:
+        pricing = session.client("pricing", region_name=_PRICING_REGION, config=_LOOKUP_CONFIG)
+        # Two results are enough to tell "exactly one" from "ambiguous"; so is a next page.
+        resp = pricing.get_products(ServiceCode="AmazonEC2", Filters=filters, MaxResults=2)
+        products = resp["PriceList"]
+        if len(products) != 1 or resp.get("NextToken"):
             return None
         terms = json.loads(products[0])["terms"]["OnDemand"].values()
         prices = [float(dim["pricePerUnit"]["USD"]) for term in terms for dim in term["priceDimensions"].values()]
-    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError, KeyError, TypeError, ValueError):
+    except Exception:  # display only, and it runs after RunInstances: never raise
         return None
     return prices[0] if len(prices) == 1 and prices[0] > 0 else None
 
@@ -1207,13 +1235,15 @@ def spot_placement_scores(session, instance_type: str, regions: tuple[str, ...])
 
     One ``get_spot_placement_scores`` call covers every region. AWS answers with zone
     *IDs* (``use1-az6``), which each account maps to its own zone *names*, so each
-    region's ``describe_availability_zones`` translates them. ``{}`` on any error
-    (it needs ``ec2:GetSpotPlacementScores``).
+    region's ``describe_availability_zones`` translates them. ``{}`` on any error (it
+    needs ``ec2:GetSpotPlacementScores``), and for families whose single-type scores AWS
+    caps low (see ``_SINGLE_TYPE_SCORED_PREFIXES``): a misleading score is worse than none.
     """
-    if not regions:
+    if not regions or not instance_type.startswith(_SINGLE_TYPE_SCORED_PREFIXES):
         return {}
     try:
-        paginator = session.client("ec2", region_name=regions[0]).get_paginator("get_spot_placement_scores")
+        client = session.client("ec2", region_name=regions[0], config=_LOOKUP_CONFIG)
+        paginator = client.get_paginator("get_spot_placement_scores")
         records = [
             (rec["Region"], rec["AvailabilityZoneId"], int(rec["Score"]))
             for page in paginator.paginate(
@@ -1225,7 +1255,7 @@ def spot_placement_scores(session, instance_type: str, regions: tuple[str, ...])
         for region in sorted({r for r, _, _ in records}):
             zones = session.client("ec2", region_name=region).describe_availability_zones()["AvailabilityZones"]
             names.update({z["ZoneId"]: z["ZoneName"] for z in zones})
-    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError, KeyError, TypeError, ValueError):
+    except Exception:  # display only: never raise
         return {}
     scores: dict[str, dict[str, int]] = {}
     for region, zone_id, score in records:

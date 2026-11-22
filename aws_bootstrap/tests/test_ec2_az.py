@@ -16,6 +16,7 @@ from aws_bootstrap.ec2 import (
     RegionContext,
     _run_instances,
     default_subnet_azs,
+    default_vcpus,
     instance_type_vcpus,
     launch_with_retry,
     offered_azs,
@@ -354,22 +355,29 @@ def _product(*prices: str) -> str:
     return json.dumps({"terms": {"OnDemand": {"term": {"priceDimensions": dims}}}})
 
 
-def _pricing_session(*, products=None, error=None) -> MagicMock:
+def _pricing_session(*, products=None, error=None, next_token=None) -> MagicMock:
     session = MagicMock()
     pricing = session.client.return_value
     if error:
         pricing.get_products.side_effect = error
     else:
-        pricing.get_products.return_value = {"PriceList": list(products or [])}
+        pricing.get_products.return_value = {
+            "PriceList": list(products or []),
+            **({"NextToken": next_token} if next_token else {}),
+        }
     return session
 
 
 def test_on_demand_price_asks_the_price_list_api_for_what_launch_runs():
     session = _pricing_session(products=[_product("3.3631200000")])
     assert on_demand_price(session, "g7e.2xlarge", "us-east-1") == 3.36312
-    session.client.assert_called_once_with("pricing", region_name="us-east-1")
+    assert session.client.call_args.args == ("pricing",)
+    assert session.client.call_args.kwargs["region_name"] == "us-east-1"
+    config = session.client.call_args.kwargs["config"]  # bounded: it also runs after RunInstances
+    assert (config.connect_timeout, config.read_timeout, config.retries["max_attempts"]) == (5, 10, 2)
     kwargs = session.client.return_value.get_products.call_args.kwargs
     assert kwargs["ServiceCode"] == "AmazonEC2"
+    assert kwargs["MaxResults"] == 2  # what lets "exactly one product" be checked
     assert {f["Field"]: f["Value"] for f in kwargs["Filters"]} == {
         "instanceType": "g7e.2xlarge",
         "regionCode": "us-east-1",
@@ -378,6 +386,7 @@ def test_on_demand_price_asks_the_price_list_api_for_what_launch_runs():
         "preInstalledSw": "NA",
         "capacitystatus": "Used",
         "licenseModel": "No License required",
+        "marketoption": "OnDemand",  # P types also have a Capacity Block product
     }
 
 
@@ -385,6 +394,8 @@ def test_on_demand_price_asks_the_price_list_api_for_what_launch_runs():
     "session",
     [
         pytest.param(_pricing_session(products=[]), id="no-product"),
+        pytest.param(_pricing_session(products=[_product("1.0")], next_token="more"), id="more-on-a-next-page"),
+        pytest.param(_pricing_session(products=['{"terms": {"OnDemand": []}}']), id="unexpected-shape"),
         pytest.param(_pricing_session(products=[_product("1.0"), _product("2.0")]), id="ambiguous-products"),
         pytest.param(_pricing_session(products=[_product("1.0", "2.0")]), id="ambiguous-prices"),
         pytest.param(_pricing_session(products=[_product("0.0000000000")]), id="zero-price"),
@@ -416,6 +427,7 @@ def test_spot_placement_scores_map_zone_ids_to_this_accounts_zone_names():
     records = [
         {"Region": "us-east-1", "AvailabilityZoneId": "use1-az6", "Score": 9},
         {"Region": "us-east-1", "AvailabilityZoneId": "use1-az2", "Score": 1},
+        {"Region": "us-east-1", "AvailabilityZoneId": "use1-az9", "Score": 5},  # unmapped: dropped
         {"Region": "us-west-2", "AvailabilityZoneId": "usw2-az1", "Score": 3},
     ]
     east = _scores_client(records, zones=[("use1-az6", "us-east-1c"), ("use1-az2", "us-east-1a")])
@@ -445,10 +457,21 @@ def test_spot_placement_scores_are_empty_when_unavailable(regions, client):
     assert spot_placement_scores(session_with_clients({"us-east-1": client}), "g7e.2xlarge", regions) == {}
 
 
+def test_spot_placement_scores_skip_families_whose_single_type_scores_are_capped():
+    """AWS caps single-type scores low outside P/G/Trn/Inf: a misleading score is worse than none."""
+    client = _scores_client()
+    assert spot_placement_scores(session_with_clients({"us-east-1": client}), "t3.large", ("us-east-1",)) == {}
+    client.get_paginator.assert_not_called()
+
+
 @pytest.mark.parametrize(
     "describe,expected",
     [
-        pytest.param({"return_value": {"InstanceTypes": [{"VCpuInfo": {"DefaultVCpus": 8}}]}}, 8, id="known"),
+        pytest.param(
+            {"return_value": {"InstanceTypes": [{"InstanceType": "g7e.2xlarge", "VCpuInfo": {"DefaultVCpus": 8}}]}},
+            8,
+            id="known",
+        ),
         pytest.param({"return_value": {"InstanceTypes": []}}, None, id="unknown-type"),
         pytest.param({"side_effect": client_error("InvalidInstanceType")}, None, id="error"),
     ],
@@ -457,3 +480,13 @@ def test_instance_type_vcpus(describe, expected):
     ec2 = MagicMock()
     ec2.describe_instance_types.configure_mock(**describe)
     assert instance_type_vcpus(ec2, "g7e.2xlarge") == expected
+
+
+def test_default_vcpus_asks_for_at_most_100_types_per_call():
+    ec2 = MagicMock()
+    ec2.describe_instance_types.side_effect = lambda InstanceTypes: {
+        "InstanceTypes": [{"InstanceType": t, "VCpuInfo": {"DefaultVCpus": 4}} for t in InstanceTypes]
+    }
+    types = [f"g6.{i}xlarge" for i in range(150)]
+    assert default_vcpus(ec2, [*types, types[0]]) == dict.fromkeys(types, 4)  # duplicates asked once
+    assert [len(c.kwargs["InstanceTypes"]) for c in ec2.describe_instance_types.call_args_list] == [100, 50]

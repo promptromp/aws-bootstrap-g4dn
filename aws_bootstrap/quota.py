@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import botocore.exceptions
 
-from .ec2 import _FAMILY_PREFIXES, CLIError, instance_type_to_family
+from .ec2 import _FAMILY_PREFIXES, CLIError, default_vcpus, instance_type_to_family
 
 
 SERVICE_CODE = "ec2"
@@ -94,23 +94,34 @@ def get_family_quotas(sq_client, family: str) -> list[dict]:
     return results
 
 
+# Lifecycles that don't draw on the spot or on-demand vCPU quotas: Capacity Block
+# instances (AWS: they "don't count against your On-Demand Instances limits") and the
+# legacy Scheduled Instances.
+_QUOTA_EXEMPT_LIFECYCLES = frozenset({"capacity-block", "scheduled"})
+
+
 def _running_vcpus(ec2_client, family: str) -> dict[str, int]:
     """vCPUs of the pending/running instances of a quota family in the client's region, by market.
 
-    All instances count, not just this tool's: the quota is the account's. A vCPU is
-    ``CoreCount x ThreadsPerCore``, what the quota counts. Spot instances carry
-    ``InstanceLifecycle: spot``; the rest are on-demand.
+    All instances count, not just this tool's: the quota is the account's. Each counts
+    its type's *default* vCPUs, which is how AWS counts quota usage whatever CPU options
+    (cores, threads) the instance runs with. Spot instances carry
+    ``InstanceLifecycle: spot``; Capacity Block (and Scheduled) instances are exempt;
+    the rest are on-demand.
     """
-    used = {"spot": 0, "on-demand": 0}
+    instances: list[tuple[str, str]] = []  # (type, market)
     paginator = ec2_client.get_paginator("describe_instances")
     for page in paginator.paginate(Filters=[{"Name": "instance-state-name", "Values": ["pending", "running"]}]):
         for reservation in page["Reservations"]:
             for inst in reservation["Instances"]:
-                if instance_type_to_family(inst["InstanceType"]) != family:
+                lifecycle = inst.get("InstanceLifecycle")
+                if lifecycle in _QUOTA_EXEMPT_LIFECYCLES or instance_type_to_family(inst["InstanceType"]) != family:
                     continue
-                cpu = inst.get("CpuOptions", {})
-                market = "spot" if inst.get("InstanceLifecycle") == "spot" else "on-demand"
-                used[market] += cpu.get("CoreCount", 0) * cpu.get("ThreadsPerCore", 1)
+                instances.append((inst["InstanceType"], "spot" if lifecycle == "spot" else "on-demand"))
+    vcpus = default_vcpus(ec2_client, (t for t, _ in instances))
+    used = {"spot": 0, "on-demand": 0}
+    for itype, market in instances:
+        used[market] += vcpus[itype]  # KeyError if EC2 doesn't know the type: vcpu_fit says "unknown"
     return used
 
 
@@ -118,9 +129,10 @@ def vcpu_fit(sq_client, ec2_client, instance_type: str, vcpus: int) -> dict | No
     """Whether one more *instance_type* (*vcpus*) fits the region's spot and on-demand vCPU quotas.
 
     ``{"family": ..., "spot": {quota, in_use, needed, fits}, "on-demand": {...}}``, or
-    ``None`` for a type outside the GPU quota families or when a lookup fails (display
-    only: it never blocks a launch). Open spot requests without an instance aren't
-    counted; one-time RunInstances creates none.
+    ``None`` for a type outside the GPU quota families or when a lookup fails. An
+    estimate for display that never blocks a launch: open spot requests without an
+    instance, and unused On-Demand Capacity Reservations (which do count toward the
+    on-demand limit), aren't counted.
     """
     family = instance_type_to_family(instance_type)
     if family is None:
@@ -128,7 +140,7 @@ def vcpu_fit(sq_client, ec2_client, instance_type: str, vcpus: int) -> dict | No
     try:
         quotas = {q["quota_type"]: q["value"] for q in get_family_quotas(sq_client, family)}
         used = _running_vcpus(ec2_client, family)
-    except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError, CLIError, KeyError):
+    except Exception:  # display only: never raise
         return None
     fit: dict = {"family": family}
     for market, quota in quotas.items():

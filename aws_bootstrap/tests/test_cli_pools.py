@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
+import botocore.exceptions
 import pytest
 
 from aws_bootstrap.cli import main
@@ -96,19 +97,48 @@ def test_dry_run_table_flattens_the_pool_facts(runner, pools, key_path):
 def test_placement_scores_join_the_az_plan_without_reordering_it(runner, pools, key_path):
     result = _dry_run(runner, key_path, "--cheapest-az", fmt="json")
     assert result.exit_code == 0, result.output
-    assert [o["zone"] for o in json.loads(result.output)["availability_zones"]["us-east-1"]] == [
-        "us-east-1a",
-        "us-east-1c",
-    ]  # still cheapest first, though 1c scores higher
-    assert json.loads(result.output)["availability_zones"]["us-east-1"][1]["placement_score"] == 9
+    plan = json.loads(result.output)["availability_zones"]["us-east-1"]
+    assert [(o["zone"], o["placement_score"]) for o in plan] == [("us-east-1a", 1), ("us-east-1c", 9)]  # price order
 
 
-def test_dry_run_reports_unknown_facts_without_failing(runner, launch_aws, key_path):
-    with patch("aws_bootstrap.cli.plan_azs", side_effect=CLIError("g7e.2xlarge is not offered in us-east-1.")):
+def test_a_cheapest_az_plan_doubles_as_the_spot_pools(runner, pools, key_path):
+    """It already lists every usable AZ: no second lookup, and no second, near-identical line."""
+    result = _dry_run(runner, key_path, "--cheapest-az")
+    assert result.exit_code == 0, result.output
+    assert "AZs: us-east-1a $2.134/h score 1 → us-east-1c $2.277/h score 9" in result.output
+    assert "Spot pools" not in result.output
+    pools.plan.assert_called_once()
+
+
+@pytest.mark.parametrize(
+    "error,pools_line",
+    [
+        pytest.param(
+            CLIError("g7e.2xlarge is not offered in us-east-1."),
+            "Spot pools: g7e.2xlarge is not offered in us-east-1.",
+            id="not-offered",
+        ),
+        pytest.param(
+            botocore.exceptions.EndpointConnectionError(endpoint_url="https://ec2"),
+            "Spot pools: unknown (Could not connect",
+            id="unreachable",
+        ),
+    ],
+)
+def test_dry_run_reports_unknown_facts_without_failing(runner, launch_aws, key_path, error, pools_line):
+    with patch("aws_bootstrap.cli.plan_azs", side_effect=error):
         result = _dry_run(runner, key_path)
     assert result.exit_code == 0, result.output
-    for text in ("On-demand price: unknown", "Spot pools: g7e.2xlarge is not offered in us-east-1.", "Quota: unknown"):
+    for text in ("On-demand price: unknown", pools_line, "Quota (gvt): unknown"):
         assert text in result.output
+
+
+def test_dry_run_says_a_type_has_no_gpu_quota(runner, launch_aws, key_path):
+    args = ["--key-path", str(key_path), "--dry-run", "--instance-type", "t3.medium", "--region", "us-east-1"]
+    result = runner.invoke(main, ["launch", *args])
+    assert result.exit_code == 0, result.output
+    assert "Quota: n/a (no GPU vCPU quota for this type)" in result.output
+    launch_aws.pools.quota_fit.assert_not_called()
 
 
 def test_dry_run_labels_each_region(runner, pools, key_path):
@@ -116,8 +146,16 @@ def test_dry_run_labels_each_region(runner, pools, key_path):
     assert result.exit_code == 0, result.output
     for region in ("us-east-1", "us-west-2"):
         assert f"On-demand price ({region}): $3.363/h" in result.output
+        assert f"Quota ({region}, gvt):" in result.output
     pools.scores.assert_called_once()  # one placement-score call covers every region
     assert pools.scores.call_args.args[2] == ("us-east-1", "us-west-2")
+
+
+def test_each_regions_pools_get_that_regions_scores(runner, pools, key_path):
+    result = _dry_run(runner, key_path, "--region", "us-west-2", fmt="json")  # SCORES only has us-east-1
+    spot_pools = json.loads(result.output)["spot_pools"]
+    assert [o["placement_score"] for o in spot_pools["us-east-1"]] == [1, 9]
+    assert [o["placement_score"] for o in spot_pools["us-west-2"]] == [None, None]
 
 
 @pytest.mark.parametrize("price", [3.36312, None], ids=["known", "unknown"])
@@ -128,14 +166,9 @@ def test_launch_reports_the_on_demand_price_when_known(runner, launched, key_pat
     assert json.loads(result.output).get("on_demand_price_per_hour") == price
 
 
-@pytest.mark.parametrize(
-    "fmt,expected",
-    [("text", ["EFA", "yes"]), ("json", ['"efa_supported": true'])],
-)
-def test_list_instance_types_shows_efa_support(runner, cli_session, instance_type_rows, fmt, expected):
-    rows = [{**instance_type_rows[0], "InstanceType": "g7e.8xlarge", "EfaSupported": True}]
-    with patch("aws_bootstrap.cli.list_instance_types", return_value=rows):
-        result = runner.invoke(main, ["-o", fmt, "list", "instance-types", "--prefix", "g7e"])
+def test_launch_text_shows_the_on_demand_price_once_set_up(runner, launched, key_path):
+    launched.pools.od_price.return_value = 3.36312
+    result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--no-setup"])
     assert result.exit_code == 0, result.output
-    for text in expected:
-        assert text in result.output
+    assert "On-demand price: $3.363/h" in result.output
+    launched.pools.od_price.assert_called_once()  # looked up once, after the alias was written

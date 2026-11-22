@@ -250,7 +250,10 @@ $ aws-bootstrap launch --dry-run --instance-type g7e.2xlarge --region us-east-1
 
 Read it as: spot saves about a third here, but the cheapest AZ is unlikely to have capacity (score 1);
 us-east-1c (score 9) is the better bet, so launch with `--az us-east-1c`, and only once the spot
-quota has room. These facts are **display only**: they never change what launches or in which order
+quota has room. The quota line is an estimate (each running instance counts its type's default
+vCPUs; Capacity Block instances don't count; open spot requests and unused capacity reservations
+aren't seen): confirm with `aws-bootstrap quota show`. Scores appear only for P, G, Trn and Inf types:
+for other families AWS caps the score of a single instance type low, which would mislead. These facts are **display only**: they never change what launches or in which order
 (`--cheapest-az` stays price-only, since a capacity miss already falls through to the next AZ).
 Structured output carries them as `on_demand_price_per_hour`, `spot_pools` (with `placement_score`)
 and `quota_fit`. Each lookup is optional and shows `unknown` without its permission:
@@ -616,7 +619,7 @@ Key behaviors:
   aws s3 sync s3://my-bucket/dataset /data/dataset
   touch /data/.prepared
   ```
-- **EFA / AZ caveat** — clusters run NCCL over ordinary VPC networking: aws-bootstrap doesn't configure EFA yet. EFA is available on the P-series and on larger G types too (e.g. g6.12xlarge, g6e.12xlarge, g7e.8xlarge and up; `list instance-types` has an EFA column). Plain networking is fine for dev/learning/modest scale. Pinning to one AZ means a spot shortage there affects the whole cluster.
+- **EFA / AZ caveat** — clusters run NCCL over ordinary VPC networking: aws-bootstrap doesn't configure EFA yet. EFA is available on the P-series and on the 8xlarge-and-up sizes of most G families (`list instance-types` has an EFA column). Plain networking is fine for dev/learning/modest scale. Pinning to one AZ means a spot shortage there affects the whole cluster.
 
 ## EC2 vCPU Quotas
 

@@ -139,8 +139,8 @@ status` afterward to confirm nothing remains.)
   fresh cluster id (which can land in a different AZ).
 - **EFA isn't configured (yet).** Nodes run NCCL over ordinary VPC networking.
   EFA, for the lowest-latency collective comms, is available on the P-series and
-  on larger G types (e.g. g6.12xlarge, g6e.12xlarge, g7e.8xlarge and up; see the
-  EFA column of `aws-bootstrap list instance-types`), but aws-bootstrap doesn't
+  on the 8xlarge-and-up sizes of most G families (see the EFA column of
+  `aws-bootstrap list instance-types`), but aws-bootstrap doesn't
   attach EFA interfaces. Plain networking is fine for development, learning DDP,
   and modest-scale training; it is not tuned for large-scale LLM throughput.
 - **Spot vs on-demand.** Spot is the default and cheapest. `cluster launch` does

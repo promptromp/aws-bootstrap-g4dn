@@ -1231,6 +1231,39 @@ def test_cleanup_include_ebs_not_deleted_on_region_failure(runner, cleanup_env, 
 # ---------------------------------------------------------------------------
 
 
+@pytest.mark.parametrize(
+    "fmt,expected",
+    [
+        ("text", ["EFA", "yes"]),
+        ("json", ['"efa_supported": true']),
+        ("yaml", ["efa_supported: true"]),
+        ("table", ["EFA", "True"]),
+    ],
+)
+def test_list_instance_types_shows_efa_support(runner, cli_session, instance_type_rows, fmt, expected):
+    rows = [{**instance_type_rows[0], "InstanceType": "g7e.8xlarge", "EfaSupported": True}]
+    with patch("aws_bootstrap.cli.list_instance_types", return_value=rows):
+        result = runner.invoke(main, ["-o", fmt, "list", "instance-types", "--prefix", "g7e"])
+    assert result.exit_code == 0, result.output
+    for text in expected:
+        assert text in result.output
+
+
+def test_status_prices_each_instance_by_its_market(runner, status_aws):
+    status_aws.find.return_value = [
+        _instance("i-spot", Lifecycle="spot"),
+        _instance("i-od", Lifecycle="on-demand"),
+        _instance("i-cb", Lifecycle="capacity-block"),  # Capacity Blocks are priced differently: not shown
+    ]
+    with patch("aws_bootstrap.cli.on_demand_price", return_value=0.526):
+        result = runner.invoke(main, ["-o", "json", *STATUS])
+    prices = {
+        i["instance_id"]: (i.get("spot_price_per_hour"), i.get("on_demand_price_per_hour"))
+        for i in json.loads(result.output)["instances"]
+    }
+    assert prices == {"i-spot": (0.15, None), "i-od": (None, 0.526), "i-cb": (None, None)}
+
+
 def test_list_instance_types_output(runner, cli_session, instance_type_rows):
     with patch("aws_bootstrap.cli.list_instance_types", return_value=instance_type_rows):
         result = runner.invoke(main, ["list", "instance-types"])

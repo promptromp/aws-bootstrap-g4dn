@@ -155,8 +155,8 @@ the instance rather than leaking it. Branch on `status`, not on the exit code al
 
 **Choosing a pool from a dry run.** These are display only and never change what launches:
 - `on_demand_price_per_hour` per region;
-- `spot_pools` per region (spot only): every usable AZ with its spot price and **placement score**. The score is EC2's 1–10 estimate that a spot request succeeds there; a low-score cheapest AZ often has no capacity.
-- `quota_fit` per region: whether one more instance fits each market's vCPU quota, given running instances. `fits: false` means the launch would be refused in that market, so don't launch into it; text mode prints the exact `quota request` to fix it.
+- `spot_pools` per region (spot only): every usable AZ with its spot price and **placement score**. The score is EC2's 1–10 estimate that a spot request succeeds there; a low-score cheapest AZ often has no capacity. Scores are given only for P, G, Trn and Inf types (elsewhere `placement_score` is `null`): AWS caps single-type scores low for other families.
+- `quota_fit` per region: an estimate of whether one more instance fits each market's vCPU quota, given running instances. `fits: false` means the launch would likely be refused in that market: confirm with `aws-bootstrap quota show` before deciding (open spot requests and unused capacity reservations aren't counted). Text mode prints the `quota request` that would make room.
 
 Prefer a high-score AZ with `--az <zone>`; `--cheapest-az` ranks by price only. Any of these is `null` (or `unknown` in text) when its lookup isn't permitted (`pricing:GetProducts`, `ec2:GetSpotPlacementScores`, `servicequotas:GetServiceQuota`). AZ names are per account.
 
@@ -400,7 +400,7 @@ derived from `--prefix`; suppressed for non-GPU families.
 ]
 ```
 
-`efa_supported` comes from EC2 (`NetworkInfo.EfaSupported`): EFA exists beyond the P-series, e.g. on g6.12xlarge, g6e.12xlarge, g7e.8xlarge and up. aws-bootstrap doesn't configure EFA yet.
+`efa_supported` comes from EC2 (`NetworkInfo.EfaSupported`): EFA exists beyond the P-series, on the 8xlarge-and-up sizes of most G families. aws-bootstrap doesn't configure EFA yet.
 
 Fractional-GPU types (g6f, gr6f) report their share of one GPU, e.g.
 `"gpu": "1/8 L4 (2861 MiB)"`.
