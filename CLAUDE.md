@@ -61,6 +61,7 @@ aws_bootstrap/
         cluster_canary.py      # Distributed DDP canary (all-reduce + SGD), SCP'd to cluster nodes for prepare/test
     tests/               # Unit tests (pytest)
         conftest.py            # Shared fixtures (runner, cli_session, quota/ami/instance-type rows)
+        helpers.py             # Plain shared helpers (client_error, session_with_clients); fixtures stay in conftest.py
         test_config.py
         test_cli.py
         test_cli_regions.py    # Region-aware quota/list CLI tests (fixtures + parametrize)
