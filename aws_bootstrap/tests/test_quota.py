@@ -17,6 +17,7 @@ from aws_bootstrap.quota import (
     get_quota,
     get_quota_request_history,
     request_quota_increase,
+    vcpu_fit,
 )
 from aws_bootstrap.tests.helpers import client_error
 
@@ -226,3 +227,88 @@ def test_quota_family_labels_derive_from_the_classifier():
 )
 def test_instance_type_to_family(instance_type: str, expected: str | None):
     assert instance_type_to_family(instance_type) == expected
+
+
+# ---------------------------------------------------------------------------
+# vcpu_fit: will one more instance fit each market's vCPU quota?
+# ---------------------------------------------------------------------------
+
+
+_DEFAULT_VCPUS = {"g6.2xlarge": 8, "g6.xlarge": 4, "p5.4xlarge": 16}
+
+
+def _running(*instances: tuple[str, str | None]) -> MagicMock:
+    """An EC2 client listing (type, lifecycle) instances, each running with SMT off (half its vCPUs)."""
+    ec2 = MagicMock()
+    ec2.get_paginator.return_value.paginate.return_value = [
+        {
+            "Reservations": [
+                {
+                    "Instances": [
+                        {
+                            "InstanceType": itype,
+                            **({"InstanceLifecycle": lifecycle} if lifecycle else {}),
+                            "CpuOptions": {"CoreCount": _DEFAULT_VCPUS.get(itype, 2) // 2, "ThreadsPerCore": 1},
+                        }
+                    ]
+                }
+                for itype, lifecycle in instances
+            ]
+        }
+    ]
+    ec2.describe_instance_types.side_effect = lambda InstanceTypes: {
+        "InstanceTypes": [{"InstanceType": t, "VCpuInfo": {"DefaultVCpus": _DEFAULT_VCPUS[t]}} for t in InstanceTypes]
+    }
+    return ec2
+
+
+def _quotas(spot: float, on_demand: float) -> MagicMock:
+    sq = MagicMock()
+    by_code = {QUOTA_FAMILIES["gvt"]["spot"]: spot, QUOTA_FAMILIES["gvt"]["on-demand"]: on_demand}
+    sq.get_service_quota.side_effect = lambda ServiceCode, QuotaCode: {
+        "Quota": {"QuotaCode": QuotaCode, "QuotaName": "x", "Value": by_code[QuotaCode]}
+    }
+    return sq
+
+
+def test_vcpu_fit_counts_running_vcpus_per_market_within_the_family():
+    """Quota usage is each type's default vCPUs, whatever CPU options the instance runs with."""
+    ec2 = _running(
+        ("g6.2xlarge", "spot"),  # 8 spot vCPUs (though running with 4)
+        ("g6.xlarge", None),  # 4 on-demand vCPUs
+        ("g6.2xlarge", "capacity-block"),  # Capacity Blocks don't count against the quotas
+        ("g6.xlarge", "scheduled"),  # nor do (legacy) Scheduled Instances
+        ("p5.4xlarge", "spot"),  # another family: not counted
+        ("t3.large", None),  # not a GPU family: not counted
+    )
+    fit = vcpu_fit(_quotas(spot=16, on_demand=8), ec2, "g7e.2xlarge", 8)
+    assert fit == {
+        "family": "gvt",
+        "spot": {"quota": 16, "in_use": 8, "needed": 8, "fits": True},  # exactly at the quota still fits
+        "on-demand": {"quota": 8, "in_use": 4, "needed": 8, "fits": False},
+    }
+    assert ec2.get_paginator.return_value.paginate.call_args.kwargs == {
+        "Filters": [{"Name": "instance-state-name", "Values": ["pending", "running"]}]
+    }
+
+
+@pytest.mark.parametrize(
+    "sq,ec2,instance_type",
+    [
+        pytest.param(_quotas(8, 8), _running(), "t3.medium", id="not-a-gpu-family"),
+        pytest.param(
+            MagicMock(**{"get_service_quota.side_effect": client_error("AccessDeniedException")}),
+            _running(),
+            "g7e.2xlarge",
+            id="quota-denied",
+        ),
+        pytest.param(
+            _quotas(8, 8),
+            MagicMock(**{"get_paginator.return_value.paginate.side_effect": client_error("UnauthorizedOperation")}),
+            "g7e.2xlarge",
+            id="usage-denied",
+        ),
+    ],
+)
+def test_vcpu_fit_is_none_when_it_cannot_tell(sq, ec2, instance_type):
+    assert vcpu_fit(sq, ec2, instance_type, 8) is None

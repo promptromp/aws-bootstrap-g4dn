@@ -475,14 +475,29 @@ def test_status_terminate_hint_pins_resolved_region(runner, status_aws):
     assert "aws-bootstrap terminate i-abc123 --region us-west-1" in result.output
 
 
-def test_status_on_demand_no_cost(runner, status_aws):
-    status_aws.find.return_value = [_instance("i-ondemand", PublicIp="5.6.7.8", Lifecycle="on-demand")]
-    result = runner.invoke(main, STATUS)
-    assert result.exit_code == 0
-    assert "on-demand" in result.output
-    assert "Uptime" not in result.output
-    assert "Est. cost" not in result.output
+@pytest.mark.parametrize(
+    "price,present,absent",
+    [
+        (0.526, ["on-demand ($0.5260/hr)", "Uptime", "Est. cost"], []),
+        (None, ["on-demand", "Uptime"], ["Est. cost", "/hr"]),
+    ],
+    ids=["price-known", "price-unknown"],
+)
+def test_status_prices_on_demand_instances(runner, status_aws, price, present, absent):
+    status_aws.find.return_value = [
+        _instance("i-ondemand", Lifecycle="on-demand", InstanceType="g6.2xlarge"),
+        _instance("i-ondemand2", Lifecycle="on-demand", InstanceType="g6.2xlarge"),
+    ]
+    with patch("aws_bootstrap.cli.on_demand_price", return_value=price) as od_price:
+        result = runner.invoke(main, STATUS)
+    assert result.exit_code == 0, result.output
+    for text in present:
+        assert text in result.output
+    for text in absent:
+        assert text not in result.output
     status_aws.spot.assert_not_called()
+    od_price.assert_called_once()  # cached per type and region
+    assert od_price.call_args[0][1:] == ("g6.2xlarge", "us-west-2")  # the instance's type and region
 
 
 def test_status_shows_alias(runner, status_aws):
@@ -1204,6 +1219,39 @@ def test_cleanup_include_ebs_not_deleted_on_region_failure(runner, cleanup_env, 
 # ---------------------------------------------------------------------------
 # list instance-types / amis
 # ---------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "fmt,expected",
+    [
+        ("text", ["EFA", "yes"]),
+        ("json", ['"efa_supported": true']),
+        ("yaml", ["efa_supported: true"]),
+        ("table", ["EFA", "True"]),
+    ],
+)
+def test_list_instance_types_shows_efa_support(runner, cli_session, instance_type_rows, fmt, expected):
+    rows = [{**instance_type_rows[0], "InstanceType": "g7e.8xlarge", "EfaSupported": True}]
+    with patch("aws_bootstrap.cli.list_instance_types", return_value=rows):
+        result = runner.invoke(main, ["-o", fmt, "list", "instance-types", "--prefix", "g7e"])
+    assert result.exit_code == 0, result.output
+    for text in expected:
+        assert text in result.output
+
+
+def test_status_prices_each_instance_by_its_market(runner, status_aws):
+    status_aws.find.return_value = [
+        _instance("i-spot", Lifecycle="spot"),
+        _instance("i-od", Lifecycle="on-demand"),
+        _instance("i-cb", Lifecycle="capacity-block"),  # Capacity Blocks are priced differently: not shown
+    ]
+    with patch("aws_bootstrap.cli.on_demand_price", return_value=0.526):
+        result = runner.invoke(main, ["-o", "json", *STATUS])
+    prices = {
+        i["instance_id"]: (i.get("spot_price_per_hour"), i.get("on_demand_price_per_hour"), "estimated_cost" in i)
+        for i in json.loads(result.output)["instances"]
+    }
+    assert prices == {"i-spot": (0.15, None, True), "i-od": (None, 0.526, True), "i-cb": (None, None, False)}
 
 
 def test_list_instance_types_output(runner, cli_session, instance_type_rows):

@@ -184,6 +184,17 @@ either flag; it also decides the region (the volume is located first, in your
 `--region`s or the default region and then every enabled region), so such a
 launch is single-region. `--dry-run` prints the AZ plan for every `--region`.
 
+### Price vs placement score vs quota (`--dry-run`)
+
+The cheapest AZ isn't always the one with capacity. A dry run shows, per
+region, every usable AZ's spot price *and* its spot placement score (EC2's 1-10
+estimate of how likely a spot request succeeds there), the on-demand price, and
+whether one more instance fits each market's vCPU quota given what's running.
+They are display only: `--cheapest-az` still ranks by price, because a
+capacity miss already falls through to the next AZ, and a score is a coarse
+estimate rather than a promise. To act on a score, pin the AZ:
+`--az <high-score AZ>` (add `--wait` to hold out for it).
+
 ## Region default precedence
 
 `--region` resolution (all commands):

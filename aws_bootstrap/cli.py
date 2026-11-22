@@ -3,6 +3,7 @@
 from __future__ import annotations
 import contextlib
 import subprocess
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 
@@ -50,13 +51,16 @@ from .ec2 import (
     get_spot_price,
     instance_type_architecture,
     instance_type_to_family,
+    instance_type_vcpus,
     launch_with_retry,
     list_amis,
     list_clusters,
     list_enabled_regions,
     list_instance_types,
     locate_ebs_volume,
+    on_demand_price,
     plan_azs,
+    spot_placement_scores,
     spot_price_or_none,
     terminate_tagged_instances,
     validate_ebs_volume,
@@ -72,6 +76,7 @@ from .quota import (
     get_quota,
     get_quota_request_history,
     request_quota_increase,
+    vcpu_fit,
 )
 from .retry import group_azs_by_region, parse_duration, resolve_regions
 from .ssh import (
@@ -318,13 +323,101 @@ def _az_label(az: str, spot_price: float | None) -> str:
     return f"{az} (spot ${spot_price:.3f}/h)" if spot_price is not None else az
 
 
-def _az_plan_label(plan: list[AzOption], pricing: str) -> str:
-    """``us-west-2b $0.991/h → us-west-2a $2.212/h`` (prices only for spot)."""
+def _az_plan_label(plan: list[AzOption], pricing: str, scores: dict[str, int] | None = None, sep: str = " → ") -> str:
+    """``us-west-2b $0.991/h → us-west-2a $2.212/h`` (prices only for spot), with placement scores when given."""
     parts = []
     for o in plan:
         price = f" ${o.spot_price:.3f}/h" if pricing == "spot" and o.spot_price is not None else ""
-        parts.append(f"{o.zone}{price}")
-    return " → ".join(parts)
+        score = f" score {scores[o.zone]}" if scores and o.zone in scores else ""
+        parts.append(f"{o.zone}{price}{score}")
+    return sep.join(parts)
+
+
+@dataclass
+class _PoolFacts:
+    """What a dry run reports about one region's pools. Every field is best-effort (None: unknown)."""
+
+    on_demand_price: float | None
+    spot_pools: list[AzOption] | None  # usable AZs with spot prices; None for on-demand or on error
+    spot_pools_error: str | None
+    scores: dict[str, int]  # spot placement score per AZ name
+    quota_family: str | None  # None: the type draws on no GPU vCPU quota
+    quota: dict | None  # quota.vcpu_fit
+
+
+def _gather_pool_facts(
+    aws_profile: str | None,
+    instance_type: str,
+    regions: tuple[str, ...],
+    spot: bool,
+    known_pools: dict[str, list[AzOption]],
+) -> dict[str, _PoolFacts]:
+    """Read-only facts for choosing a pool, per region: on-demand price, spot pools and scores, quota fit.
+
+    *known_pools* are AZ plans that already cover every usable AZ of their region
+    (``--cheapest-az`` alone), reused rather than looked up again.
+    """
+    session = boto3.Session(profile_name=aws_profile)
+    scores = spot_placement_scores(session, instance_type, regions) if spot else {}
+    family = instance_type_to_family(instance_type)
+    facts: dict[str, _PoolFacts] = {}
+    for region in regions:
+        ec2r = session.client("ec2", region_name=region)
+        pools, pools_error = known_pools.get(region), None
+        if spot and pools is None:
+            try:
+                pools = plan_azs(ec2r, region, instance_type)
+            except CLIError as e:
+                pools_error = e.format_message()
+            except (botocore.exceptions.ClientError, botocore.exceptions.BotoCoreError) as e:
+                pools_error = f"unknown ({e})"
+        quota = None
+        if family:
+            vcpus = instance_type_vcpus(ec2r, instance_type)
+            sq = session.client("service-quotas", region_name=region)
+            quota = vcpu_fit(sq, ec2r, instance_type, vcpus) if vcpus else None
+        facts[region] = _PoolFacts(
+            on_demand_price(session, instance_type, region),
+            pools,
+            pools_error,
+            scores.get(region, {}),
+            family,
+            quota,
+        )
+    return facts
+
+
+def _price_label(price: float | None) -> str:
+    return f"${price:.3f}/h" if price is not None else "unknown"
+
+
+def _quota_fit_label(fit: dict | None, family: str | None) -> str:
+    """``spot 8/8 vCPU in use + 8 → won't fit; on-demand 0/8 + 8 → fits`` (or why it can't say).
+
+    *family* is the type's quota family; None means it draws on no GPU vCPU quota.
+    """
+    if family is None:
+        return "n/a (no GPU vCPU quota for this type)"
+    if fit is None:
+        return "unknown"
+    parts = []
+    for market in ("spot", "on-demand"):
+        m = fit.get(market)
+        if m:
+            verdict = "fits" if m["fits"] else "won't fit"
+            parts.append(f"{market} {m['in_use']}/{m['quota']} vCPU in use + {m['needed']} → {verdict}")
+    return "; ".join(parts)
+
+
+def _quota_raise_command(fit: dict | None, market: str, region: str) -> str | None:
+    """The `quota request` that would make one more instance fit *market*, if it doesn't fit now."""
+    m = (fit or {}).get(market)
+    if not m or m["fits"]:
+        return None
+    return (
+        f"aws-bootstrap quota request --family {fit['family']} --type {market} "  # type: ignore[index]
+        f"--desired-value {m['in_use'] + m['needed']} --region {region}"
+    )
 
 
 def _check_profile(aws_profile: str | None, value: str | None) -> list[str] | None:
@@ -658,6 +751,13 @@ def launch(
         ami = ctx0.ami
         # Only with AZ flags: without them prepare_region caches an empty plan ("EC2 picks").
         dry_plans: dict[str, list[AzOption]] = dict(az_plans) if (az_map or config.cheapest_az) else {}
+        # Display only: prices, placement scores and quota headroom never change what launches.
+        # A --cheapest-az plan for a region without explicit AZs already lists every pool.
+        full_plans = {
+            r: az_plans[r] for r in config.regions if config.cheapest_az and not az_map.get(r) and az_plans.get(r)
+        }
+        facts = _gather_pool_facts(config.profile, config.instance_type, config.regions, config.spot, full_plans)
+        market = "spot" if config.spot else "on-demand"
         if is_text(ctx):
             click.echo()
             click.secho("--- Dry Run Summary ---", bold=True, fg="yellow")
@@ -671,8 +771,19 @@ def launch(
             if config.iam_instance_profile:
                 val("IAM instance profile", _profile_label(config.iam_instance_profile, profile_roles))
             for r, plan in dry_plans.items():
-                label = _az_plan_label(plan, pricing) if plan else "chosen by EC2"
+                label = _az_plan_label(plan, pricing, facts[r].scores) if plan else "chosen by EC2"
                 val(f"AZs ({r})" if multi_region or len(dry_plans) > 1 else "AZs", label)
+            for r, f in facts.items():
+                where = f" ({r})" if multi_region else ""
+                val(f"On-demand price{where}", _price_label(f.on_demand_price))
+                if config.spot and r not in full_plans:  # else the AZs line above already lists them
+                    pools = _az_plan_label(f.spot_pools, "spot", f.scores, sep=" · ") if f.spot_pools else None
+                    val(f"Spot pools{where}", pools or f.spot_pools_error or "none")
+                quota_where = ", ".join(x for x in (r if multi_region else "", f.quota_family or "") if x)
+                val(f"Quota ({quota_where})" if quota_where else "Quota", _quota_fit_label(f.quota, f.quota_family))
+                raise_cmd = _quota_raise_command(f.quota, market, r)
+                if raise_cmd:
+                    info(f"  {market} quota too small for one more {config.instance_type}: " + _cmd(raise_cmd))
             if config.wait:
                 val("Wait", f"yes (timeout {config.wait_timeout}s)")
             val("Remote setup", "yes" if config.run_setup else "no")
@@ -705,18 +816,50 @@ def launch(
                 # Per region, the AZs that would be tried in order (null: EC2 chooses).
                 "availability_zones": (
                     {
-                        r: [{"zone": o.zone, "spot_price": o.spot_price} for o in plan] or None
+                        r: [
+                            {"zone": o.zone, "spot_price": o.spot_price, "placement_score": facts[r].scores.get(o.zone)}
+                            for o in plan
+                        ]
+                        or None
                         for r, plan in dry_plans.items()
                     }
                     if dry_plans
                     else None
                 ),
+                # Display-only facts for choosing a pool (null where a lookup failed).
+                "on_demand_price_per_hour": {r: f.on_demand_price for r, f in facts.items()},
+                "quota_fit": {r: f.quota for r, f in facts.items()},
             }
-            if dry_plans and get_format(ctx) == OutputFormat.TABLE:
-                # A nested mapping renders as a Python repr in the key/value table.
-                result["availability_zones"] = "; ".join(
-                    f"{r}: {_az_plan_label(plan, pricing) if plan else 'EC2 chooses'}" for r, plan in dry_plans.items()
+            if config.spot:
+                result["spot_pools"] = {
+                    r: (
+                        [
+                            {"zone": o.zone, "spot_price": o.spot_price, "placement_score": f.scores.get(o.zone)}
+                            for o in f.spot_pools
+                        ]
+                        if f.spot_pools is not None
+                        else None
+                    )
+                    for r, f in facts.items()
+                }
+            if get_format(ctx) == OutputFormat.TABLE:
+                # Nested mappings render as a Python repr in the key/value table: flatten them.
+                if dry_plans:
+                    result["availability_zones"] = "; ".join(
+                        f"{r}: {_az_plan_label(plan, pricing, facts[r].scores) if plan else 'EC2 chooses'}"
+                        for r, plan in dry_plans.items()
+                    )
+                result["on_demand_price_per_hour"] = "; ".join(
+                    f"{r}: {_price_label(f.on_demand_price)}" for r, f in facts.items()
                 )
+                result["quota_fit"] = "; ".join(
+                    f"{r}: {_quota_fit_label(f.quota, f.quota_family)}" for r, f in facts.items()
+                )
+                if config.spot:
+                    result["spot_pools"] = "; ".join(
+                        f"{r}: {_az_plan_label(f.spot_pools, 'spot', f.scores, sep=', ') if f.spot_pools else 'none'}"
+                        for r, f in facts.items()
+                    )
             if config.ssh_port != SSH_PORT_DEFAULT:
                 result["ssh_port"] = config.ssh_port
             if config.python_version:
@@ -791,6 +934,15 @@ def launch(
     if pricing == "spot" and az:
         # A fresh lookup first (a plan's price can be an hour old after a long --wait).
         spot_price = spot_price_or_none(ec2, config.instance_type, az) or launched.context.az_prices.get(az)
+    od_prices: dict[str, float | None] = {}
+
+    def od_price() -> float | None:
+        """The on-demand price, looked up once, late: best-effort, never raises (the instance is billing)."""
+        if "price" not in od_prices:
+            session = boto3.Session(profile_name=config.profile)
+            od_prices["price"] = on_demand_price(session, config.instance_type, active_region)
+        return od_prices["price"]
+
     val("Instance ID", instance_id)
     val("Region", active_region)
     val("Pricing", pricing)
@@ -827,6 +979,7 @@ def launch(
                     "region": active_region,
                     "pricing": pricing,
                     **({"spot_price_per_hour": spot_price} if spot_price is not None else {}),
+                    **({"on_demand_price_per_hour": od_price()} if od_price() is not None else {}),
                     **({"iam_instance_profile": profile_name} if profile_name else {}),
                     "error": message,
                     # The volume is created and attached *before* the SSH wait, so
@@ -943,6 +1096,8 @@ def launch(
         }
         if spot_price is not None:
             result_data["spot_price_per_hour"] = spot_price
+        if od_price() is not None:
+            result_data["on_demand_price_per_hour"] = od_price()
         if profile_name:
             result_data["iam_instance_profile"] = profile_name
         if cuda_version:
@@ -970,6 +1125,8 @@ def launch(
     val("Region", active_region)
     val("Availability zone", _az_label(az, spot_price))
     val("Pricing", pricing)
+    if od_price() is not None:
+        val("On-demand price", _price_label(od_price()))
     if profile_name:
         val("IAM instance profile", profile_name)
     if cuda_version:
@@ -1112,6 +1269,7 @@ def status(ctx, region, profile, gpu, instructions):
             click.echo()
 
     structured_instances = []
+    od_prices: dict[tuple[str, str], float | None] = {}
 
     for inst in instances:
         state = inst["State"]
@@ -1210,24 +1368,21 @@ def status(ctx, region, profile, gpu, instructions):
                 for vol in ebs_volumes
             ]
 
-        lifecycle = inst["Lifecycle"]
-        is_spot = lifecycle == "spot"
-        spot_price = None
+        lifecycle = inst["Lifecycle"]  # spot, on-demand, or e.g. capacity-block (priced differently: not shown)
+        hourly = None
+        if lifecycle == "spot":
+            hourly = get_spot_price(ec2, inst["InstanceType"], inst["AvailabilityZone"])
+        elif lifecycle == "on-demand":
+            key = (inst["InstanceType"], inst["Region"])
+            if key not in od_prices:  # one Price List lookup per type and region
+                od_prices[key] = on_demand_price(session, *key)
+            hourly = od_prices[key]
+        if is_text(ctx):
+            val("    Pricing", f"{lifecycle} (${hourly:.4f}/hr)" if hourly is not None else lifecycle)
+        if hourly is not None:
+            inst_data["spot_price_per_hour" if lifecycle == "spot" else "on_demand_price_per_hour"] = hourly
 
-        if is_spot:
-            spot_price = get_spot_price(ec2, inst["InstanceType"], inst["AvailabilityZone"])
-            if is_text(ctx):
-                if spot_price is not None:
-                    val("    Pricing", f"spot (${spot_price:.4f}/hr)")
-                else:
-                    val("    Pricing", "spot")
-            if spot_price is not None:
-                inst_data["spot_price_per_hour"] = spot_price
-        else:
-            if is_text(ctx):
-                val("    Pricing", "on-demand")
-
-        if state == "running" and is_spot:
+        if state == "running":
             uptime = datetime.now(UTC) - inst["LaunchTime"]
             total_seconds = int(uptime.total_seconds())
             inst_data["uptime_seconds"] = total_seconds
@@ -1235,9 +1390,8 @@ def status(ctx, region, profile, gpu, instructions):
                 hours, remainder = divmod(total_seconds, 3600)
                 minutes = remainder // 60
                 val("    Uptime", f"{hours}h {minutes:02d}m")
-            if spot_price is not None:
-                uptime_hours = uptime.total_seconds() / 3600
-                est_cost = uptime_hours * spot_price
+            if hourly is not None:
+                est_cost = uptime.total_seconds() / 3600 * hourly
                 inst_data["estimated_cost"] = round(est_cost, 4)
                 if is_text(ctx):
                     val("    Est. cost", f"~${est_cost:.4f}")
@@ -1707,6 +1861,7 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
                 "memory_mib": t["MemoryMiB"],
                 # vCPU quota family this type draws from (gvt/p/dl), or None for non-GPU.
                 "quota_family": instance_type_to_family(t["InstanceType"]),
+                "efa_supported": t["EfaSupported"],
                 "gpu": t["GpuSummary"] or None,
             }
             for r, types in per_region
@@ -1720,6 +1875,7 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
                 "vcpus": "vCPUs",
                 "memory_mib": "Memory (MiB)",
                 "quota_family": "Quota Family",
+                "efa_supported": "EFA",
                 "gpu": "GPU",
             },
             ctx=ctx,
@@ -1739,16 +1895,19 @@ def list_instance_types_cmd(ctx, prefix, region, profile):
         click.echo(
             "  "
             + click.style(
-                f"{'Instance Type':<20}{'vCPUs':>7}{'Memory (MiB)':>15}  {'Quota Family':<14}GPU",
+                f"{'Instance Type':<20}{'vCPUs':>7}{'Memory (MiB)':>15}  {'Quota Family':<14}{'EFA':<5}GPU",
                 fg="bright_white",
                 bold=True,
             )
         )
-        click.echo("  " + "-" * 80)
+        click.echo("  " + "-" * 85)
         for t in types:
             gpu_str = t["GpuSummary"] or "-"
             fam_str = instance_type_to_family(t["InstanceType"]) or "-"
-            click.echo(f"  {t['InstanceType']:<20}{t['VCpuCount']:>7}{t['MemoryMiB']:>15}  {fam_str:<14}{gpu_str}")
+            efa_str = "yes" if t["EfaSupported"] else "-"
+            click.echo(
+                f"  {t['InstanceType']:<20}{t['VCpuCount']:>7}{t['MemoryMiB']:>15}  {fam_str:<14}{efa_str:<5}{gpu_str}"
+            )
 
     click.echo()
     click.echo(

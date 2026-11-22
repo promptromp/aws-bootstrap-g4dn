@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 import json
-from unittest.mock import patch
+from unittest.mock import ANY, patch
 
 import pytest
 import yaml
@@ -62,8 +62,7 @@ def test_az_implies_its_region_and_is_planned_explicitly(plan_azs, key_path):
     result = _run("-o", "json", "launch", "--key-path", str(key_path), "--dry-run", "--az", "us-west-2b")
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["regions"] == ["us-west-2"]
-    assert plan_azs.call_args.args[1:] == ("us-west-2", "g4dn.xlarge")
-    assert plan_azs.call_args.kwargs == {"explicit": ("us-west-2b",), "cheapest": False}
+    plan_azs.assert_any_call(ANY, "us-west-2", "g4dn.xlarge", explicit=("us-west-2b",), cheapest=False)
 
 
 def test_dry_run_plans_every_region_not_only_the_first(plan_azs, key_path):
@@ -71,7 +70,8 @@ def test_dry_run_plans_every_region_not_only_the_first(plan_azs, key_path):
     result = _run("-o", "json", "launch", "--key-path", str(key_path), "--dry-run", "--cheapest-az", *regions)
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["availability_zones"] == {
-        r: [{"zone": o.zone, "spot_price": o.spot_price} for o in options] for r, options in PLANS.items()
+        r: [{"zone": o.zone, "spot_price": o.spot_price, "placement_score": None} for o in options]
+        for r, options in PLANS.items()
     }
 
 
@@ -96,7 +96,8 @@ def test_dry_run_without_az_flags_reports_null(plan_azs, key_path):
     result = _run("-o", "json", "launch", "--key-path", str(key_path), "--dry-run")
     assert result.exit_code == 0, result.output
     assert json.loads(result.output)["availability_zones"] is None
-    plan_azs.assert_not_called()
+    # Only the dry run's display of the region's spot pools: no explicit or cheapest-first plan.
+    assert [c.kwargs for c in plan_azs.call_args_list] == [{}]
 
 
 def test_bad_az_in_a_later_region_fails_before_anything_is_created(launch_aws, plan_azs, key_path):

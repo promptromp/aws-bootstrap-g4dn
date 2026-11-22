@@ -233,6 +233,34 @@ Price semantics, stated plainly:
 - Both flags are incompatible with `--ebs-volume-id` (the volume already decides the AZ);
   `--cheapest-az` is incompatible with `--on-demand` (on-demand prices don't vary by AZ).
 
+#### Choosing a pool: what `--dry-run` shows
+
+Price is only one of three things that decide whether a launch works and what it costs. For every
+`--region`, a dry run also reports the on-demand price, every usable AZ's spot price with its **spot
+placement score** (EC2's 1–10 estimate of how likely a spot request succeeds there), and whether one
+more instance **fits your vCPU quota** in each market, given what's already running:
+
+```
+$ aws-bootstrap launch --dry-run --instance-type g7e.2xlarge --region us-east-1
+  On-demand price: $3.363/h
+  Spot pools: us-east-1a $2.134/h score 1 · us-east-1b $2.609/h score 1 · us-east-1c $2.277/h score 9
+  Quota (gvt): spot 8/8 vCPU in use + 8 → won't fit; on-demand 8/24 vCPU in use + 8 → fits
+    spot quota too small for one more g7e.2xlarge: aws-bootstrap quota request --family gvt --type spot --desired-value 16 --region us-east-1
+```
+
+Read it as: spot saves about a third here, but the cheapest AZ is unlikely to have capacity (score 1);
+us-east-1c (score 9) is the better bet, so launch with `--az us-east-1c`, and only once the spot
+quota has room. The quota line is an estimate (each running instance counts its type's default
+vCPUs; Capacity Block instances don't count; open spot requests and unused capacity reservations
+aren't seen). `aws-bootstrap quota show` confirms the limits; the in-use side is the estimate. Scores appear only for P, G, Trn and Inf types:
+for other families AWS caps the score of a single instance type low, which would mislead. These facts are **display only**: they never change what launches or in which order
+(`--cheapest-az` stays price-only, since a capacity miss already falls through to the next AZ).
+Structured output carries them as `on_demand_price_per_hour`, `spot_pools` (with `placement_score`)
+and `quota_fit`. Each lookup is optional and shows `unknown` without its permission:
+`pricing:GetProducts`, `ec2:GetSpotPlacementScores`, `servicequotas:GetServiceQuota`. AZ names are
+mapped per account (use1-az6 is `us-east-1c` in one account and maybe `us-east-1a` in another), and the
+dry run shows your account's names.
+
 See [docs/capacity-and-retry.md](docs/capacity-and-retry.md) for the backoff design and recommended region lists per instance family.
 
 ### 🔑 AWS access from the instance (`--iam-instance-profile`)
@@ -591,7 +619,7 @@ Key behaviors:
   aws s3 sync s3://my-bucket/dataset /data/dataset
   touch /data/.prepared
   ```
-- **EFA / AZ caveat** — `g4dn`/`g5` instances run NCCL over ordinary VPC networking (EFA is essentially P-series only), which is fine for dev/learning/modest scale. Pinning to one AZ means a spot shortage there affects the whole cluster.
+- **EFA / AZ caveat** — clusters run NCCL over ordinary VPC networking: aws-bootstrap doesn't configure EFA yet. EFA is available on the P-series and on the 8xlarge-and-up sizes of most G families (`list instance-types` has an EFA column). Plain networking is fine for dev/learning/modest scale. Pinning to one AZ means a spot shortage there affects the whole cluster.
 
 ## EC2 vCPU Quotas
 
