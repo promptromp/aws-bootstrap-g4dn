@@ -438,6 +438,8 @@ def test_spot_placement_scores_map_zone_ids_to_this_accounts_zone_names():
         "us-west-2": {"us-west-2b": 3},
     }
     east.get_paginator.assert_called_once_with("get_spot_placement_scores")
+    first = session.client.call_args_list[0]  # the scores client is bounded like the pricing one
+    assert first.kwargs["region_name"] == "us-east-1" and first.kwargs["config"].connect_timeout == 5
     assert east.get_paginator.return_value.paginate.call_args.kwargs == {
         "InstanceTypes": ["g7e.2xlarge"],
         "TargetCapacity": 1,

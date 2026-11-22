@@ -155,8 +155,8 @@ the instance rather than leaking it. Branch on `status`, not on the exit code al
 
 **Choosing a pool from a dry run.** These are display only and never change what launches:
 - `on_demand_price_per_hour` per region;
-- `spot_pools` per region (spot only): every usable AZ with its spot price and **placement score**. The score is EC2's 1–10 estimate that a spot request succeeds there; a low-score cheapest AZ often has no capacity. Scores are given only for P, G, Trn and Inf types (elsewhere `placement_score` is `null`): AWS caps single-type scores low for other families.
-- `quota_fit` per region: an estimate of whether one more instance fits each market's vCPU quota, given running instances. `fits: false` means the launch would likely be refused in that market: confirm with `aws-bootstrap quota show` before deciding (open spot requests and unused capacity reservations aren't counted). Text mode prints the `quota request` that would make room.
+- `spot_pools` per region (spot only): every usable AZ with its spot price and **placement score** (in price order with `--cheapest-az`, else by zone). The score is EC2's 1–10 estimate that a spot request succeeds there; a low-score cheapest AZ often has no capacity. Scores are given only for P, G, Trn and Inf types (elsewhere `placement_score` is `null`): AWS caps single-type scores low for other families.
+- `quota_fit` per region: an estimate of whether one more instance fits each market's vCPU quota, given running instances. `fits: false` means the launch would likely be refused in that market: `aws-bootstrap quota show` confirms the limit; in-use is estimated from running instances (open spot requests and unused capacity reservations aren't counted). Text mode prints the `quota request` that would make room.
 
 Prefer a high-score AZ with `--az <zone>`; `--cheapest-az` ranks by price only. Any of these is `null` (or `unknown` in text) when its lookup isn't permitted (`pricing:GetProducts`, `ec2:GetSpotPlacementScores`, `servicequotas:GetServiceQuota`). AZ names are per account.
 

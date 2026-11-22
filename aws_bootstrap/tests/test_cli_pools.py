@@ -167,7 +167,11 @@ def test_launch_reports_the_on_demand_price_when_known(runner, launched, key_pat
 
 
 def test_launch_text_shows_the_on_demand_price_once_set_up(runner, launched, key_path):
-    launched.pools.od_price.return_value = 3.36312
+    def price(*_args):
+        launched.add_ssh.assert_called_once()  # a slow price lookup mustn't delay the SSH alias
+        return 3.36312
+
+    launched.pools.od_price.side_effect = price
     result = runner.invoke(main, ["launch", "--key-path", str(key_path), "--no-setup"])
     assert result.exit_code == 0, result.output
     assert "On-demand price: $3.363/h" in result.output

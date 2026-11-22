@@ -391,8 +391,11 @@ def _price_label(price: float | None) -> str:
     return f"${price:.3f}/h" if price is not None else "unknown"
 
 
-def _quota_fit_label(fit: dict | None, family: str | None = "") -> str:
-    """``spot 8/8 vCPU in use + 8 → won't fit; on-demand 0/8 + 8 → fits`` (or why it can't say)."""
+def _quota_fit_label(fit: dict | None, family: str | None) -> str:
+    """``spot 8/8 vCPU in use + 8 → won't fit; on-demand 0/8 + 8 → fits`` (or why it can't say).
+
+    *family* is the type's quota family; None means it draws on no GPU vCPU quota.
+    """
     if family is None:
         return "n/a (no GPU vCPU quota for this type)"
     if fit is None:

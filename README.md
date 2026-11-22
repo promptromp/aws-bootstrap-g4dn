@@ -252,7 +252,7 @@ Read it as: spot saves about a third here, but the cheapest AZ is unlikely to ha
 us-east-1c (score 9) is the better bet, so launch with `--az us-east-1c`, and only once the spot
 quota has room. The quota line is an estimate (each running instance counts its type's default
 vCPUs; Capacity Block instances don't count; open spot requests and unused capacity reservations
-aren't seen): confirm with `aws-bootstrap quota show`. Scores appear only for P, G, Trn and Inf types:
+aren't seen). `aws-bootstrap quota show` confirms the limits; the in-use side is the estimate. Scores appear only for P, G, Trn and Inf types:
 for other families AWS caps the score of a single instance type low, which would mislead. These facts are **display only**: they never change what launches or in which order
 (`--cheapest-az` stays price-only, since a capacity miss already falls through to the next AZ).
 Structured output carries them as `on_demand_price_per_hour`, `spot_pools` (with `placement_score`)

@@ -277,6 +277,7 @@ def test_vcpu_fit_counts_running_vcpus_per_market_within_the_family():
         ("g6.2xlarge", "spot"),  # 8 spot vCPUs (though running with 4)
         ("g6.xlarge", None),  # 4 on-demand vCPUs
         ("g6.2xlarge", "capacity-block"),  # Capacity Blocks don't count against the quotas
+        ("g6.xlarge", "scheduled"),  # nor do (legacy) Scheduled Instances
         ("p5.4xlarge", "spot"),  # another family: not counted
         ("t3.large", None),  # not a GPU family: not counted
     )
