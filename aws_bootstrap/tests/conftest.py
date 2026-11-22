@@ -1,10 +1,12 @@
 """Shared pytest fixtures for the aws_bootstrap CLI tests."""
 
 from __future__ import annotations
+import json
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
+import yaml
 from click.testing import CliRunner
 
 from aws_bootstrap.ec2 import RegionContext, RegionLaunch, VolumeLocation
@@ -32,6 +34,12 @@ def key_check_stub(request):
 def runner():
     """A Click CLI test runner."""
     return CliRunner()
+
+
+@pytest.fixture(params=[("json", json.loads), ("yaml", yaml.safe_load)], ids=["json", "yaml"])
+def structured(request):
+    """``(format, loader)`` for each ``--output`` format that parses back into data (table doesn't)."""
+    return request.param
 
 
 @pytest.fixture

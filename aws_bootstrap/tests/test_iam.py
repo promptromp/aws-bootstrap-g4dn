@@ -59,6 +59,7 @@ def test_check_returns_the_roles_and_looks_up_by_name(value, arn, capsys):
     [
         pytest.param(_iam(error=_client_error("NoSuchEntity")), "app", "'app' not found", id="no-such-profile"),
         pytest.param(_iam(arn=PATH_ARN), ARN, "doesn't match this account's 'app'", id="arn-mismatch"),
+        pytest.param(_iam(), "arn:aws:iam::123456789012:role/app", "is an IAM role ARN", id="role-arn"),
     ],
 )
 def test_check_fails_on_a_definite_answer(iam, value, match):
@@ -71,6 +72,7 @@ def test_check_fails_on_a_definite_answer(iam, value, match):
     [
         pytest.param(_client_error("AccessDenied"), id="no-get-permission"),
         pytest.param(botocore.exceptions.EndpointConnectionError(endpoint_url="https://iam"), id="unreachable"),
+        pytest.param(botocore.exceptions.ReadTimeoutError(endpoint_url="https://iam"), id="timed-out"),
     ],
 )
 def test_check_warns_and_continues_when_it_cannot_tell(error, capsys):
@@ -82,3 +84,10 @@ def test_check_warns_and_continues_when_it_cannot_tell(error, capsys):
 def test_check_warns_about_a_profile_without_a_role(capsys):
     assert check_instance_profile(_iam(roles=()), "app") == []
     assert "no role" in capsys.readouterr().err
+
+
+def test_check_lets_missing_credentials_through(capsys):
+    """The CLI's own credentials message must not be preceded by a misleading "could not verify"."""
+    with pytest.raises(botocore.exceptions.NoCredentialsError):
+        check_instance_profile(_iam(error=botocore.exceptions.NoCredentialsError()), "app")
+    assert capsys.readouterr().err == ""

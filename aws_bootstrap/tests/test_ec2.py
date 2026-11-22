@@ -41,6 +41,7 @@ from aws_bootstrap.ec2 import (
     list_instance_types,
     terminate_tagged_instances,
 )
+from aws_bootstrap.iam import InstanceProfileError
 
 
 @pytest.fixture
@@ -343,15 +344,20 @@ def test_run_instances_attaches_the_instance_profile(ec2, profile, expected, spo
     [
         pytest.param(PROFILE_REJECTED, "EC2 rejected IAM instance profile 'app'", id="invalid-profile"),
         pytest.param(
+            _make_client_error("InvalidParameterValue", "Value (x) for parameter IamInstanceProfile.Arn is invalid"),
+            "EC2 rejected IAM instance profile 'app'",
+            id="invalid-profile-other-casing",
+        ),
+        pytest.param(
             _make_client_error("UnauthorizedOperation", "Encoded authorization failure message: xyz"),
-            "iam:PassRole",
+            "often a missing iam:PassRole",
             id="pass-role-denied",
         ),
     ],
 )
-def test_run_instances_profile_errors_become_cli_errors(ec2, error, match):
+def test_run_instances_profile_errors_become_global_errors(ec2, error, match):
     ec2.run_instances.side_effect = error
-    with pytest.raises(CLIError, match=match):
+    with pytest.raises(InstanceProfileError, match=match):
         _run_instances(ec2, LaunchConfig(iam_instance_profile="app"), "ami-1", "sg-1", "us-west-2", True, "k")
 
 

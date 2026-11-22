@@ -12,6 +12,14 @@ import click
 from .errors import CLIError
 
 
+# An unreachable or flaky endpoint (not credentials: those reach the CLI's own handler).
+_UNREACHABLE = (botocore.exceptions.ConnectionError, botocore.exceptions.HTTPClientError)
+
+
+class InstanceProfileError(CLIError):
+    """EC2 refused the launch because of the instance profile: the same in every AZ, region and market."""
+
+
 def instance_profile_spec(value: str) -> dict[str, str]:
     """RunInstances ``IamInstanceProfile``: ``{"Arn": …}`` for an ARN, else ``{"Name": …}``."""
     return {"Arn": value} if value.startswith("arn:") else {"Name": value}
@@ -32,10 +40,17 @@ def check_instance_profile(iam_client, value: str) -> list[str] | None:
 
     Raises :class:`CLIError` only when the answer is definite: no such profile, or an
     ARN that isn't this account's profile of that name. When the profile can't be
-    read (e.g. no ``iam:GetInstanceProfile`` — launching needs only ``iam:PassRole``),
-    warns and returns ``None``: EC2 still rejects an invalid profile before it creates
-    anything. A profile with no role gives the instance no credentials, so that warns too.
+    read (e.g. no ``iam:GetInstanceProfile`` — launching needs only ``iam:PassRole`` — or
+    an unreachable endpoint), warns and returns ``None``: EC2 still rejects an invalid
+    profile before it creates an instance. Missing credentials propagate to the CLI's
+    handler. A role ARN passed by mistake is an error; a profile with no role gives the
+    instance no credentials, so that warns.
     """
+    if value.startswith("arn:") and ":role/" in value:
+        raise CLIError(
+            f"{value} is an IAM role ARN; --iam-instance-profile takes an instance profile (name or ARN).\n"
+            "  A role created for EC2 in the console has a profile of the same name: pass that name."
+        )
     name = instance_profile_name(value)
     try:
         profile = iam_client.get_instance_profile(InstanceProfileName=name)["InstanceProfile"]
@@ -48,7 +63,7 @@ def check_instance_profile(iam_client, value: str) -> list[str] | None:
             ) from None
         _warn(f"could not verify IAM instance profile '{name}' ({e}); continuing (EC2 checks it at launch).")
         return None
-    except botocore.exceptions.BotoCoreError as e:
+    except _UNREACHABLE as e:
         _warn(f"could not verify IAM instance profile '{name}' ({e}); continuing (EC2 checks it at launch).")
         return None
     if value.startswith("arn:") and profile["Arn"] != value:

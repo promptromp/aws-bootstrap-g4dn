@@ -62,7 +62,7 @@ from .ec2 import (
     validate_ebs_volume,
     wait_instance_ready,
 )
-from .iam import check_instance_profile, instance_profile_name
+from .iam import InstanceProfileError, check_instance_profile, instance_profile_name
 from .output import OutputFormat, emit, get_format, is_text
 from .quota import (
     QUOTA_FAMILIES,
@@ -334,7 +334,7 @@ def _check_profile(aws_profile: str | None, value: str | None) -> list[str] | No
 
 
 def _profile_label(value: str, roles: list[str] | None) -> str:
-    """``onepass-ec2 (role onepass-ec2)``; notes when the roles are unknown or missing."""
+    """``my-profile (role my-role)``; notes when the roles are unknown or missing."""
     name = instance_profile_name(value)
     if roles is None:
         return f"{name} (not verified)"
@@ -2177,18 +2177,24 @@ def _warn_profile_mismatch(cluster_id: str, existing: list[dict], value: str | N
         return
     have = ", ".join(sorted({n.get("IamInstanceProfile") or "none" for n in others}))
     nodes = ", ".join(n["InstanceId"] for n in others)
-    fix = (
-        f"  To give them the same profile:  aws ec2 associate-iam-instance-profile --region {region} "
-        f"--instance-id <id> --iam-instance-profile Name={want}"
-        if want
-        else ""
-    )
+    fixes = []
+    if want and any(not n.get("IamInstanceProfile") for n in others):
+        fixes.append(
+            f"  Nodes without one:  aws ec2 associate-iam-instance-profile --region {region} "
+            f"--instance-id <id> --iam-instance-profile Name={want}"
+        )
+    if want and any(n.get("IamInstanceProfile") for n in others):
+        fixes.append(
+            "  Nodes with another:  aws ec2 replace-iam-instance-profile-association "
+            f"--region {region} --association-id <id> --iam-instance-profile Name={want}\n"
+            f"    (association ids: aws ec2 describe-iam-instance-profile-associations --region {region})"
+        )
     # stderr, unconditionally: structured-output users must see it too.
     click.echo(
         click.style("  WARNING: ", fg="yellow", bold=True)
         + f"cluster '{cluster_id}' node(s) {nodes} have IAM instance profile {have}; "
         + f"new nodes get {want or 'none'}."
-        + (f"\n{fix}" if fix else ""),
+        + "".join(f"\n{f}" for f in fixes),
         err=True,
     )
 
@@ -2405,14 +2411,20 @@ def cluster_launch(
         # Partial progress: nodes already launched are tagged + aliased and billable.
         if added:
             warn(f"Launched {len(added)} of {to_add} requested node(s) before failing.")
+            profile_flag = f" --iam-instance-profile {iam_instance_profile}" if iam_instance_profile else ""
             info(
                 "  Re-run to finish:  "
-                + _cmd(f"aws-bootstrap cluster launch --cluster-id {cluster_id} --nodes {nodes} --region {region}")
+                + _cmd(
+                    f"aws-bootstrap cluster launch --cluster-id {cluster_id} --nodes {nodes} --region {region}"
+                    + profile_flag
+                )
             )
             info(
                 "  Or roll back:      "
                 + _cmd(f"aws-bootstrap cluster terminate --cluster-id {cluster_id} --region {region}")
             )
+        if isinstance(e, InstanceProfileError):
+            raise  # not about capacity or the AZ: the AZ/--wait advice below doesn't apply
         raise CLIError(
             f"{e.format_message()}\n\n  (cluster nodes are AZ-pinned to {shared['az'] or region}; "
             "a fresh cluster id can target a different AZ, or re-run with --wait to ride out spot capacity.)"
@@ -2429,6 +2441,7 @@ def cluster_launch(
             "placement_group": pg_name,
             "nodes_added": to_add,
             "node_count": len(existing) + to_add,
+            **({"iam_instance_profile": instance_profile_name(iam_instance_profile)} if iam_instance_profile else {}),
             "nodes": added,
         },
         headers={"rank": "Rank", "instance_id": "Instance", "public_ip": "Public IP", "alias": "SSH Alias"},

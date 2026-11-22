@@ -9,7 +9,6 @@ import json
 from unittest.mock import patch
 
 import pytest
-import yaml
 
 from aws_bootstrap.cli import main
 from aws_bootstrap.ec2 import CLIError, VolumeLocation
@@ -59,15 +58,20 @@ def test_dry_run_text_shows_the_profile(runner, launch_aws, key_path, roles, lab
     assert label in result.output
 
 
-@pytest.mark.parametrize("fmt,load", [("json", json.loads), ("yaml", yaml.safe_load), ("table", None)])
-def test_dry_run_structured_output_names_the_profile(runner, launch_aws, key_path, fmt, load):
-    arn = "arn:aws:iam::123456789012:instance-profile/team/app"
-    result = _launch(runner, key_path, "--dry-run", "--iam-instance-profile", arn, fmt=fmt)
+ARN = "arn:aws:iam::123456789012:instance-profile/team/app"
+
+
+def test_dry_run_structured_output_names_the_profile(runner, launch_aws, key_path, structured):
+    fmt, load = structured
+    result = _launch(runner, key_path, "--dry-run", "--iam-instance-profile", ARN, fmt=fmt)
     assert result.exit_code == 0, result.output
-    if load:
-        assert load(result.output)["iam_instance_profile"] == "app"
-    else:
-        assert "iam_instance_profile" in result.output and "app" in result.output
+    assert load(result.output)["iam_instance_profile"] == "app"
+
+
+def test_dry_run_table_names_the_profile(runner, launch_aws, key_path):
+    result = _launch(runner, key_path, "--dry-run", "--iam-instance-profile", ARN, fmt="table")
+    assert result.exit_code == 0, result.output
+    assert "iam_instance_profile" in result.output and "app" in result.output
 
 
 def test_launch_threads_the_profile_into_the_launch_and_its_result(runner, launched, key_path):

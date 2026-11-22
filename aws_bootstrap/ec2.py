@@ -34,7 +34,7 @@ from .constants import (
     VOLUME_TYPE,
 )
 from .errors import CLIError
-from .iam import instance_profile_name, instance_profile_spec
+from .iam import InstanceProfileError, instance_profile_name, instance_profile_spec
 from .output import echo, is_text, secho
 from .retry import backoff_sleep_seconds
 
@@ -496,8 +496,8 @@ def _run_instances(
             ) from None
         if config.iam_instance_profile and _is_profile_error(code, e):
             # The profile is account-wide, so another AZ, region, market or a --wait
-            # retry fails the same way: stop here (nothing was created).
-            raise CLIError(_profile_error_message(code, config.iam_instance_profile, e)) from None
+            # retry fails the same way: stop here (no instance was created).
+            raise InstanceProfileError(_profile_error_message(code, config.iam_instance_profile, e)) from None
         if code == "Unsupported" and placement_az:
             # Often the type isn't offered in this AZ, so another AZ of the region may
             # work; the sweep decides (a hard pin re-raises the original error).
@@ -509,8 +509,8 @@ def _run_instances(
 
 def _is_profile_error(code: str, e: botocore.exceptions.ClientError) -> bool:
     """A RunInstances failure caused by the instance profile (or the right to pass its role)."""
-    message = e.response["Error"].get("Message", "")
-    return (code == "InvalidParameterValue" and "iamInstanceProfile" in message) or code == "UnauthorizedOperation"
+    message = e.response["Error"].get("Message", "").lower()
+    return (code == "InvalidParameterValue" and "iaminstanceprofile" in message) or code == "UnauthorizedOperation"
 
 
 def _profile_error_message(code: str, profile: str, e: botocore.exceptions.ClientError) -> str:
@@ -518,8 +518,8 @@ def _profile_error_message(code: str, profile: str, e: botocore.exceptions.Clien
     if code == "UnauthorizedOperation":
         return (
             f"EC2 refused the launch: {aws_msg}\n\n"
-            f"  Launching with an instance profile also needs iam:PassRole on the role of '{profile}'.\n"
-            "  Decode the message above with:  aws sts decode-authorization-message --encoded-message <message>"
+            f"  With an instance profile this is often a missing iam:PassRole on the role of '{profile}'.\n"
+            "  See which action was denied:  aws sts decode-authorization-message --encoded-message <message>"
         )
     return (
         f"EC2 rejected IAM instance profile '{profile}': {aws_msg}\n\n"
@@ -1338,6 +1338,45 @@ def _describe_volume_in(session, volume_id: str, region: str) -> dict | None:
     return volumes[0] if volumes else None
 
 
+# An unreachable or flaky endpoint, as opposed to an API answer.
+_UNREACHABLE = (botocore.exceptions.ConnectionError, botocore.exceptions.HTTPClientError)
+
+
+def _volume_location(volume_id: str, region: str, volume: dict) -> VolumeLocation:
+    attachments = volume.get("Attachments") or []
+    return VolumeLocation(
+        volume_id=volume_id,
+        region=region,
+        availability_zone=volume["AvailabilityZone"],
+        state=volume["State"],
+        attached_to=attachments[0].get("InstanceId") if attachments else None,
+    )
+
+
+def _sweep_for_volume(
+    session, volume_id: str, regions: list[str], failures: dict[str, str], max_workers: int
+) -> tuple[str, dict] | None:
+    """Query *regions* in parallel; the first that has the volume wins. Failures go to *failures*."""
+    if not regions:
+        return None
+    executor = ThreadPoolExecutor(max_workers=min(max_workers, len(regions)))
+    try:
+        futures = {executor.submit(_describe_volume_in, session, volume_id, r): r for r in regions}
+        for future in as_completed(futures):
+            region = futures[future]
+            try:
+                volume = future.result()
+            except (botocore.exceptions.ClientError, *_UNREACHABLE) as exc:
+                failures[region] = str(exc)
+                continue
+            if volume is not None:
+                return region, volume
+        return None
+    finally:
+        # Found it: don't wait for the slower regions.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
 def locate_ebs_volume(
     session,
     volume_id: str,
@@ -1347,54 +1386,37 @@ def locate_ebs_volume(
 ) -> VolumeLocation:
     """Find the region and AZ of an existing EBS volume.
 
-    Searches *first* (the requested regions — usually one, so the common case is a
-    single call), then, only if the volume isn't there, the rest of ``everywhere()``
-    (the enabled regions) in parallel, so the caller can name where it really is.
-    A region that can't be queried is reported rather than read as "not there".
-    Raises :class:`CLIError` for a malformed ID or a volume found nowhere.
+    Asks the requested regions (*first*, usually one) in turn. An error there
+    propagates, so a credentials or permission problem gets the CLI's usual message
+    instead of a misleading "not found", and an unreachable endpoint is a
+    region-named :class:`CLIError`. Only if the volume isn't there are the rest of
+    ``everywhere()`` (the enabled regions) swept in parallel, so the caller can name
+    where it really is; a region that fails in that sweep is reported, never read as
+    "not there". Raises :class:`CLIError` for a malformed ID or a volume found nowhere.
     """
-    failures: dict[str, str] = {}
-
-    def search(regions: list[str]) -> tuple[str, dict] | None:
-        if not regions:
-            return None
-        with ThreadPoolExecutor(max_workers=min(max_workers, len(regions))) as executor:
-            futures = {executor.submit(_describe_volume_in, session, volume_id, r): r for r in regions}
-            for future in as_completed(futures):
-                region = futures[future]
-                try:
-                    volume = future.result()
-                except (botocore.exceptions.ClientError, botocore.exceptions.EndpointConnectionError) as exc:
-                    failures[region] = str(exc)
-                    continue
-                if volume is not None:
-                    return region, volume
-        return None
-
     searched = list(dict.fromkeys(first))
-    found = search(searched)
-    if found is None:
+    for region in searched:
         try:
-            rest = [r for r in everywhere() if r not in searched]
-        except (botocore.exceptions.ClientError, botocore.exceptions.EndpointConnectionError) as exc:
-            failures["other regions"] = f"could not list them: {exc}"
-            rest = []
-        searched += rest
-        found = search(rest)
-    if found is None:
-        message = f"EBS volume {volume_id} not found in any of the {len(searched)} region(s) searched."
-        if failures:
-            message += "\n  Couldn't check: " + "; ".join(f"{r} ({err})" for r, err in sorted(failures.items()))
-        raise CLIError(message)
-    region, volume = found
-    attachments = volume.get("Attachments") or []
-    return VolumeLocation(
-        volume_id=volume_id,
-        region=region,
-        availability_zone=volume["AvailabilityZone"],
-        state=volume["State"],
-        attached_to=attachments[0].get("InstanceId") if attachments else None,
-    )
+            volume = _describe_volume_in(session, volume_id, region)
+        except _UNREACHABLE as exc:
+            raise CLIError(f"[{region}] couldn't reach EC2 to look up {volume_id}: {exc}") from None
+        if volume is not None:
+            return _volume_location(volume_id, region, volume)
+
+    failures: dict[str, str] = {}
+    try:
+        rest = [r for r in everywhere() if r not in searched]
+    except (botocore.exceptions.ClientError, *_UNREACHABLE) as exc:
+        failures["other regions"] = f"could not list them: {exc}"
+        rest = []
+    found = _sweep_for_volume(session, volume_id, rest, failures, max_workers)
+    if found:
+        return _volume_location(volume_id, *found)
+    checked = len(searched) + len([r for r in rest if r not in failures])
+    message = f"EBS volume {volume_id} not found in the {checked} region(s) checked."
+    if failures:
+        message += "\n  Couldn't check: " + "; ".join(f"{r} ({err})" for r, err in sorted(failures.items()))
+    raise CLIError(message)
 
 
 def validate_ebs_volume(ec2_client, volume_id: str, availability_zone: str) -> dict:

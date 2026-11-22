@@ -265,12 +265,30 @@ def test_locate_then_searches_the_other_enabled_regions():
     clients["us-west-2"].describe_volumes.assert_called_once()  # not searched twice
 
 
-def test_locate_rejects_a_malformed_id_without_searching_on():
+@pytest.mark.parametrize("code", ["InvalidParameterValue", "InvalidVolumeID.Malformed"])
+def test_locate_rejects_a_malformed_id_without_searching_on(code):
+    """AWS IDs carry a check value: a typo is malformed in every region, so stop at once."""
     everywhere = MagicMock()
-    session = _session({"us-west-2": _volume_client(error=_client_error("InvalidParameterValue"))})
-    with pytest.raises(CLIError, match="vol-bogus is not a valid EBS volume ID"):
+    session = _session({"us-west-2": _volume_client(error=_client_error(code))})
+    with pytest.raises(CLIError, match="vol-bogus is not a valid EBS volume ID; check it for a typo"):
         locate_ebs_volume(session, "vol-bogus", ("us-west-2",), everywhere)
     everywhere.assert_not_called()
+
+
+def test_locate_lets_a_requested_regions_api_error_through():
+    """Bad credentials must reach the CLI's credentials message, not read as "not found"."""
+    everywhere = MagicMock()
+    session = _session({"us-west-2": _volume_client(error=_client_error("AuthFailure"))})
+    with pytest.raises(botocore.exceptions.ClientError, match="AuthFailure"):
+        locate_ebs_volume(session, "vol-1", ("us-west-2",), everywhere)
+    everywhere.assert_not_called()
+
+
+def test_locate_names_an_unreachable_requested_region():
+    timeout = botocore.exceptions.ConnectTimeoutError(endpoint_url="https://ec2.us-west-2.amazonaws.com")
+    session = _session({"us-west-2": _volume_client(error=timeout)})
+    with pytest.raises(CLIError, match=r"\[us-west-2\] couldn't reach EC2 to look up vol-1"):
+        locate_ebs_volume(session, "vol-1", ("us-west-2",), MagicMock())
 
 
 def _cannot_list() -> list[str]:
@@ -283,14 +301,23 @@ def _cannot_list() -> list[str]:
         pytest.param(
             {"us-west-2": _volume_client(), "us-east-1": _volume_client()},
             lambda: ["us-east-1", "us-west-2"],
-            r"vol-1 not found in any of the 2 region\(s\) searched\.$",
+            r"vol-1 not found in the 2 region\(s\) checked\.$",
             id="nowhere",
         ),
         pytest.param(
             {"us-west-2": _volume_client(), "eu-west-1": _volume_client(error=_client_error("AuthFailure"))},
             lambda: ["eu-west-1"],
-            r"Couldn't check: eu-west-1 \(.*AuthFailure",
+            r"not found in the 1 region\(s\) checked\.\n  Couldn't check: eu-west-1 \(.*AuthFailure",
             id="unqueryable-region-is-named",
+        ),
+        pytest.param(
+            {
+                "us-west-2": _volume_client(),
+                "eu-west-1": _volume_client(error=botocore.exceptions.ReadTimeoutError(endpoint_url="https://x")),
+            },
+            lambda: ["eu-west-1"],
+            r"Couldn't check: eu-west-1 \(Read timeout",
+            id="timed-out-region-is-named",
         ),
         pytest.param(
             {"us-west-2": _volume_client()},

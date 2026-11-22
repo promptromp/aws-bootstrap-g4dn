@@ -281,19 +281,20 @@ The setup script runs automatically on the instance after SSH becomes available:
 
 ### 🧩 Packages that compile against the instance's PyTorch
 
-Some packages (flash-attn, causal-conv1d, mamba-ssm, apex, …) build CUDA kernels against the
-installed torch, so they need `--no-build-isolation` in `~/venv`, and the build can take many
-minutes. [`examples/compiled-extensions/install_compiled.sh`](examples/compiled-extensions/) does
-that, with an optional S3 wheel cache so the next instance installs in seconds:
+Some packages (flash-attn, causal-conv1d, mamba-ssm, …) build CUDA kernels against the installed
+torch, so they need `--no-build-isolation` in `~/venv`, and the build can take many minutes.
+[`examples/compiled-extensions/install_compiled.sh`](examples/compiled-extensions/) does that, with
+an optional S3 wheel cache so the next instance installs in seconds:
 
 ```bash
-ssh aws-gpu1 'WHEEL_CACHE=s3://my-bucket/wheels bash -s -- causal-conv1d==1.5.0' \
+ssh aws-gpu1 'WHEEL_CACHE=s3://my-bucket/wheels bash -s -- flash-attn==2.8.3' \
     < examples/compiled-extensions/install_compiled.sh
 ```
 
-Cached wheels are keyed by torch version (including its CUDA tag), Python, CPU architecture and
-GPU generation, since a wheel's filename records none of the first or last. The instance needs S3
-access for the cache (`--iam-instance-profile`).
+A wheel's filename doesn't record what it was built against, so cached wheels are kept under a key
+that does: torch version, torch's CUDA, the nvcc toolkit, Python, CPU architecture, libc and GPU
+generation. pip decides whether a cached wheel satisfies each requested version. The instance
+needs S3 access for the cache (`--iam-instance-profile`).
 
 ### 📊 GPU Benchmark
 

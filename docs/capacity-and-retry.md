@@ -120,7 +120,8 @@ An IAM instance profile EC2 rejects (`--iam-instance-profile`: no such profile,
 or one created seconds ago that hasn't propagated yet) and, with a profile set,
 a missing `iam:PassRole` (`UnauthorizedOperation`) fail the same in every AZ,
 region and market. The launch stops with that error: no next region, no
-on-demand fallback, no `--wait` sleep. Nothing has been created at that point.
+on-demand fallback, no `--wait` sleep. No instance has been created at that point
+(the key pair and security group, and a cluster's placement group, may exist).
 
 ### On-demand fallback (without `--wait`)
 

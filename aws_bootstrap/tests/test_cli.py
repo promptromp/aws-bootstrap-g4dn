@@ -680,9 +680,9 @@ def test_status_json_no_orphans_empty_list(runner, status_aws, orphans):
     assert json.loads(result.output)["orphan_volumes"] == []
 
 
-@pytest.mark.parametrize("fmt,load", [("json", json.loads), ("yaml", yaml.safe_load)], ids=["json", "yaml"])
-def test_status_structured_output_carries_instances_and_orphans(runner, status_aws, orphans, fmt, load):
+def test_status_structured_output_carries_instances_and_orphans(runner, status_aws, orphans, structured):
     """json/yaml keep both lists in the single result."""
+    fmt, load = structured
     status_aws.find.return_value = [_instance()]
     orphans.return_value = [dict(_ORPHAN_VOLUME)]
     result = runner.invoke(main, ["-o", fmt, *STATUS])
@@ -693,8 +693,8 @@ def test_status_structured_output_carries_instances_and_orphans(runner, status_a
 
 
 @pytest.mark.parametrize("profile", ["app", ""], ids=["attached", "none"])
-@pytest.mark.parametrize("fmt,load", [("json", json.loads), ("yaml", yaml.safe_load)], ids=["json", "yaml"])
-def test_status_structured_output_carries_the_iam_profile(runner, status_aws, fmt, load, profile):
+def test_status_structured_output_carries_the_iam_profile(runner, status_aws, structured, profile):
+    fmt, load = structured
     status_aws.find.return_value = [_instance(IamInstanceProfile=profile)]
     result = runner.invoke(main, ["-o", fmt, *STATUS])
     assert result.exit_code == 0, result.output
