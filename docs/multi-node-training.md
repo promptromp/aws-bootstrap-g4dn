@@ -118,6 +118,10 @@ at read time, so each node holding a full copy is correct at this scale. For
 very large datasets, prefer streaming from S3 (S3 Connector for PyTorch /
 Mountpoint) or a shared FSx for Lustre mount.
 
+The nodes need S3 credentials for this. Launch the cluster with an existing IAM
+instance profile whose role can read the bucket, and every node gets them:
+`aws-bootstrap cluster launch ... --iam-instance-profile my-ec2-s3-profile`.
+
 ## 5. Tear it down
 
 ```bash

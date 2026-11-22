@@ -146,6 +146,9 @@ aws-bootstrap launch --on-demand
 # With persistent EBS data volume (survives termination)
 aws-bootstrap launch --ebs-storage 96
 
+# AWS access from the instance (e.g. read S3) via an EXISTING IAM instance profile
+aws-bootstrap launch --iam-instance-profile my-ec2-s3-profile
+
 # Dry run first to validate configuration
 aws-bootstrap launch --dry-run
 
@@ -243,7 +246,7 @@ aws-bootstrap launch --ebs-volume-id vol-0abc123def456
 
 EBS volumes are mounted at `/data`, survive spot interruptions, and persist independently of instances. Use `/data` for large datasets, model checkpoints, and training outputs — it persists across instance lifecycles while the root volume does not.
 
-When you reattach with `--ebs-volume-id`, the launch automatically pins the new instance to the volume's availability zone (EBS volumes are AZ-scoped, so the instance must be in the same AZ to attach). This means a `--ebs-volume-id` launch targets the volume's region, and spot capacity is constrained to that one AZ — if you hit `InsufficientInstanceCapacity`, add `--wait` to retry until capacity frees up. For example:
+When you reattach with `--ebs-volume-id`, the launch finds the volume first and launches in its region, pinned to its availability zone (EBS volumes are AZ-scoped, so the instance must be in the same AZ to attach) — don't pass `--region` for it. Spot capacity is constrained to that one AZ — if you hit `InsufficientInstanceCapacity`, add `--wait` to retry until capacity frees up. A volume that isn't `available` (still attached to an instance that's shutting down) fails before launch; wait for that instance to terminate, then retry. For example:
 
 ```bash
 # Store training data on persistent volume
@@ -265,6 +268,8 @@ After launch and remote setup, each instance comes pre-configured with:
 - Additional numerical/ML libraries from `requirements.txt`: `numpy`, `tqdm`, and other common dependencies
 - Use `--python-version` on launch to pin a specific Python version (e.g. `3.13`)
 - To install additional packages: `ssh aws-gpu1 'pip install transformers datasets'`
+- Packages that compile against the installed torch (flash-attn, causal-conv1d, mamba-ssm, …): use `examples/compiled-extensions/install_compiled.sh` from the aws-bootstrap repo (`ssh aws-gpu1 'WHEEL_CACHE=s3://bucket/wheels bash -s -- causal-conv1d==1.5.0' < install_compiled.sh`). It builds with `--no-build-isolation` and can share wheels through S3 (keyed by torch/CUDA, Python, arch and GPU). A plain `pip install` of these either builds against a different torch or fails.
+- AWS calls from the instance (S3, ECR, …) need credentials: launch with `--iam-instance-profile <existing profile>` rather than copying access keys onto it.
 
 ### GPU and CUDA
 
@@ -296,6 +301,7 @@ The `/data` volume is **not lost on spot interruption** — when AWS reclaims th
 - **SSH key handling**: a missing local `--key-path` is auto-generated (ed25519); if an AWS key pair with the target `--key-name` exists but is a *different* key, the existing one is left untouched and the local key is imported under a derived name `<key-name>-<fp8>` so the instance is always reachable.
 - **SSH auth failure**: `launch` fails fast (no long retry loop) and surfaces the real `ssh` error (e.g. `Permission denied (publickey)`) instead of a generic "SSH not ready" — indicates a key mismatch; relaunch with the correct `--key-name`/`--key-path`.
 - **`SSH key ... has a passphrase and isn't loaded in ssh-agent`** (exit 1, before anything is created): aws-bootstrap connects without prompts. Ask the user to run the printed `ssh-add --apple-use-keychain <key>` (macOS) / `ssh-add <key>` in their own terminal, or relaunch with a passphrase-less `--key-path`. Use `--skip-key-check` only if the passphrase is supplied another way. A stderr *warning* about the macOS Keychain (`UseKeychain`) does not stop the launch.
+- **`IAM instance profile '<name>' not found`** (exit 1, before anything is created): the profile must already exist — aws-bootstrap never creates IAM resources. List them with `aws iam list-instance-profiles --query 'InstanceProfiles[].InstanceProfileName'` and ask the user which to use; don't invent one. If EC2 *rejects* the profile at launch (`EC2 rejected IAM instance profile …`, e.g. created seconds ago, or no `iam:PassRole`), nothing was created; retry shortly or ask the user to fix permissions.
 - **SSH timeouts**: Instance may still be initializing -- check `aws-bootstrap status`
 - **No public IP**: Check VPC settings or assign an Elastic IP
 - **EBS mount failures**: Non-fatal -- instance remains usable, may need manual mount

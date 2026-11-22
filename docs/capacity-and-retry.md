@@ -114,6 +114,14 @@ region even if a later region ultimately succeeds.
 > already pinned to `--region <the region that failed>`; don't let them
 > resolve to your default region.
 
+### Global errors (stop at once)
+
+An IAM instance profile EC2 rejects (`--iam-instance-profile`: no such profile,
+or one created seconds ago that hasn't propagated yet) and, with a profile set,
+a missing `iam:PassRole` (`UnauthorizedOperation`) fail the same in every AZ,
+region and market. The launch stops with that error: no next region, no
+on-demand fallback, no `--wait` sleep. Nothing has been created at that point.
+
 ### On-demand fallback (without `--wait`)
 
 A single exhausted spot pass (no `--wait`) still offers the interactive
@@ -171,7 +179,9 @@ aws-bootstrap launch --instance-type g6e.2xlarge --availability-zone us-west-2b 
 ```
 
 `--ebs-volume-id` already pins its volume's AZ, so it can't be combined with
-either flag. `--dry-run` prints the AZ plan for every `--region`.
+either flag; it also decides the region (the volume is located first, in your
+`--region`s or the default region and then every enabled region), so such a
+launch is single-region. `--dry-run` prints the AZ plan for every `--region`.
 
 ## Region default precedence
 

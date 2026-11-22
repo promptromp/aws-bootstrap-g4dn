@@ -36,7 +36,12 @@ case "$1 $2" in
     touch "$dir/$(printf '%s' "$name" | tr -s -- '-_.' '_')-$version-cp312-cp312-linux.whl" ;;
 esac
 """,
-    "uv": r"""[ "$1 $2" = "pip install" ] && [ "${*: -1}" != packaging ] && echo "install ${*: -1}" >> "$STUB_LOG"; true""",
+    # Logs installs of built wheels only, not the build tools (that call ends with "packaging").
+    "uv": r"""
+last=${*: -1}
+[ "$1 $2" = "pip install" ] && [ "$last" != packaging ] && echo "install $last" >> "$STUB_LOG"
+true
+""",
     "nvidia-smi": "echo 8.9",
     "aws": r"""
 src=${3/s3:\/\//$FAKE_S3/}; dst=${4/s3:\/\//$FAKE_S3/}
@@ -69,9 +74,7 @@ def instance(tmp_path):
             env = {"HOME": str(home), "PATH": "/usr/bin:/bin", "STUB_LOG": str(log), "FAKE_S3": str(fake_s3)}
             if cache:
                 env["WHEEL_CACHE"] = "s3://bucket/wheels"
-            result = subprocess.run(
-                ["bash", str(INSTALL_COMPILED), *packages], env=env, capture_output=True, text=True
-            )
+            result = subprocess.run(["bash", str(INSTALL_COMPILED), *packages], env=env, capture_output=True, text=True)
             calls = log.read_text().splitlines() if log.exists() else []
             log.unlink(missing_ok=True)
             return result, calls

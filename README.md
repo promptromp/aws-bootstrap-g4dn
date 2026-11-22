@@ -156,8 +156,11 @@ aws-bootstrap launch --ssh-port 2222
 # Attach a persistent EBS data volume (96 GB gp3, mounted at /data)
 aws-bootstrap launch --ebs-storage 96
 
-# Reattach an existing EBS volume from a previous instance
+# Reattach an existing EBS volume from a previous instance (the volume decides the region and AZ)
 aws-bootstrap launch --ebs-volume-id vol-0abc123def456
+
+# Give the instance AWS credentials through an existing IAM instance profile (e.g. to read S3)
+aws-bootstrap launch --iam-instance-profile my-ec2-s3-profile
 
 # Spot prices differ a lot between AZs: try each region's AZs cheapest-first
 aws-bootstrap launch --instance-type g6e.2xlarge --cheapest-az --region us-west-2 --region us-east-1
@@ -232,6 +235,33 @@ Price semantics, stated plainly:
 
 See [docs/capacity-and-retry.md](docs/capacity-and-retry.md) for the backoff design and recommended region lists per instance family.
 
+### 🔑 AWS access from the instance (`--iam-instance-profile`)
+
+Code on the instance that calls AWS (reading a dataset from S3, pulling from ECR, writing
+checkpoints) needs credentials. Don't copy access keys onto it: give it an IAM **instance
+profile** instead, and the AWS CLI and SDKs there pick up short-lived credentials on their own.
+
+```bash
+aws-bootstrap launch --iam-instance-profile my-ec2-s3-profile          # name or ARN
+aws-bootstrap cluster launch --cluster-id ml1 --nodes 2 --iam-instance-profile my-ec2-s3-profile
+```
+
+- aws-bootstrap only **attaches** a profile you already have; it never creates roles, policies or
+  profiles. Create one with a role whose policy grants what the instance needs (e.g. `s3:GetObject`
+  on your bucket), or ask whoever manages IAM for your account.
+- The profile is checked before anything is created: a name that doesn't exist stops the launch.
+  If you lack `iam:GetInstanceProfile`, the check only warns (EC2 still rejects a bad profile before
+  launching anything). Launching with a profile needs `iam:PassRole` on its role.
+- `status` shows each instance's profile (`iam_instance_profile` in structured output).
+- Growing a cluster whose nodes have a different profile warns and names them, since a job that
+  needs the credentials on every rank would fail on the others.
+- For an instance that's already running, use the AWS CLI:
+  ```bash
+  aws ec2 associate-iam-instance-profile --region us-west-2 --instance-id i-0abc... \
+      --iam-instance-profile Name=my-ec2-s3-profile
+  # to swap one: describe-iam-instance-profile-associations, then replace-iam-instance-profile-association
+  ```
+
 ### 🔧 What Remote Setup Does
 
 The setup script runs automatically on the instance after SSH becomes available:
@@ -248,6 +278,22 @@ The setup script runs automatically on the instance after SSH becomes available:
 | **Jupyter** | Configures and starts JupyterLab as a systemd service on port 8888 |
 | **SSH keepalive** | Configures server-side keepalive to prevent idle disconnects |
 | **VSCode workspace** | Creates `~/workspace/.vscode/` with `launch.json` and `tasks.json` (auto-detected `cuda-gdb` path and GPU arch), plus an example `saxpy.cu` |
+
+### 🧩 Packages that compile against the instance's PyTorch
+
+Some packages (flash-attn, causal-conv1d, mamba-ssm, apex, …) build CUDA kernels against the
+installed torch, so they need `--no-build-isolation` in `~/venv`, and the build can take many
+minutes. [`examples/compiled-extensions/install_compiled.sh`](examples/compiled-extensions/) does
+that, with an optional S3 wheel cache so the next instance installs in seconds:
+
+```bash
+ssh aws-gpu1 'WHEEL_CACHE=s3://my-bucket/wheels bash -s -- causal-conv1d==1.5.0' \
+    < examples/compiled-extensions/install_compiled.sh
+```
+
+Cached wheels are keyed by torch version (including its CUDA tag), Python, CPU architecture and
+GPU generation, since a wheel's filename records none of the first or last. The instance needs S3
+access for the cache (`--iam-instance-profile`).
 
 ### 📊 GPU Benchmark
 
@@ -492,7 +538,8 @@ Key behaviors:
 - **Orphan visibility** — `status` always reports orphaned data volumes (detached, linked instance gone) with size, region, and an estimated monthly cost, plus reattach/delete commands — even when you have zero running instances. Orphans bill silently (~$0.08/GB-month for gp3), so this is your safety net after a spot reclaim or a forgotten `--keep-ebs`
 - **Orphan cleanup** — use `aws-bootstrap cleanup --include-ebs` to find and delete orphan volumes (e.g. from spot interruptions or forgotten `--keep-ebs` volumes). Use `--dry-run` to preview
 - **Spot-safe** — data volumes survive spot interruptions. If AWS reclaims your instance, the volume detaches automatically and can be reattached to a new instance with `--ebs-volume-id`
-- **Automatic AZ matching** — EBS volumes are tied to a single availability zone, and an instance can only attach a volume in its own AZ. When you reattach with `--ebs-volume-id`, the launch automatically pins the new instance to the volume's AZ, so you never hit a "wrong AZ" attach failure. (One consequence: spot capacity is then constrained to that single AZ, so a launch may need `--wait` to ride out a temporary shortage. A `--ebs-volume-id` launch targets the volume's region.)
+- **The volume decides the region and AZ** — EBS volumes are tied to a single availability zone, and an instance can only attach a volume in its own AZ. `--ebs-volume-id` finds the volume first (in your `--region`s, or the default region, then every enabled region) and launches there, pinned to its AZ, so you never hit a "wrong AZ" attach failure and don't need `--region`. A volume outside an explicit `--region` is an error that names where it actually is. (One consequence: spot capacity is then constrained to that single AZ, so a launch may need `--wait` to ride out a temporary shortage.)
+- **Checked before launch** — a volume that isn't `available` (still attached, e.g. its old instance hasn't finished terminating) stops the launch before an instance is created, naming the instance it's attached to.
 - Mount failures are non-fatal — the instance remains usable
 
 ## Multi-node training clusters (preview)
@@ -535,7 +582,7 @@ Key behaviors:
 - **Stable ranks** — nodes are tagged with a stable rank (`0..N-1`); rank 0 is the rendezvous/master node (it also trains).
 - **Verify before you train** — `cluster prepare` checks every node is reachable, has a GPU, and runs a **consistent** CUDA version (it fails fast on version skew), writes a per-node cluster config, then runs a built-in distributed **canary** (a tiny DDP all-reduce + a few SGD steps across all nodes) to prove NCCL/rendezvous works end-to-end. `cluster test` re-runs that canary on demand.
 - **`cluster run` — distributed training** — distributes your `SCRIPT` to every node and runs it across the cluster. A `.py` script is launched with `torchrun` (c10d rendezvous, all nodes pointed at rank 0); a `.sh` script runs as-is with the `AWSB_*` environment contract exported (`AWSB_NODE_RANK`, `AWSB_NUM_NODES`, `AWSB_NUM_GPUS_PER_NODE`, `AWSB_NODE_IPS`, `AWSB_MASTER_ADDR`) so you can wire up any launcher. Per-node stdout/stderr are saved under `--log-dir`.
-- **Data-prep convention** — pass `--data-script prep.sh` and it's copied to every node and run **once, before training** (it's a barrier — training won't start until all nodes finish prep). Only the script's **exit code** is the success signal, so start it with `set -euo pipefail` to ensure a failed step actually fails the prep. The recommended pattern is an idempotent S3 pull into the per-node `/data` EBS mount:
+- **Data-prep convention** — pass `--data-script prep.sh` and it's copied to every node and run **once, before training** (it's a barrier — training won't start until all nodes finish prep). Only the script's **exit code** is the success signal, so start it with `set -euo pipefail` to ensure a failed step actually fails the prep. The recommended pattern is an idempotent S3 pull into the per-node `/data` EBS mount (launch the cluster with `--iam-instance-profile` so the nodes can read the bucket):
   ```bash
   # prep.sh
   set -euo pipefail

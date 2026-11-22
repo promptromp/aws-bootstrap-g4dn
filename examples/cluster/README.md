@@ -12,7 +12,8 @@ cluster. Each file has a detailed usage header. Full walkthrough:
 End-to-end:
 
 ```bash
-aws-bootstrap cluster launch  --cluster-id demo --nodes 2 --instance-type g5.xlarge --region us-west-2 --wait
+aws-bootstrap cluster launch  --cluster-id demo --nodes 2 --instance-type g5.xlarge --region us-west-2 --wait \
+    --iam-instance-profile my-ec2-s3-profile   # S3 access for prepare_data.sh
 aws-bootstrap cluster prepare --cluster-id demo --region us-west-2
 aws-bootstrap cluster run     --cluster-id demo --region us-west-2 \
     examples/cluster/train_ddp.py -- --epochs 3 --steps 50

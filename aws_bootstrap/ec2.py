@@ -1318,7 +1318,7 @@ class VolumeLocation:
 def _describe_volume_in(session, volume_id: str, region: str) -> dict | None:
     """The volume's description in *region*, or None if it isn't there.
 
-    Raises :class:`CLIError` for a malformed ID (wrong everywhere, so no point searching on).
+    Raises :class:`CLIError` for a malformed ID (including a typo: wrong everywhere).
     """
     client = session.client("ec2", region_name=region)
     try:
@@ -1328,8 +1328,11 @@ def _describe_volume_in(session, volume_id: str, region: str) -> dict | None:
         if code == "InvalidVolume.NotFound":
             return None
         if code in ("InvalidParameterValue", "InvalidVolumeID.Malformed"):
+            # IDs carry a check value, so a typo is rejected as malformed in every
+            # region (a real ID is just NotFound outside its own); no point searching on.
             raise CLIError(
-                f"{volume_id} is not a valid EBS volume ID: {e.response['Error'].get('Message', code)}"
+                f"{volume_id} is not a valid EBS volume ID; check it for a typo.\n"
+                f"  AWS: {e.response['Error'].get('Message', code)}"
             ) from None
         raise
     return volumes[0] if volumes else None
