@@ -15,6 +15,7 @@ from aws_bootstrap.cli import main
 from aws_bootstrap.ec2 import CLIError
 from aws_bootstrap.gpu import GpuInfo
 from aws_bootstrap.ssh import SSHHostDetails, add_ssh_host
+from aws_bootstrap.tests.helpers import client_error
 
 
 def _instance(instance_id="i-abc123", **overrides):
@@ -820,10 +821,6 @@ def test_status_json_includes_regions_failed(runner, multi_region_status):
 # ---------------------------------------------------------------------------
 
 
-def _client_error(code, message):
-    return botocore.exceptions.ClientError({"Error": {"Code": code, "Message": message}}, "DescribeInstances")
-
-
 @pytest.mark.parametrize(
     "error,expected",
     [
@@ -838,12 +835,12 @@ def _client_error(code, message):
             id="partial-credentials",
         ),
         pytest.param(
-            _client_error("ExpiredTokenException", "The security token is expired"),
+            client_error("ExpiredTokenException", "The security token is expired"),
             ["AWS authorization failed", "expired"],
             id="expired-token",
         ),
         pytest.param(
-            _client_error("AuthFailure", "credentials are invalid"), ["AWS authorization failed"], id="auth-failure"
+            client_error("AuthFailure", "credentials are invalid"), ["AWS authorization failed"], id="auth-failure"
         ),
     ],
 )
@@ -858,7 +855,7 @@ def test_credential_errors_show_friendly_message(runner, cli_session, error, exp
 
 def test_unhandled_client_error_propagates(runner, cli_session):
     """Non-auth ClientErrors should propagate without being caught."""
-    with patch("aws_bootstrap.cli.list_enabled_regions", side_effect=_client_error("UnknownError", "something")):
+    with patch("aws_bootstrap.cli.list_enabled_regions", side_effect=client_error("UnknownError", "something")):
         result = runner.invoke(main, ["status"])
     assert result.exit_code != 0
     assert isinstance(result.exception, botocore.exceptions.ClientError)
@@ -1348,9 +1345,7 @@ def test_quota_show_all_families(runner, cli_session):
 
 
 def test_quota_show_api_error(runner, cli_session):
-    error = botocore.exceptions.ClientError(
-        {"Error": {"Code": "NoSuchResourceException", "Message": "not found"}}, "GetServiceQuota"
-    )
+    error = client_error("NoSuchResourceException", "not found")
     with patch("aws_bootstrap.cli.get_family_quotas", side_effect=error):
         result = runner.invoke(main, ["quota", "show", "--family", "gvt"])
     assert result.exit_code != 0

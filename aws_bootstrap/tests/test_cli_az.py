@@ -4,13 +4,13 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
-import botocore.exceptions
 import pytest
 import yaml
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import _emit_region_fatal, main
 from aws_bootstrap.ec2 import AzOption, CLIError
+from aws_bootstrap.tests.helpers import client_error
 
 
 PLAN_USW2 = [AzOption("us-west-2b", 0.9911), AzOption("us-west-2a", 2.2122)]
@@ -173,7 +173,7 @@ def test_ebs_volume_az_is_a_hard_pin(plan_azs, key_path):
 # ---------------------------------------------------------------------------
 
 
-THROTTLED = botocore.exceptions.ClientError({"Error": {"Code": "RequestLimitExceeded", "Message": "x"}}, "Op")
+THROTTLED = client_error("RequestLimitExceeded")
 
 
 @pytest.mark.parametrize(

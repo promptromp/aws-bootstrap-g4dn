@@ -8,15 +8,11 @@ import pytest
 
 from aws_bootstrap.errors import CLIError
 from aws_bootstrap.iam import check_instance_profile, instance_profile_name, instance_profile_spec
+from aws_bootstrap.tests.helpers import client_error
 
 
 ARN = "arn:aws:iam::123456789012:instance-profile/app"
 PATH_ARN = "arn:aws:iam::123456789012:instance-profile/team/app"
-
-
-def _client_error(code: str) -> botocore.exceptions.ClientError:
-    error = {"Error": {"Code": code, "Message": f"{code} message"}}
-    return botocore.exceptions.ClientError(error, "GetInstanceProfile")
 
 
 def _iam(*, arn: str = ARN, roles=("app-role",), error: Exception | None = None) -> MagicMock:
@@ -57,7 +53,7 @@ def test_check_returns_the_roles_and_looks_up_by_name(value, arn, capsys):
 @pytest.mark.parametrize(
     "iam,value,match",
     [
-        pytest.param(_iam(error=_client_error("NoSuchEntity")), "app", "'app' not found", id="no-such-profile"),
+        pytest.param(_iam(error=client_error("NoSuchEntity")), "app", "'app' not found", id="no-such-profile"),
         pytest.param(_iam(arn=PATH_ARN), ARN, "doesn't match this account's 'app'", id="arn-mismatch"),
         pytest.param(_iam(), "arn:aws:iam::123456789012:role/app", "is an IAM role ARN", id="role-arn"),
     ],
@@ -70,7 +66,7 @@ def test_check_fails_on_a_definite_answer(iam, value, match):
 @pytest.mark.parametrize(
     "error",
     [
-        pytest.param(_client_error("AccessDenied"), id="no-get-permission"),
+        pytest.param(client_error("AccessDenied"), id="no-get-permission"),
         pytest.param(botocore.exceptions.EndpointConnectionError(endpoint_url="https://iam"), id="unreachable"),
         pytest.param(botocore.exceptions.ReadTimeoutError(endpoint_url="https://iam"), id="timed-out"),
     ],

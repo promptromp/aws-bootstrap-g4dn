@@ -18,13 +18,7 @@ from aws_bootstrap.quota import (
     get_quota_request_history,
     request_quota_increase,
 )
-
-
-def _make_client_error(code: str, message: str = "error") -> botocore.exceptions.ClientError:
-    return botocore.exceptions.ClientError(
-        {"Error": {"Code": code, "Message": message}},
-        "ServiceQuotas",
-    )
+from aws_bootstrap.tests.helpers import client_error
 
 
 @pytest.fixture
@@ -122,7 +116,7 @@ _CALLS = {
 )
 def test_api_errors_are_mapped(sq, call, code, raises, match):
     method, invoke = _CALLS[call]
-    getattr(sq, method).side_effect = _make_client_error(code)
+    getattr(sq, method).side_effect = client_error(code)
     with pytest.raises(raises, match=match):
         invoke(sq)
 

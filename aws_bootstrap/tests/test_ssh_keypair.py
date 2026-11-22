@@ -18,6 +18,7 @@ from aws_bootstrap.ssh import (
     query_cuda_version,
     wait_for_ssh,
 )
+from aws_bootstrap.tests.helpers import client_error
 
 
 LOCAL_PUB = "ssh-ed25519 AAAALOCALKEYBLOB adamhadani@Mac\n"
@@ -38,9 +39,7 @@ def _ec2(describe_side_effect):
 
 
 def _not_found():
-    return botocore.exceptions.ClientError(
-        {"Error": {"Code": "InvalidKeyPair.NotFound", "Message": "not found"}}, "DescribeKeyPairs"
-    )
+    return client_error("InvalidKeyPair.NotFound", "not found")
 
 
 # --- pure helpers ------------------------------------------------------------

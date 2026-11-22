@@ -106,58 +106,74 @@ def toolchain(tmp_path_factory):
     return {"uv": uv, "python": python, "root": root, "sdists": sdists, "wheels": wheels}
 
 
-@pytest.fixture
-def instance(tmp_path, toolchain):
-    """``instance()`` makes a fresh instance (its own HOME, so its own local cache); all share one fake bucket.
+def _runner(home: Path, toolchain: dict, fake_s3: Path):
+    """An instance with its own HOME (so its own local cache) that uses the bucket at *fake_s3*.
 
-    Its runner runs the script as documented (``bash -s -- PKG... < install_compiled.sh``) and
+    Calling it runs the script as documented (``bash -s -- PKG... < install_compiled.sh``) and
     returns ``(exit code, combined output, local cache dir or None)``.
     """
+    bin_dir = home / ".local" / "bin"
+    bin_dir.mkdir(parents=True)
+    for tool, body in _STUBS.items():
+        (bin_dir / tool).write_text(f"#!/usr/bin/env bash\n{body}")
+        (bin_dir / tool).chmod(0o755)
+    (bin_dir / "uv").symlink_to(toolchain["uv"])
+
+    def run(
+        *packages: str, cache: bool = True, aws_fail: bool = False, cwd: Path | None = None
+    ) -> tuple[int, str, Path | None]:
+        env = {
+            "HOME": str(home),
+            "PATH": "/usr/bin:/bin",
+            "VENV": str(toolchain["python"].parent.parent),
+            "FAKE_S3": str(fake_s3),
+            # Everything resolves locally, never from the network.
+            "PIP_NO_INDEX": "1",
+            "PIP_FIND_LINKS": str(toolchain["sdists"]),
+            "UV_NO_INDEX": "1",
+            "UV_FIND_LINKS": str(toolchain["wheels"]),
+            "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(home.parent / "uv-cache")),
+            **({"WHEEL_CACHE": "s3://bucket/wheels"} if cache else {}),
+            **({"AWS_FAIL": "1"} if aws_fail else {}),
+        }
+        with INSTALL_COMPILED.open() as script:
+            proc = subprocess.run(
+                ["bash", "-s", "--", *packages],
+                stdin=script,
+                env=env,
+                cwd=cwd,
+                capture_output=True,
+                text=True,
+                timeout=180,
+            )
+        caches = list((home / "wheels").glob("*"))
+        return proc.returncode, proc.stdout + proc.stderr, caches[0] if caches else None
+
+    return run
+
+
+@pytest.fixture(scope="module")
+def seeded_bucket(tmp_path_factory, toolchain):
+    """A bucket already holding the fancy-ext 1.0 wheel, built once for the module; tests get a copy."""
+    root = tmp_path_factory.mktemp("seeded")
+    rc, out, _ = _runner(root / "home", toolchain, root / "s3")("fancy-ext==1.0")
+    assert rc == 0, out
+    return root / "s3"
+
+
+@pytest.fixture
+def instance(tmp_path, toolchain, request):
+    """``instance()`` makes a fresh instance; all of a test's instances share one bucket.
+
+    ``instance(seeded=True)`` starts that bucket with the fancy-ext 1.0 wheel already in it.
+    """
     fake_s3 = tmp_path / "s3"
-    count = 0
+    homes = iter(range(1, 100))
 
-    def make():
-        nonlocal count
-        count += 1
-        home = tmp_path / f"home{count}"
-        bin_dir = home / ".local" / "bin"
-        bin_dir.mkdir(parents=True)
-        for tool, body in _STUBS.items():
-            (bin_dir / tool).write_text(f"#!/usr/bin/env bash\n{body}")
-            (bin_dir / tool).chmod(0o755)
-        (bin_dir / "uv").symlink_to(toolchain["uv"])
-
-        def run(
-            *packages: str, cache: bool = True, aws_fail: bool = False, cwd: Path | None = None
-        ) -> tuple[int, str, Path | None]:
-            env = {
-                "HOME": str(home),
-                "PATH": "/usr/bin:/bin",
-                "VENV": str(toolchain["python"].parent.parent),
-                "FAKE_S3": str(fake_s3),
-                # Everything resolves locally, never from the network.
-                "PIP_NO_INDEX": "1",
-                "PIP_FIND_LINKS": str(toolchain["sdists"]),
-                "UV_NO_INDEX": "1",
-                "UV_FIND_LINKS": str(toolchain["wheels"]),
-                "UV_CACHE_DIR": os.environ.get("UV_CACHE_DIR", str(tmp_path / "uv-cache")),
-                **({"WHEEL_CACHE": "s3://bucket/wheels"} if cache else {}),
-                **({"AWS_FAIL": "1"} if aws_fail else {}),
-            }
-            with INSTALL_COMPILED.open() as script:
-                proc = subprocess.run(
-                    ["bash", "-s", "--", *packages],
-                    stdin=script,
-                    env=env,
-                    cwd=cwd,
-                    capture_output=True,
-                    text=True,
-                    timeout=180,
-                )
-            caches = list((home / "wheels").glob("*"))
-            return proc.returncode, proc.stdout + proc.stderr, caches[0] if caches else None
-
-        return run
+    def make(*, seeded: bool = False):
+        if seeded and not fake_s3.exists():
+            shutil.copytree(request.getfixturevalue("seeded_bucket"), fake_s3)
+        return _runner(tmp_path / f"home{next(homes)}", toolchain, fake_s3)
 
     make.s3 = fake_s3  # type: ignore[attr-defined]
     return make
@@ -182,8 +198,7 @@ def test_builds_against_the_venv_torch_uploads_then_installs(instance, toolchain
 
 @pytest.mark.slow
 def test_the_next_instance_installs_from_the_s3_cache(instance, toolchain):
-    instance()("fancy-ext==1.0")
-    rc, out, _ = instance()("Fancy.Ext==1.0")  # another spelling of the same name
+    rc, out, _ = instance(seeded=True)("Fancy.Ext==1.0")  # another spelling of the same name
     assert rc == 0, out
     assert "using cached fancy_ext-1.0-py3-none-any.whl" in out
     assert "building" not in out
@@ -201,11 +216,11 @@ def test_the_next_instance_installs_from_the_s3_cache(instance, toolchain):
     ],
 )
 def test_pip_decides_whether_the_cache_satisfies_the_spec(instance, toolchain, spec, expected_version, builds):
-    run = instance()
-    run("fancy-ext==1.0")
-    rc, out, _ = run(spec)
+    """The cache holds 1.0. A build must compile from source even though the index has a
+    prebuilt 2.0 wheel (``--no-binary``): it was built against some other torch."""
+    rc, out, _ = instance(seeded=True)(spec)
     assert rc == 0, out
-    assert ("building" in out) is builds
+    assert ("Building wheel for fancy" in out) is builds
     assert _installed_version(toolchain) == expected_version
 
 
@@ -220,8 +235,7 @@ def test_pip_decides_whether_the_cache_satisfies_the_spec(instance, toolchain, s
     ],
 )
 def test_a_direct_reference_builds_but_stays_out_of_the_cache(instance, toolchain, spec, cwd):
-    run = instance()
-    run("fancy-ext==1.0")
+    run = instance(seeded=True)
     rc, out, cache = run(spec.format(root=toolchain["root"]), cwd=toolchain[cwd] if cwd else None)
     assert rc == 0, out
     assert "building against torch" in out
@@ -229,13 +243,6 @@ def test_a_direct_reference_builds_but_stays_out_of_the_cache(instance, toolchai
     assert [w.name for w in cache.iterdir()] == ["fancy_ext-1.0-py3-none-any.whl"]  # 1.2 isn't cached
     assert not (instance.s3 / "bucket" / "wheels" / cache.name / "fancy_ext-1.2-py3-none-any.whl").exists()
     assert _installed_version(toolchain) == "1.2"
-
-
-@pytest.mark.slow
-def test_compiles_even_when_the_index_has_a_prebuilt_wheel(instance):
-    rc, out, _ = instance()("fancy-ext==2.0")
-    assert rc == 0, out
-    assert "Building wheel for fancy" in out  # compiled here, not the index's prebuilt wheel
 
 
 @pytest.mark.slow

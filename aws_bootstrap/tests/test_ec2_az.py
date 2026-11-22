@@ -21,16 +21,13 @@ from aws_bootstrap.ec2 import (
     spot_price_or_none,
     spot_prices_by_az,
 )
+from aws_bootstrap.tests.helpers import client_error
 
 
-def _client_error(code: str, message: str = "test") -> botocore.exceptions.ClientError:
-    return botocore.exceptions.ClientError({"Error": {"Code": code, "Message": message}}, "Op")
-
-
-CAPACITY = _client_error("InsufficientInstanceCapacity")
-QUOTA = _client_error("MaxSpotInstanceCountExceeded")
-PRICE = _client_error("SpotMaxPriceTooLow")
-UNSUPPORTED = _client_error("Unsupported", "Your requested instance type is not supported in your requested AZ.")
+CAPACITY = client_error("InsufficientInstanceCapacity")
+QUOTA = client_error("MaxSpotInstanceCountExceeded")
+PRICE = client_error("SpotMaxPriceTooLow")
+UNSUPPORTED = client_error("Unsupported", "Your requested instance type is not supported in your requested AZ.")
 
 
 # ---------------------------------------------------------------------------
@@ -94,7 +91,7 @@ def test_offered_and_default_subnet_azs():
 
 @pytest.mark.parametrize(
     "side_effect",
-    [_client_error("UnauthorizedOperation"), botocore.exceptions.EndpointConnectionError(endpoint_url="x")],
+    [client_error("UnauthorizedOperation"), botocore.exceptions.EndpointConnectionError(endpoint_url="x")],
     ids=["client-error", "botocore-error"],
 )
 def test_spot_price_or_none_swallows_api_errors(side_effect):
@@ -142,7 +139,7 @@ def test_plan_azs(plan_kwargs, subnets, expected):
             "Usable AZs in us-west-2: us-west-2a",
         ),
         (
-            {"offered": USW2, "zones_error": _client_error("InvalidParameterValue", "Invalid AZ")},
+            {"offered": USW2, "zones_error": client_error("InvalidParameterValue", "Invalid AZ")},
             {"explicit": ("us-west-2z",)},
             "Unknown availability zone in us-west-2: us-west-2z",
         ),
@@ -180,7 +177,7 @@ def test_plan_azs_errors(ec2_kwargs, plan_kwargs, match):
 
 def test_plan_azs_explicit_tolerates_a_denied_price_lookup():
     """--az without --cheapest-az only shows prices; it mustn't need DescribeSpotPriceHistory."""
-    ec2 = _ec2(offered=USW2, subnets=USW2, price_error=_client_error("UnauthorizedOperation"))
+    ec2 = _ec2(offered=USW2, subnets=USW2, price_error=client_error("UnauthorizedOperation"))
     assert plan_azs(ec2, "us-west-2", "g6e.2xlarge", explicit=("us-west-2b",)) == [AzOption("us-west-2b", None)]
     with pytest.raises(botocore.exceptions.ClientError):
         plan_azs(ec2, "us-west-2", "g6e.2xlarge", cheapest=True)  # the ranking needs prices
