@@ -21,8 +21,9 @@
 #          --data-script examples/cluster/prepare_data.sh \
 #          examples/cluster/train_ddp.py -- --epochs 3 --data-dir /data/dataset
 #
-#    The cluster nodes need an IAM role / credentials with s3:GetObject on the
-#    bucket (the Deep Learning AMI has the AWS CLI preinstalled).
+#    The cluster nodes need credentials with s3:GetObject on the bucket: launch
+#    the cluster with `--iam-instance-profile <profile>` (an existing profile
+#    whose role allows it). The Deep Learning AMI has the AWS CLI preinstalled.
 #
 # ---------------------------------------------------------------------------
 # NOTES

@@ -73,6 +73,8 @@ impacted_map = [
     # remote_setup.sh and every SETUP_PAYLOAD file are checked by the payload-wiring tests.
     # `**`, not `*`: a `*` glob matches one path segment, so it would miss resources/<dir>/<file>.
     "aws_bootstrap/resources/**=aws_bootstrap/tests/test_torch_index.py",
+    # The example scripts are parsed, and install_compiled.sh run against stub tools.
+    "examples/**=aws_bootstrap/tests/test_examples.py",
 ]
 
 [tool.ruff]

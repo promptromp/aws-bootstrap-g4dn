@@ -4,13 +4,13 @@ from __future__ import annotations
 import json
 from unittest.mock import patch
 
-import botocore.exceptions
 import pytest
 import yaml
 from click.testing import CliRunner
 
 from aws_bootstrap.cli import _emit_region_fatal, main
 from aws_bootstrap.ec2 import AzOption, CLIError
+from aws_bootstrap.tests.helpers import client_error
 
 
 PLAN_USW2 = [AzOption("us-west-2b", 0.9911), AzOption("us-west-2a", 2.2122)]
@@ -162,12 +162,9 @@ def test_ebs_volume_az_is_a_hard_pin(plan_azs, key_path):
         captured["ctx"] = prepare_region("us-west-2")
         raise CLIError("stop here")
 
-    with (
-        patch("aws_bootstrap.cli.resolve_ebs_placement_az", return_value="us-west-2c"),
-        patch("aws_bootstrap.cli.launch_with_retry", side_effect=fake_launch),
-    ):
+    with patch("aws_bootstrap.cli.launch_with_retry", side_effect=fake_launch):
         _run("launch", "--key-path", str(key_path), "--ebs-volume-id", "vol-1", "--region", "us-west-2")
-    assert captured["ctx"].placement_azs == ("us-west-2c",)
+    assert captured["ctx"].placement_azs == ("us-west-2a",)  # the located volume's AZ (conftest)
     assert captured["ctx"].hard_pin is True
 
 
@@ -176,7 +173,7 @@ def test_ebs_volume_az_is_a_hard_pin(plan_azs, key_path):
 # ---------------------------------------------------------------------------
 
 
-THROTTLED = botocore.exceptions.ClientError({"Error": {"Code": "RequestLimitExceeded", "Message": "x"}}, "Op")
+THROTTLED = client_error("RequestLimitExceeded")
 
 
 @pytest.mark.parametrize(

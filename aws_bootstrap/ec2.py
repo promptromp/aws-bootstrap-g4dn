@@ -33,17 +33,10 @@ from .constants import (
     TAG_NAME,
     VOLUME_TYPE,
 )
+from .errors import CREDENTIAL_ERROR_CODES, CLIError
+from .iam import InstanceProfileError, instance_profile_name, instance_profile_spec
 from .output import echo, is_text, secho
 from .retry import backoff_sleep_seconds
-
-
-class CLIError(click.ClickException):
-    """A ClickException that displays the error message in red."""
-
-    def show(self, file=None):  # type: ignore[no-untyped-def]
-        # `file=None` + `err=True` lets click resolve stderr itself; the explicit
-        # `click.get_text_stream("stderr")` it replaces is deprecated in Click 8.5.
-        click.secho(f"Error: {self.format_message()}", file=file, err=True, fg="red")
 
 
 # Well-known AMI owners by name prefix
@@ -444,6 +437,8 @@ def _build_launch_params(
         placement["GroupName"] = placement_group
     if placement:
         params["Placement"] = placement
+    if config.iam_instance_profile:
+        params["IamInstanceProfile"] = instance_profile_spec(config.iam_instance_profile)
     if spot:
         params["InstanceMarketOptions"] = {
             "MarketType": "spot",
@@ -499,6 +494,10 @@ def _run_instances(
                 f"Spot price for {config.instance_type} in {region} exceeds the default maximum.\n\n"
                 "  Waiting will not help — retry with --on-demand or a different instance type.",
             ) from None
+        if config.iam_instance_profile and _is_profile_error(code, e):
+            # The profile is account-wide, so another AZ, region, market or a --wait
+            # retry fails the same way: stop here (no instance was created).
+            raise InstanceProfileError(_profile_error_message(code, config.iam_instance_profile, e)) from None
         if code == "Unsupported" and placement_az:
             # Often the type isn't offered in this AZ, so another AZ of the region may
             # work; the sweep decides (a hard pin re-raises the original error).
@@ -506,6 +505,27 @@ def _run_instances(
             raise AzUnsupportedError(f"{placement_az}: {aws_msg or 'request unsupported'}") from None
         raise
     return response["Instances"][0]
+
+
+def _is_profile_error(code: str, e: botocore.exceptions.ClientError) -> bool:
+    """A RunInstances failure caused by the instance profile (or the right to pass its role)."""
+    message = e.response["Error"].get("Message", "").lower()
+    return (code == "InvalidParameterValue" and "iaminstanceprofile" in message) or code == "UnauthorizedOperation"
+
+
+def _profile_error_message(code: str, profile: str, e: botocore.exceptions.ClientError) -> str:
+    aws_msg = e.response["Error"].get("Message", "")
+    if code == "UnauthorizedOperation":
+        return (
+            f"EC2 refused the launch: {aws_msg}\n\n"
+            f"  With an instance profile this is often a missing iam:PassRole on the role of '{profile}'.\n"
+            "  See which action was denied:  aws sts decode-authorization-message --encoded-message <message>"
+        )
+    return (
+        f"EC2 rejected IAM instance profile '{profile}': {aws_msg}\n\n"
+        "  A profile created moments ago can take a few seconds to reach EC2; retry shortly.\n"
+        "  List yours with:  aws iam list-instance-profiles --query 'InstanceProfiles[].InstanceProfileName'"
+    )
 
 
 class AzUnsupportedError(Exception):
@@ -806,6 +826,12 @@ def _quota_error_message(code: str, config: LaunchConfig, region: str | None = N
     )
 
 
+def _profile_of(inst: dict) -> str:
+    """Name of the IAM instance profile attached to a described instance, or ``""``."""
+    arn = inst.get("IamInstanceProfile", {}).get("Arn")
+    return instance_profile_name(arn) if arn else ""
+
+
 def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
     """Find all non-terminated instances with the created-by tag."""
     response = ec2_client.describe_instances(
@@ -832,6 +858,7 @@ def find_tagged_instances(ec2_client, tag_value: str) -> list[dict]:
                     "LaunchTime": inst["LaunchTime"],
                     "Lifecycle": inst.get("InstanceLifecycle", "on-demand"),
                     "AvailabilityZone": inst["Placement"]["AvailabilityZone"],
+                    "IamInstanceProfile": _profile_of(inst),
                     "ClusterId": tags.get(TAG_CLUSTER_ID, ""),
                     "Rank": int(rank_raw) if rank_raw is not None and rank_raw.isdigit() else None,
                 }
@@ -883,6 +910,7 @@ def _cluster_node_dict(inst: dict) -> dict:
         "LaunchTime": inst["LaunchTime"],
         "Lifecycle": inst.get("InstanceLifecycle", "on-demand"),
         "AvailabilityZone": inst["Placement"]["AvailabilityZone"],
+        "IamInstanceProfile": _profile_of(inst),
     }
 
 
@@ -1271,34 +1299,145 @@ def create_ebs_volume(ec2_client, size_gb: int, availability_zone: str, tag_valu
 
 
 def _ebs_volume_not_found_message(volume_id: str, region: str | None) -> str:
-    """Region-named 'volume not found' guidance (EBS volumes are region-scoped)."""
+    """Region-named 'volume not found' (EBS volumes are region-scoped)."""
     where = f" in {region}" if region else ""
-    return (
-        f"EBS volume not found: {volume_id}{where}.\n"
-        "  EBS volumes are region-scoped — pass --ebs-volume-id only when launching"
-        " in the volume's region."
+    return f"EBS volume not found: {volume_id}{where}."
+
+
+@dataclass(frozen=True)
+class VolumeLocation:
+    """Where an existing EBS volume lives, and whether it can be attached now."""
+
+    volume_id: str
+    region: str
+    availability_zone: str
+    state: str
+    attached_to: str | None = None  # instance ID while attached
+
+
+def _describe_volume_in(session, volume_id: str, region: str) -> dict | None:
+    """The volume's description in *region*, or None if it isn't there.
+
+    Raises :class:`CLIError` for a malformed ID (including a typo: wrong everywhere).
+    """
+    client = session.client("ec2", region_name=region)
+    try:
+        volumes = client.describe_volumes(VolumeIds=[volume_id])["Volumes"]
+    except botocore.exceptions.ClientError as e:
+        code = e.response["Error"]["Code"]
+        if code == "InvalidVolume.NotFound":
+            return None
+        if code in ("InvalidParameterValue", "InvalidVolumeID.Malformed"):
+            # IDs carry a check value, so a typo is rejected as malformed in every
+            # region (a real ID is just NotFound outside its own); no point searching on.
+            raise CLIError(
+                f"{volume_id} is not a valid EBS volume ID; check it for a typo.\n"
+                f"  AWS: {e.response['Error'].get('Message', code)}"
+            ) from None
+        raise
+    return volumes[0] if volumes else None
+
+
+# An unreachable or flaky endpoint, as opposed to an API answer.
+_UNREACHABLE = (botocore.exceptions.ConnectionError, botocore.exceptions.HTTPClientError)
+
+
+def _volume_location(volume_id: str, region: str, volume: dict) -> VolumeLocation:
+    attachments = volume.get("Attachments") or []
+    return VolumeLocation(
+        volume_id=volume_id,
+        region=region,
+        availability_zone=volume["AvailabilityZone"],
+        state=volume["State"],
+        attached_to=attachments[0].get("InstanceId") if attachments else None,
     )
 
 
-def resolve_ebs_placement_az(ec2_client, volume_id: str, region: str) -> str:
-    """Return the availability zone of an existing EBS volume.
+def _failure_reason(exc: Exception) -> str:
+    """A short reason for a region that couldn't be queried (its messages can be long and unique)."""
+    if isinstance(exc, botocore.exceptions.ClientError):
+        return exc.response["Error"]["Code"]
+    return type(exc).__name__
 
-    EBS volumes are AZ-scoped — an instance can only attach a volume in its own
-    availability zone. Resolving the AZ up front lets the launch pin the
-    instance to it (via ``Placement.AvailabilityZone``) instead of landing in a
-    random AZ and failing to attach. Raises :class:`CLIError` (region-named) if
-    the volume does not exist in ``region``.
-    """
+
+def _is_credential_error(exc: Exception) -> bool:
+    return isinstance(exc, botocore.exceptions.ClientError) and exc.response["Error"]["Code"] in CREDENTIAL_ERROR_CODES
+
+
+def _sweep_for_volume(
+    session, volume_id: str, regions: list[str], failures: dict[str, Exception], max_workers: int
+) -> tuple[str, dict] | None:
+    """Query *regions* in parallel; the first that has the volume wins. Failures go to *failures*."""
+    if not regions:
+        return None
+    executor = ThreadPoolExecutor(max_workers=min(max_workers, len(regions)))
     try:
-        response = ec2_client.describe_volumes(VolumeIds=[volume_id])
-    except botocore.exceptions.ClientError as e:
-        if e.response["Error"]["Code"] == "InvalidVolume.NotFound":
-            raise CLIError(_ebs_volume_not_found_message(volume_id, region)) from None
-        raise
-    volumes = response["Volumes"]
-    if not volumes:
-        raise CLIError(_ebs_volume_not_found_message(volume_id, region))
-    return volumes[0]["AvailabilityZone"]
+        futures = {executor.submit(_describe_volume_in, session, volume_id, r): r for r in regions}
+        for future in as_completed(futures):
+            region = futures[future]
+            try:
+                volume = future.result()
+            except (botocore.exceptions.ClientError, *_UNREACHABLE) as exc:
+                failures[region] = exc
+                continue
+            if volume is not None:
+                return region, volume
+        return None
+    finally:
+        # Found it: don't wait for the slower regions.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+def locate_ebs_volume(
+    session,
+    volume_id: str,
+    first: tuple[str, ...],
+    everywhere: Callable[[], list[str]],
+    max_workers: int = 10,
+) -> VolumeLocation:
+    """Find the region and AZ of an existing EBS volume.
+
+    Asks *first* (the requested regions, usually one) and, only if the volume isn't
+    there, the rest of ``everywhere()`` (the enabled regions) in parallel, so the
+    caller can name where it really is. A region that can't be queried (a regional
+    deny, an opt-in region refusing these credentials, an unreachable endpoint) is
+    reported in the not-found error, never read as "not there", and doesn't stop the
+    search. Only when no region answered at all is a credentials error re-raised, for
+    the CLI's credentials message. Raises :class:`CLIError` for a malformed ID or a
+    volume found nowhere.
+    """
+    searched = list(dict.fromkeys(first))
+    failures: dict[str, Exception] = {}
+    found = _sweep_for_volume(session, volume_id, searched, failures, max_workers)
+    rest: list[str] = []
+    if found is None:
+        try:
+            rest = [r for r in everywhere() if r not in searched]
+        except (botocore.exceptions.ClientError, *_UNREACHABLE) as exc:
+            failures["other regions"] = exc
+        found = _sweep_for_volume(session, volume_id, rest, failures, max_workers)
+    if found:
+        return _volume_location(volume_id, *found)
+    checked = len([r for r in searched + rest if r not in failures])
+    credential_error = next((e for e in failures.values() if _is_credential_error(e)), None)
+    if not checked and credential_error:
+        raise credential_error  # nothing answered and the credentials are bad: the CLI explains that
+    message = (
+        f"EBS volume {volume_id} not found in the {checked} region(s) checked."
+        if checked
+        else f"Couldn't look up EBS volume {volume_id}: no region answered."
+    )
+    if failures:
+        by_reason: dict[str, list[str]] = {}
+        for region, failure in failures.items():
+            reason = _failure_reason(failure)
+            if region == "other regions":
+                reason = f"could not list them: {reason}"
+            by_reason.setdefault(reason, []).append(region)
+        message += "\n  Couldn't check: " + "; ".join(
+            f"{', '.join(sorted(regions))} ({reason})" for reason, regions in sorted(by_reason.items())
+        )
+    raise CLIError(message)
 
 
 def validate_ebs_volume(ec2_client, volume_id: str, availability_zone: str) -> dict:

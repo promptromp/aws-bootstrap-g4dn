@@ -39,9 +39,10 @@ from aws_bootstrap.ec2 import (
     list_clusters,
     list_enabled_regions,
     list_instance_types,
-    resolve_ebs_placement_az,
     terminate_tagged_instances,
 )
+from aws_bootstrap.iam import InstanceProfileError
+from aws_bootstrap.tests.helpers import client_error, session_with_clients
 
 
 @pytest.fixture
@@ -50,20 +51,12 @@ def ec2():
     return MagicMock()
 
 
-def _make_client_error(code: str, message: str = "test") -> botocore.exceptions.ClientError:
-    return botocore.exceptions.ClientError({"Error": {"Code": code, "Message": message}}, "RunInstances")
-
-
-def test_cli_error_is_click_exception():
-    err = CLIError("something went wrong")
-    assert isinstance(err, click.ClickException)
-    assert err.format_message() == "something went wrong"
-
-
-def test_cli_error_show_outputs_red():
+def test_cli_error_is_a_click_error_shown_with_an_error_prefix():
+    err = CLIError("bad input")
     buf = io.StringIO()
-    CLIError("bad input").show(file=buf)
-    assert "Error: bad input" in buf.getvalue()
+    err.show(file=buf)
+    assert isinstance(err, click.ClickException) and err.exit_code == 1
+    assert buf.getvalue() == "Error: bad input\n"
 
 
 # ---------------------------------------------------------------------------
@@ -111,7 +104,7 @@ def _instance_type_response(arches: list[str]) -> dict:
         pytest.param(_instance_type_response([]), "x86_64", id="no-architectures"),
         pytest.param({"InstanceTypes": []}, "x86_64", id="empty-response"),
         # An unknown type in this region must not abort the launch sweep.
-        pytest.param(_make_client_error("InvalidInstanceType"), "x86_64", id="unknown-type"),
+        pytest.param(client_error("InvalidInstanceType"), "x86_64", id="unknown-type"),
     ],
 )
 def test_instance_type_architecture(ec2, response, expected):
@@ -251,7 +244,7 @@ def test_quota_hint_without_region_omits_flag():
 
 def test_run_instances_maps_capacity_error(ec2):
     """InsufficientInstanceCapacity is retryable (CapacityError), not fatal."""
-    ec2.run_instances.side_effect = _make_client_error("InsufficientInstanceCapacity")
+    ec2.run_instances.side_effect = client_error("InsufficientInstanceCapacity")
     with pytest.raises(CapacityError) as exc:
         _run_instances(ec2, LaunchConfig(spot=True), "ami-1", "sg-1", "us-west-2", True, "k")
     assert exc.value.region == "us-west-2"
@@ -264,7 +257,7 @@ def test_run_instances_maps_capacity_error(ec2):
 )
 def test_run_instances_maps_region_fatal_error(ec2, code, kind):
     """Quota / price are never worth waiting on -> RegionFatalError with a kind."""
-    ec2.run_instances.side_effect = _make_client_error(code)
+    ec2.run_instances.side_effect = client_error(code)
     with pytest.raises(RegionFatalError) as exc:
         _run_instances(ec2, LaunchConfig(spot=True), "ami-1", "sg-1", "us-west-2", True, "k")
     assert exc.value.kind == kind
@@ -272,7 +265,7 @@ def test_run_instances_maps_region_fatal_error(ec2, code, kind):
 
 def test_run_instances_reraises_unknown_client_error(ec2):
     """An unmapped API error must not be silently reclassified as capacity."""
-    ec2.run_instances.side_effect = _make_client_error("UnauthorizedOperation")
+    ec2.run_instances.side_effect = client_error("UnauthorizedOperation")
     with pytest.raises(botocore.exceptions.ClientError):
         _run_instances(ec2, LaunchConfig(spot=True), "ami-1", "sg-1", "us-west-2", True, "k")
 
@@ -317,6 +310,58 @@ def test_run_instances_omits_placement_without_az_or_group(ec2):
     assert "Placement" not in ec2.run_instances.call_args[1]
 
 
+PROFILE_ARN = "arn:aws:iam::123456789012:instance-profile/team/app"
+PROFILE_REJECTED = client_error(
+    "InvalidParameterValue",
+    "Value (app) for parameter iamInstanceProfile.name is invalid. Invalid IAM Instance Profile name",
+)
+
+
+@pytest.mark.parametrize("spot", [True, False], ids=["spot", "on-demand"])
+@pytest.mark.parametrize(
+    "profile,expected",
+    [
+        pytest.param(None, None, id="none"),
+        pytest.param("app", {"Name": "app"}, id="name"),
+        pytest.param(PROFILE_ARN, {"Arn": PROFILE_ARN}, id="arn"),
+    ],
+)
+def test_run_instances_attaches_the_instance_profile(ec2, profile, expected, spot):
+    ec2.run_instances.return_value = {"Instances": [{"InstanceId": "i-test"}]}
+    _run_instances(ec2, LaunchConfig(iam_instance_profile=profile), "ami-1", "sg-1", "us-west-2", spot, "k")
+    assert ec2.run_instances.call_args[1].get("IamInstanceProfile") == expected
+
+
+@pytest.mark.parametrize(
+    "error,match",
+    [
+        pytest.param(PROFILE_REJECTED, "EC2 rejected IAM instance profile 'app'", id="invalid-profile"),
+        pytest.param(
+            client_error("InvalidParameterValue", "Value (x) for parameter IamInstanceProfile.Arn is invalid"),
+            "EC2 rejected IAM instance profile 'app'",
+            id="invalid-profile-other-casing",
+        ),
+        pytest.param(
+            client_error("UnauthorizedOperation", "Encoded authorization failure message: xyz"),
+            "often a missing iam:PassRole",
+            id="pass-role-denied",
+        ),
+    ],
+)
+def test_run_instances_profile_errors_become_global_errors(ec2, error, match):
+    ec2.run_instances.side_effect = error
+    with pytest.raises(InstanceProfileError, match=match):
+        _run_instances(ec2, LaunchConfig(iam_instance_profile="app"), "ami-1", "sg-1", "us-west-2", True, "k")
+
+
+def test_run_instances_does_not_blame_the_profile_for_other_bad_parameters(ec2):
+    ec2.run_instances.side_effect = client_error(
+        "InvalidParameterValue", "Value (x) for parameter blockDeviceMapping is invalid"
+    )
+    with pytest.raises(botocore.exceptions.ClientError):
+        _run_instances(ec2, LaunchConfig(iam_instance_profile="app"), "ami-1", "sg-1", "us-west-2", True, "k")
+
+
 # ---------------------------------------------------------------------------
 # launch_with_retry
 # ---------------------------------------------------------------------------
@@ -342,7 +387,7 @@ def _ok_instance(instance_id="i-ok"):
 
 def test_launch_with_retry_falls_through_to_second_region_on_capacity():
     contexts = {
-        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
+        "us-west-2": _region_ctx("us-west-2", client_error("InsufficientInstanceCapacity")),
         "us-east-1": _region_ctx("us-east-1", [_ok_instance("i-east")]),
     }
     config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True)
@@ -371,7 +416,7 @@ def test_launch_with_retry_falls_through_to_second_region_on_capacity():
 )
 def test_launch_with_retry_region_fatal_skips_to_next_region(code, spot, kind):
     contexts = {
-        "us-west-2": _region_ctx("us-west-2", _make_client_error(code)),
+        "us-west-2": _region_ctx("us-west-2", client_error(code)),
         "us-east-1": _region_ctx("us-east-1", [_ok_instance("i-east")]),
     }
     fatal: list[tuple[str, str]] = []
@@ -389,8 +434,8 @@ def test_launch_with_retry_region_fatal_skips_to_next_region(code, spot, kind):
 def test_launch_with_retry_all_regions_quota_aggregated_hard_fail():
     """Every region quota-blocked -> hard fail listing each region + pinned hints."""
     contexts = {
-        "us-west-2": _region_ctx("us-west-2", _make_client_error("VcpuLimitExceeded")),
-        "us-east-1": _region_ctx("us-east-1", _make_client_error("VcpuLimitExceeded")),
+        "us-west-2": _region_ctx("us-west-2", client_error("VcpuLimitExceeded")),
+        "us-east-1": _region_ctx("us-east-1", client_error("VcpuLimitExceeded")),
     }
     config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False, instance_type="g4dn.xlarge")
     with pytest.raises(click.ClickException) as exc:
@@ -405,8 +450,8 @@ def test_launch_with_retry_all_regions_quota_aggregated_hard_fail():
 def test_launch_with_retry_quota_hint_pins_failed_region():
     """Aggregated failure pins the quota hint to the region that failed."""
     contexts = {
-        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
-        "us-east-1": _region_ctx("us-east-1", _make_client_error("VcpuLimitExceeded")),
+        "us-west-2": _region_ctx("us-west-2", client_error("InsufficientInstanceCapacity")),
+        "us-east-1": _region_ctx("us-east-1", client_error("VcpuLimitExceeded")),
     }
     config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=False, instance_type="g4dn.xlarge")
     with pytest.raises(click.ClickException) as exc:
@@ -419,7 +464,7 @@ def test_launch_with_retry_quota_hint_pins_failed_region():
 
 def test_launch_with_retry_single_region_price_emits_hint_then_fails():
     """Price-fatal single region: hint surfaced via callback, then hard fail."""
-    ctx = _region_ctx("us-west-2", _make_client_error("SpotMaxPriceTooLow"))
+    ctx = _region_ctx("us-west-2", client_error("SpotMaxPriceTooLow"))
     fatal: list[tuple[str, str, str]] = []
     with pytest.raises(click.ClickException, match="Launch cancelled"):
         launch_with_retry(
@@ -435,9 +480,7 @@ def test_launch_with_retry_single_region_price_emits_hint_then_fails():
 
 def test_launch_with_retry_on_demand_quota_aggregated_after_spot_capacity():
     """Spot capacity miss -> on-demand fallback hits quota -> aggregated hint."""
-    ctx = _region_ctx(
-        "us-west-2", [_make_client_error("InsufficientInstanceCapacity"), _make_client_error("VcpuLimitExceeded")]
-    )
+    ctx = _region_ctx("us-west-2", [client_error("InsufficientInstanceCapacity"), client_error("VcpuLimitExceeded")])
     config = LaunchConfig(regions=("us-west-2",), spot=True, instance_type="g4dn.xlarge")
     with pytest.raises(click.ClickException) as exc:
         launch_with_retry(config, lambda r: ctx, confirm_on_demand=lambda: True)
@@ -451,9 +494,9 @@ def test_launch_with_retry_wait_only_retries_capacity_regions():
     regions are re-swept, and on_wait reports retried vs skipped accurately
     (regression: heartbeat used to list every region as if still swept)."""
     contexts = {
-        "us-east-1": _region_ctx("us-east-1", _make_client_error("MaxSpotInstanceCountExceeded")),
-        "us-west-1": _region_ctx("us-west-1", _make_client_error("MaxSpotInstanceCountExceeded")),
-        "us-west-2": _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity")),
+        "us-east-1": _region_ctx("us-east-1", client_error("MaxSpotInstanceCountExceeded")),
+        "us-west-1": _region_ctx("us-west-1", client_error("MaxSpotInstanceCountExceeded")),
+        "us-west-2": _region_ctx("us-west-2", client_error("InsufficientInstanceCapacity")),
     }
     config = LaunchConfig(regions=("us-east-1", "us-west-1", "us-west-2"), spot=True, wait=True, wait_timeout=100)
     ticks = iter([0.0, 0.0, 150.0])
@@ -475,7 +518,7 @@ def test_launch_with_retry_wait_only_retries_capacity_regions():
 
 
 def test_launch_with_retry_wait_times_out_hard_fail():
-    ctx = _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity"))
+    ctx = _region_ctx("us-west-2", client_error("InsufficientInstanceCapacity"))
     config = LaunchConfig(regions=("us-west-2",), spot=True, wait=True, wait_timeout=100)
     ticks = iter([0.0, 0.0, 150.0])  # start, check#1 (<100 -> one wait), check#2 (>=100 -> timeout)
     slept: list[float] = []
@@ -496,7 +539,7 @@ def test_launch_with_retry_wait_times_out_hard_fail():
 
 
 def test_launch_with_retry_no_wait_on_demand_fallback_across_regions():
-    capacity = _make_client_error("InsufficientInstanceCapacity")
+    capacity = client_error("InsufficientInstanceCapacity")
     contexts = {
         # [spot attempt, on-demand attempt]
         "us-west-2": _region_ctx("us-west-2", [capacity, capacity]),
@@ -509,14 +552,14 @@ def test_launch_with_retry_no_wait_on_demand_fallback_across_regions():
 
 
 def test_launch_with_retry_declined_on_demand_cancels():
-    ctx = _region_ctx("us-west-2", _make_client_error("InsufficientInstanceCapacity"))
+    ctx = _region_ctx("us-west-2", client_error("InsufficientInstanceCapacity"))
     config = LaunchConfig(regions=("us-west-2",), spot=True)
     with pytest.raises(click.ClickException, match="Launch cancelled"):
         launch_with_retry(config, lambda r: ctx, confirm_on_demand=lambda: False)
 
 
 def test_launch_with_retry_prepares_each_region_once_across_wait_sweeps():
-    capacity = _make_client_error("InsufficientInstanceCapacity")
+    capacity = client_error("InsufficientInstanceCapacity")
     contexts = {
         "us-west-2": _region_ctx("us-west-2", capacity),  # never has capacity
         "us-east-1": _region_ctx("us-east-1", [capacity, _ok_instance()]),  # frees up on the 2nd sweep
@@ -552,6 +595,24 @@ def test_launch_with_retry_sends_the_pinned_az_to_run_instances(ctx_fields, expe
     result = launch_with_retry(LaunchConfig(regions=("us-east-1",), spot=True, ebs_volume_id="vol-abc"), lambda r: ctx)
     assert result.region == "us-east-1"
     assert ctx.ec2_client.run_instances.call_args[1]["Placement"] == expected
+
+
+@pytest.mark.parametrize("wait", [False, True], ids=["no-wait", "wait"])
+def test_launch_with_retry_profile_error_never_falls_through(wait):
+    """A bad profile fails the same in every region and market: stop at once —
+    no next region, no on-demand prompt, no --wait sleep."""
+    contexts = {
+        "us-west-2": _region_ctx("us-west-2", PROFILE_REJECTED),
+        "us-east-1": _region_ctx("us-east-1", [_ok_instance()]),
+    }
+    confirm = MagicMock(return_value=True)
+    config = LaunchConfig(regions=("us-west-2", "us-east-1"), spot=True, iam_instance_profile="app", wait=wait)
+    with pytest.raises(CLIError, match="rejected IAM instance profile"):
+        launch_with_retry(
+            config, lambda r: contexts[r], confirm_on_demand=confirm, sleeper=lambda s: pytest.fail("slept")
+        )
+    contexts["us-east-1"].ec2_client.run_instances.assert_not_called()
+    confirm.assert_not_called()
 
 
 # ---------------------------------------------------------------------------
@@ -810,14 +871,8 @@ def _region_client(instance_id: str | None = None, az: str = "", error: Exceptio
     return client
 
 
-def _session_with_region_clients(clients_by_region: dict[str, MagicMock]) -> MagicMock:
-    session = MagicMock()
-    session.client.side_effect = lambda _service, region_name=None, **_kw: clients_by_region[region_name]
-    return session
-
-
 def test_find_tagged_instances_in_regions_aggregates_and_labels():
-    session = _session_with_region_clients(
+    session = session_with_clients(
         {"us-east-1": _region_client("i-east", "us-east-1a"), "us-west-2": _region_client("i-west", "us-west-2a")}
     )
     instances, failures = find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", ["us-east-1", "us-west-2"])
@@ -831,8 +886,8 @@ def test_find_tagged_instances_in_regions_aggregates_and_labels():
 
 
 def test_find_tagged_instances_in_regions_captures_failure():
-    bad = _region_client(error=botocore.exceptions.ClientError({"Error": {"Code": "AuthFailure"}}, "DescribeInstances"))
-    session = _session_with_region_clients({"us-east-1": _region_client("i-ok", "us-east-1a"), "ap-south-1": bad})
+    bad = _region_client(error=client_error("AuthFailure"))
+    session = session_with_clients({"us-east-1": _region_client("i-ok", "us-east-1a"), "ap-south-1": bad})
     instances, failures = find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", ["us-east-1", "ap-south-1"])
     assert [i["InstanceId"] for i in instances] == ["i-ok"]
     assert len(failures) == 1
@@ -848,37 +903,9 @@ def test_find_tagged_instances_in_regions_empty_region_list():
 
 def test_find_tagged_instances_in_regions_propagates_credential_error():
     """Non-ClientError exceptions (e.g. missing credentials) are not swallowed."""
-    session = _session_with_region_clients(
-        {"us-east-1": _region_client(error=botocore.exceptions.NoCredentialsError())}
-    )
+    session = session_with_clients({"us-east-1": _region_client(error=botocore.exceptions.NoCredentialsError())})
     with pytest.raises(botocore.exceptions.NoCredentialsError):
         find_tagged_instances_in_regions(session, "aws-bootstrap-g4dn", ["us-east-1"])
-
-
-# ---------------------------------------------------------------------------
-# EBS AZ pinning: an existing data volume is AZ-scoped, so the instance must be
-# launched in the volume's AZ. resolve_ebs_placement_az looks up the AZ once;
-# _run_instances pins the run_instances request to it via Placement.
-# ---------------------------------------------------------------------------
-
-
-def test_resolve_ebs_placement_az_returns_volume_az(ec2):
-    ec2.describe_volumes.return_value = {"Volumes": [{"VolumeId": "vol-abc", "AvailabilityZone": "us-east-1c"}]}
-    assert resolve_ebs_placement_az(ec2, "vol-abc", "us-east-1") == "us-east-1c"
-    ec2.describe_volumes.assert_called_once_with(VolumeIds=["vol-abc"])
-
-
-@pytest.mark.parametrize(
-    "describe",
-    [
-        pytest.param({"side_effect": _make_client_error("InvalidVolume.NotFound", "not found")}, id="not-found-error"),
-        pytest.param({"return_value": {"Volumes": []}}, id="empty-response"),
-    ],
-)
-def test_resolve_ebs_placement_az_not_found_names_region(ec2, describe):
-    ec2.describe_volumes.configure_mock(**describe)
-    with pytest.raises(CLIError, match="EBS volume not found: vol-x in us-west-2"):
-        resolve_ebs_placement_az(ec2, "vol-x", "us-west-2")
 
 
 # ---------------------------------------------------------------------------
@@ -918,7 +945,7 @@ def test_ensure_cluster_placement_group_reuses_existing(ec2):
 )
 def test_delete_cluster_placement_group(ec2, error, deleted):
     if error:
-        ec2.delete_placement_group.side_effect = _make_client_error(error)
+        ec2.delete_placement_group.side_effect = client_error(error)
     assert delete_cluster_placement_group(ec2, "aws-bootstrap-cluster-ml1") is deleted
     ec2.delete_placement_group.assert_called_once_with(GroupName="aws-bootstrap-cluster-ml1")
 
@@ -933,7 +960,7 @@ def test_ensure_cluster_sg_rule_authorizes_self_reference(ec2):
 
 
 def test_ensure_cluster_sg_rule_idempotent_on_duplicate(ec2):
-    ec2.authorize_security_group_ingress.side_effect = _make_client_error("InvalidPermission.Duplicate")
+    ec2.authorize_security_group_ingress.side_effect = client_error("InvalidPermission.Duplicate")
     ensure_cluster_security_group_rule(ec2, "sg-123")  # must not raise
 
 
@@ -964,6 +991,20 @@ def test_find_cluster_instances_sorted_by_rank(ec2):
     assert nodes[0]["AvailabilityZone"] == "us-east-1c"
     filters = ec2.describe_instances.call_args[1]["Filters"]
     assert {"Name": "tag:aws-bootstrap-cluster", "Values": ["ml1"]} in filters
+
+
+@pytest.mark.parametrize(
+    "raw,expected",
+    [
+        pytest.param({}, "", id="none"),
+        pytest.param({"IamInstanceProfile": {"Arn": PROFILE_ARN, "Id": "AIPA123"}}, "app", id="attached"),
+    ],
+)
+def test_instance_discovery_reports_the_profile_name(ec2, raw, expected):
+    """describe_instances gives only the profile's ARN; status and clusters show its name."""
+    ec2.describe_instances.return_value = _reservations(_raw_instance(**raw))
+    assert find_tagged_instances(ec2, "aws-bootstrap-g4dn")[0]["IamInstanceProfile"] == expected
+    assert find_cluster_instances(ec2, "ml1")[0]["IamInstanceProfile"] == expected
 
 
 def test_list_clusters_groups_by_cluster_id(ec2):
@@ -1051,13 +1092,13 @@ def test_unowned_sg_that_already_has_ingress_is_silent(capsys):
 
 def test_reused_sg_tolerates_a_concurrent_duplicate_add():
     ec2 = _sg_client([])
-    ec2.authorize_security_group_ingress.side_effect = _make_client_error("InvalidPermission.Duplicate")
+    ec2.authorize_security_group_ingress.side_effect = client_error("InvalidPermission.Duplicate")
     assert ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22) == "sg-1"
 
 
 def test_reused_sg_propagates_an_unexpected_authorize_error():
     ec2 = _sg_client([])
-    ec2.authorize_security_group_ingress.side_effect = _make_client_error("UnauthorizedOperation")
+    ec2.authorize_security_group_ingress.side_effect = client_error("UnauthorizedOperation")
     with pytest.raises(botocore.exceptions.ClientError):
         ensure_security_group(ec2, "aws-bootstrap-ssh", "tv", ssh_port=22)
 

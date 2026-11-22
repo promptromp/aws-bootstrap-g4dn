@@ -15,6 +15,7 @@ from aws_bootstrap.cli import main
 from aws_bootstrap.ec2 import CLIError
 from aws_bootstrap.gpu import GpuInfo
 from aws_bootstrap.ssh import SSHHostDetails, add_ssh_host
+from aws_bootstrap.tests.helpers import client_error
 
 
 def _instance(instance_id="i-abc123", **overrides):
@@ -28,6 +29,7 @@ def _instance(instance_id="i-abc123", **overrides):
         "LaunchTime": datetime(2025, 1, 1, tzinfo=UTC),
         "Lifecycle": "spot",
         "AvailabilityZone": "us-west-2a",
+        "IamInstanceProfile": "",
         **overrides,
     }
 
@@ -55,6 +57,7 @@ _HELP_CASES = [
             "--ssh-port",
             "--ebs-storage",
             "--ebs-volume-id",
+            "--iam-instance-profile",
         ],
     ),
     (
@@ -678,9 +681,9 @@ def test_status_json_no_orphans_empty_list(runner, status_aws, orphans):
     assert json.loads(result.output)["orphan_volumes"] == []
 
 
-@pytest.mark.parametrize("fmt,load", [("json", json.loads), ("yaml", yaml.safe_load)], ids=["json", "yaml"])
-def test_status_structured_output_carries_instances_and_orphans(runner, status_aws, orphans, fmt, load):
+def test_status_structured_output_carries_instances_and_orphans(runner, status_aws, orphans, structured):
     """json/yaml keep both lists in the single result."""
+    fmt, load = structured
     status_aws.find.return_value = [_instance()]
     orphans.return_value = [dict(_ORPHAN_VOLUME)]
     result = runner.invoke(main, ["-o", fmt, *STATUS])
@@ -688,6 +691,35 @@ def test_status_structured_output_carries_instances_and_orphans(runner, status_a
     data = load(result.output)
     assert data["instances"][0]["instance_id"] == "i-abc123"
     assert data["orphan_volumes"][0]["volume_id"] == "vol-orphan1"
+
+
+@pytest.mark.parametrize("profile", ["app", ""], ids=["attached", "none"])
+def test_status_structured_output_carries_the_iam_profile(runner, status_aws, structured, profile):
+    fmt, load = structured
+    status_aws.find.return_value = [_instance(IamInstanceProfile=profile)]
+    result = runner.invoke(main, ["-o", fmt, *STATUS])
+    assert result.exit_code == 0, result.output
+    assert load(result.output)["instances"][0]["iam_instance_profile"] == (profile or None)
+
+
+@pytest.mark.parametrize(
+    "fmt,profile,present,absent",
+    [
+        ("text", "app", ["IAM profile", "app"], []),
+        ("text", "", [], ["IAM profile"]),
+        ("table", "app", ["IAM Profile", "app"], []),
+        ("table", "", ["IAM Profile"], ["app"]),  # the column is always there
+    ],
+    ids=["text-attached", "text-none", "table-attached", "table-none"],
+)
+def test_status_renders_the_iam_profile(runner, status_aws, fmt, profile, present, absent):
+    status_aws.find.return_value = [_instance(IamInstanceProfile=profile)]
+    result = runner.invoke(main, ["-o", fmt, *STATUS])
+    assert result.exit_code == 0, result.output
+    for text in present:
+        assert text in result.output
+    for text in absent:
+        assert text not in result.output
 
 
 def test_status_table_renders_orphans_in_their_own_table(runner, status_aws, orphans):
@@ -789,10 +821,6 @@ def test_status_json_includes_regions_failed(runner, multi_region_status):
 # ---------------------------------------------------------------------------
 
 
-def _client_error(code, message):
-    return botocore.exceptions.ClientError({"Error": {"Code": code, "Message": message}}, "DescribeInstances")
-
-
 @pytest.mark.parametrize(
     "error,expected",
     [
@@ -807,12 +835,12 @@ def _client_error(code, message):
             id="partial-credentials",
         ),
         pytest.param(
-            _client_error("ExpiredTokenException", "The security token is expired"),
+            client_error("ExpiredTokenException", "The security token is expired"),
             ["AWS authorization failed", "expired"],
             id="expired-token",
         ),
         pytest.param(
-            _client_error("AuthFailure", "credentials are invalid"), ["AWS authorization failed"], id="auth-failure"
+            client_error("AuthFailure", "credentials are invalid"), ["AWS authorization failed"], id="auth-failure"
         ),
     ],
 )
@@ -827,7 +855,7 @@ def test_credential_errors_show_friendly_message(runner, cli_session, error, exp
 
 def test_unhandled_client_error_propagates(runner, cli_session):
     """Non-auth ClientErrors should propagate without being caught."""
-    with patch("aws_bootstrap.cli.list_enabled_regions", side_effect=_client_error("UnknownError", "something")):
+    with patch("aws_bootstrap.cli.list_enabled_regions", side_effect=client_error("UnknownError", "something")):
         result = runner.invoke(main, ["status"])
     assert result.exit_code != 0
     assert isinstance(result.exception, botocore.exceptions.ClientError)
@@ -1317,9 +1345,7 @@ def test_quota_show_all_families(runner, cli_session):
 
 
 def test_quota_show_api_error(runner, cli_session):
-    error = botocore.exceptions.ClientError(
-        {"Error": {"Code": "NoSuchResourceException", "Message": "not found"}}, "GetServiceQuota"
-    )
+    error = client_error("NoSuchResourceException", "not found")
     with patch("aws_bootstrap.cli.get_family_quotas", side_effect=error):
         result = runner.invoke(main, ["quota", "show", "--family", "gvt"])
     assert result.exit_code != 0

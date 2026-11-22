@@ -11,14 +11,15 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
-import yaml
 
 from aws_bootstrap.cli import main
 from aws_bootstrap.cluster import NodeResult
+from aws_bootstrap.ec2 import CLIError
 from aws_bootstrap.gpu import GpuInfo
+from aws_bootstrap.iam import InstanceProfileError
 
 
-def _node(instance_id="i-1", cluster_id="ml1", rank=0, state="running"):
+def _node(instance_id="i-1", cluster_id="ml1", rank=0, state="running", **overrides):
     return {
         "InstanceId": instance_id,
         "ClusterId": cluster_id,
@@ -30,6 +31,8 @@ def _node(instance_id="i-1", cluster_id="ml1", rank=0, state="running"):
         "AvailabilityZone": "us-east-1c",
         "Lifecycle": "spot",
         "LaunchTime": datetime(2026, 5, 21),
+        "IamInstanceProfile": "",
+        **overrides,
     }
 
 
@@ -67,8 +70,8 @@ def test_cluster_help(runner, argv, expected):
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize("fmt,load", [("json", json.loads), ("yaml", yaml.safe_load)], ids=["json", "yaml"])
-def test_cluster_status_structured_output_lists_nodes(runner, cluster_nodes, fmt, load):
+def test_cluster_status_structured_output_lists_nodes(runner, cluster_nodes, structured):
+    fmt, load = structured
     cluster_nodes.return_value = [_node(instance_id="i-aaa", rank=0)]
     result = runner.invoke(main, ["-o", fmt, "cluster", "status", "--cluster-id", "ml1"])
     assert result.exit_code == 0, result.output
@@ -146,11 +149,11 @@ def cluster_launch(launched, region_launch, cluster_nodes, key_path):
     launched.ready.return_value = {"PublicIpAddress": "1.2.3.4", "Placement": {"AvailabilityZone": "us-east-1c"}}
     launched.add_ssh.return_value = "aws-ml1-0"
     with (
-        patch("aws_bootstrap.cli.ensure_cluster_placement_group", return_value="aws-bootstrap-cluster-ml1"),
-        patch("aws_bootstrap.cli.ensure_cluster_security_group_rule"),
+        patch("aws_bootstrap.cli.ensure_cluster_placement_group", return_value="aws-bootstrap-cluster-ml1") as pg,
+        patch("aws_bootstrap.cli.ensure_cluster_security_group_rule") as sg_rule,
     ):
         argv = ["cluster", "launch", "--cluster-id", "ml1", "--region", "us-east-1", "--key-path", str(key_path)]
-        yield SimpleNamespace(mocks=launched, argv=argv)
+        yield SimpleNamespace(mocks=launched, argv=argv, nodes=cluster_nodes, pg=pg, sg_rule=sg_rule)
 
 
 def test_cluster_launch_two_nodes_tags_ranks(runner, cluster_launch):
@@ -185,6 +188,72 @@ def test_cluster_launch_threads_wait_into_config(runner, cluster_launch):
     cfg = cluster_launch.mocks.launch.call_args[0][0]
     assert cfg.wait is True
     assert cfg.wait_timeout == 90
+
+
+PROFILE = ["--iam-instance-profile", "app"]
+
+
+def test_cluster_launch_checks_and_threads_the_profile(runner, cluster_launch):
+    result = runner.invoke(main, ["-o", "json", *cluster_launch.argv, "--nodes", "1", "--no-setup", *PROFILE])
+    assert result.exit_code == 0, result.output
+    cluster_launch.mocks.profile_check.assert_called_once()
+    assert cluster_launch.mocks.launch.call_args[0][0].iam_instance_profile == "app"
+    assert json.loads(result.stdout)["iam_instance_profile"] == "app"
+    assert "WARNING" not in result.output  # a new cluster has no nodes to disagree with
+
+
+def test_cluster_launch_profile_check_fails_before_anything_is_created(runner, cluster_launch):
+    cluster_launch.mocks.profile_check.side_effect = CLIError("IAM instance profile 'app' not found.")
+    result = runner.invoke(main, [*cluster_launch.argv, "--nodes", "1", *PROFILE])
+    assert result.exit_code != 0
+    assert "'app' not found" in result.output
+    cluster_launch.pg.assert_not_called()
+    cluster_launch.mocks.sg.assert_not_called()
+    cluster_launch.sg_rule.assert_not_called()
+    cluster_launch.mocks.launch.assert_not_called()
+
+
+@pytest.mark.parametrize(
+    "existing_profile,flag,expected,hint,no_hint",
+    [
+        pytest.param(
+            "", PROFILE, "profile none; new nodes get app", "associate-iam-instance-profile", "replace-", id="add"
+        ),
+        pytest.param(
+            "old", PROFILE, "profile old; new nodes get app", "replace-iam-instance-profile", "associate-", id="swap"
+        ),
+        pytest.param("old", [], "profile old; new nodes get none", "", "aws ec2", id="drop"),
+    ],
+)
+def test_growing_a_cluster_warns_about_mismatched_profiles(
+    runner, cluster_launch, existing_profile, flag, expected, hint, no_hint
+):
+    cluster_launch.nodes.return_value = [_node("i-0", IamInstanceProfile=existing_profile)]
+    result = runner.invoke(main, [*cluster_launch.argv, "--nodes", "2", "--no-setup", *flag])
+    assert result.exit_code == 0, result.output
+    assert f"node(s) i-0 have IAM instance {expected}" in result.output
+    assert hint in result.output
+    assert no_hint not in result.output
+
+
+def test_cluster_profile_failure_keeps_the_profile_in_the_rerun_hint_and_skips_capacity_advice(
+    runner, cluster_launch, region_launch
+):
+    calls = iter([region_launch({"InstanceId": "i-x"}, region="us-east-1")])
+
+    def launch(config, prepare_region, **kw):
+        try:
+            return next(calls)
+        except StopIteration:
+            raise InstanceProfileError("EC2 rejected IAM instance profile 'app': not yet propagated") from None
+
+    cluster_launch.mocks.launch.side_effect = launch
+    result = runner.invoke(main, [*cluster_launch.argv, "--nodes", "2", "--no-setup", *PROFILE])
+    assert result.exit_code != 0
+    assert "Launched 1 of 2" in result.output
+    assert "--nodes 2 --region us-east-1 --iam-instance-profile app" in result.output
+    assert "EC2 rejected IAM instance profile 'app'" in result.output
+    assert "ride out spot capacity" not in result.output
 
 
 def test_cluster_launch_reports_nothing_to_add_for_a_half_dead_cluster(runner, cluster_nodes):

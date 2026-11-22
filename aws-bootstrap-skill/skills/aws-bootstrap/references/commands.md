@@ -50,7 +50,8 @@ aws-bootstrap launch [OPTIONS]
 | `--python-version` | string | none | Python version for remote venv (e.g. 3.13) |
 | `--ssh-port` | int | `22` | SSH port for security group and connection |
 | `--ebs-storage` | int | none | Create new EBS data volume (GB, gp3, at /data) |
-| `--ebs-volume-id` | string | none | Attach existing EBS volume (at /data); pins instance to the volume's AZ |
+| `--ebs-volume-id` | string | none | Attach existing EBS volume (at /data); the volume decides the region and AZ |
+| `--iam-instance-profile` | string | none | Attach an existing IAM instance profile (name or ARN) so the instance gets AWS credentials (e.g. S3); never creates one |
 | `--availability-zone` / `--az` | string (repeatable) | none | Only these AZs, tried in order; an AZ implies its region |
 | `--cheapest-az` | flag | false | Spot only: try each region's AZs cheapest-first by current spot price |
 | `--skip-key-check` | flag | false | Skip the pre-launch check that the SSH key works without a prompt |
@@ -61,7 +62,9 @@ aws-bootstrap launch [OPTIONS]
 
 **Pre-launch key check:** aws-bootstrap connects with `BatchMode=yes` (no prompts). Before any AWS call, including in `--dry-run`, `launch` checks that the agent ssh would use holds the key, including via `IdentityAgent` such as 1Password, or that the key has no passphrase. Otherwise it exits 1 *before* creating a billed instance and prints the fix (`ssh-add --apple-use-keychain <key>`). On macOS with `UseKeychain yes` in `~/.ssh/config`, it only warns on stderr, because the Keychain may hold the passphrase. On this error, don't retry blindly: load the key into the agent (the user may need to do this in their own terminal), or pass `--skip-key-check` only if you know the passphrase is supplied another way.
 
-`--ebs-volume-id` automatically pins the instance to the volume's availability zone (EBS volumes are AZ-scoped). The launch therefore targets the volume's region, and spot capacity is limited to that one AZ — combine with `--wait` if the AZ is temporarily short on capacity. If the volume isn't found in the target region, the launch fails fast with a region-named error before provisioning anything.
+`--ebs-volume-id` finds the volume before anything is created (in the `--region`s given, or the default region, then every enabled region) and launches in its region, pinned to its availability zone (EBS volumes are AZ-scoped) — no `--region` needed. Spot capacity is limited to that one AZ, so combine with `--wait` if it's short. Errors, all before provisioning anything: the volume is outside an explicit `--region` (the message names its real region — drop `--region` or use that one); it isn't `available` (e.g. still attached to an instance that is shutting down — the message names it; wait and retry); a malformed ID; not found in any region (unqueryable regions are named).
+
+**`--iam-instance-profile`:** checked before anything is created. "not found" stops the launch (exit 1): list profiles with the printed `aws iam list-instance-profiles` command, don't guess names. A stderr warning that it "could not verify" (no `iam:GetInstanceProfile`) or that it has no role does not stop the launch. If EC2 rejects the profile at launch (e.g. created seconds ago, or no `iam:PassRole`), the launch stops at once with that error — no other region, no on-demand fallback, no `--wait` retry. For an already-running instance use `aws ec2 associate-iam-instance-profile` (there is no aws-bootstrap command for it).
 
 **`--wait` + multiple `--region`:** a region sweep is the inner loop, backoff is the outer loop. Each cycle tries spot in every `--region` in order with no delay between regions; only when *all* regions miss does it sleep (capped+jittered exponential backoff, escalating per sweep) and sweep again, until `--wait-timeout` total wall-clock, then hard-fail. So `--wait --region A --region B` = "try A then B instantly; if both dry, back off and retry both" — not "wait on A then try B." Region order wins every tie. Without `--wait`, exactly one sweep then on-demand fallback.
 
@@ -81,6 +84,7 @@ aws-bootstrap launch [OPTIONS]
   "regions_tried": ["us-west-2", "us-east-1"],
   "ssh_alias": "aws-gpu1",
   "spot_price_per_hour": 0.9911,
+  "iam_instance_profile": "my-ec2-s3-profile",
   "cuda_version": "13.2",
   "ebs_volume": {
     "volume_id": "vol-0abc123",
@@ -90,7 +94,7 @@ aws-bootstrap launch [OPTIONS]
 }
 ```
 
-`status` is the outcome discriminator, present on every non-dry-run `launch` result: `"ready"` on success, `"no-public-ip"` or `"ssh-unavailable"` on an **incomplete launch**. The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id` is used. `cuda_version` is present only when remote setup ran and a CUDA version was detected (omitted with `--no-setup` or on non-CUDA/smoke-test instances). `region` is the region the instance actually launched in; `regions_tried` lists all regions attempted in order. `spot_price_per_hour` is the current spot price in the chosen `availability_zone` (spot launches only; omitted if the lookup fails, which never fails the launch).
+`status` is the outcome discriminator, present on every non-dry-run `launch` result: `"ready"` on success, `"no-public-ip"` or `"ssh-unavailable"` on an **incomplete launch**. The `ebs_volume` field is only present when `--ebs-storage` or `--ebs-volume-id` is used. `cuda_version` is present only when remote setup ran and a CUDA version was detected (omitted with `--no-setup` or on non-CUDA/smoke-test instances). `region` is the region the instance actually launched in; `regions_tried` lists all regions attempted in order. `spot_price_per_hour` is the current spot price in the chosen `availability_zone` (spot launches only; omitted if the lookup fails, which never fails the launch). `iam_instance_profile` (the profile's name) is present only with `--iam-instance-profile`, also on an incomplete launch.
 
 **Incomplete launch** (exit code 1 — the instance **exists and is billing**, but is unusable):
 ```json
@@ -134,6 +138,8 @@ the instance rather than leaking it. Branch on `status`, not on the exit code al
 }
 ```
 
+With `--ebs-volume-id`, the dry run also carries `ebs_volume_id` and `ebs_volume_availability_zone`, and `regions` is the volume's region; with `--iam-instance-profile`, `iam_instance_profile`.
+
 `availability_zones` is `null` unless `--availability-zone` or `--cheapest-az` is given. It maps each `--region` to the AZs that would be tried, in order, or `null` where EC2 chooses. In `-o table` it is a single string.
 
 On capacity timeout (`--wait` exhausted) or all regions exhausted, `launch` exits non-zero with an aggregated `CLIError` (per-region reasons + region-pinned quota hints). Quota / `SpotMaxPriceTooLow` are never *waited* on, but in multi-region mode the launcher warns and moves on to the next `--region`; it only fails hard once every region is blocked.
@@ -172,6 +178,7 @@ aws-bootstrap status [OPTIONS]
       "ssh_alias": "aws-gpu1",
       "lifecycle": "spot",
       "availability_zone": "us-west-2a",
+      "iam_instance_profile": "my-ec2-s3-profile",
       "launch_time": "2025-01-15T10:30:00+00:00",
       "spot_price_per_hour": 0.1578,
       "uptime_seconds": 3600,
@@ -209,7 +216,7 @@ aws-bootstrap status [OPTIONS]
 }
 ```
 
-Top-level `regions_queried` lists every region the query was attempted against (including any that subsequently failed). `regions_failed` is present only when one or more regions could not be queried (e.g. unauthorized); those regions appear in both lists. Per-instance fields `gpu`, `ebs_volumes`, `spot_price_per_hour`, `uptime_seconds`, and `estimated_cost` are conditional.
+Top-level `regions_queried` lists every region the query was attempted against (including any that subsequently failed). `regions_failed` is present only when one or more regions could not be queried (e.g. unauthorized); those regions appear in both lists. Per-instance fields `gpu`, `ebs_volumes`, `spot_price_per_hour`, `uptime_seconds`, and `estimated_cost` are conditional. `iam_instance_profile` is always present: the attached profile's name, or `null`.
 
 `orphan_volumes` is **always present** (empty list when none): aws-bootstrap data volumes that are detached and whose linked instance no longer exists — they still bill (`monthly_cost_usd` is an estimate at the common gp3 rate) until reattached (`launch --ebs-volume-id <id> --region <region>`) or deleted (`cleanup --include-ebs`). Reported even when `instances` is empty; in `table` mode orphans render as a second table.
 
@@ -592,6 +599,7 @@ Launch (or incrementally grow) a multi-node training cluster: N GPU instances ta
 | `--availability-zone` / `--az` | string | none | AZ for a **new** cluster (implies its region); an existing cluster stays in its AZ (a conflicting value is an error) |
 | `--cheapest-az` | flag | false | Spot, new cluster: the first node tries the region's AZs cheapest-first; the rest follow it |
 | `--skip-key-check` | flag | false | Skip the pre-launch SSH key check (runs before any AWS change) |
+| `--iam-instance-profile` | string | none | Existing IAM instance profile (name or ARN) for the new nodes; growing a cluster whose nodes have a different one warns |
 
 ### JSON Output
 
